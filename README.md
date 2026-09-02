@@ -19,16 +19,19 @@ scrcpy/Pi5 prototype scripts).
 │  (RTX 5080)          │                              │  jitter buffer        │
 │  → H.264 access units│                              │  fragment reassembly  │
 │  → fragment → send   │                              │  CUVID decode         │
-└──────────────────────┘                              │  → NV12 → BGRA conv   │
-                                                      │  → /dev/fb0 → HDMI    │
+│  (C11 poll loop)     │                              │  → NV12 → BGRA conv   │
+└──────────────────────┘                              │  → /dev/fb0 → HDMI    │
                                                       └───────────────────────┘
 ```
 
 Roles:
 
-- **MEC sim** (`tools/mec_sim.py`) — stands in for the ReDroid/MEC container.
-  Encodes real H.264 with **NVENC**, wraps access units in the VMC protocol
-  (fragmenting large frames), echoes keepalives, and ingests input batches.
+- **MEC sim** (`tools/vmc_sim/vmc-mec-sim`) — stands in for the ReDroid/MEC
+  container. Encodes real H.264 with **NVENC** (ffmpeg `h264_nvenc` subprocess),
+  wraps access units in the VMC protocol (fragmenting large frames), echoes
+  keepalives, and ingests input batches. A single-threaded `poll()` loop with
+  **no Python GIL** — the previous `tools/mec_sim.py` Python simulator is kept
+  for comparison but no longer used.
 - **Thin client** (`apps/thinclient/main.c`) — receives, reorders, reassembles,
   decodes with **CUVID**, converts NV12→BGRA (CPU swscale or GPU CUDA kernel),
   and presents to the framebuffer/HDMI. A decode worker thread keeps reception
@@ -48,7 +51,8 @@ include/vmc/
 src/          implementations (platform/linux holds Linux-specific code)
 apps/         thin client main application (decode-worker pipeline + overlay)
 tests/        unit tests (8 suites, dependency-free harness)
-tools/        mec_sim.py, wifi_connect.sh, cuda/nv12_conv.cu
+tools/        vmc_sim/ (C/CUDA MEC sender), mec_sim.py (legacy Python sim),
+              wifi_connect.sh, cuda/nv12_conv.cu
 systemd/      vmc-thinclient.service, vmc-wifi.service
 ```
 
@@ -76,14 +80,21 @@ cd tools/cuda && nvcc -O3 -shared -Xcompiler -fPIC -o libnv12conv.so nv12_conv.c
 # install to /usr/local/lib + ldconfig so the client can dlopen it
 ```
 
+`vmc-mec-sim` is built as part of the main build (target
+`tools/vmc_sim/vmc-mec-sim`, linked against `libvmc_thinclient.a`).
+
 ## Running
 
 **1. Start the MEC sim** (on the machine with the encoder GPU):
 
 ```sh
-python3 tools/mec_sim.py 192.168.0.126 9999 6000 [width] [height]
+./build/tools/vmc_sim/vmc-mec-sim 192.168.0.126 9999 6000 [width] [height] [drop_rate]
 # e.g. 1920 1080, or 3840 2160 for 4K (~24 Mbps, NVENC)
+# drop_rate defaults to 0.001 (matches the Python sim); pass 0.0 to disable drops
 ```
+
+The legacy Python sim is still available as `tools/mec_sim.py` with the same
+argument order.
 
 **2. Run the thin client** (on the client device):
 
@@ -141,14 +152,20 @@ e2e = present_time − frame_send_time − offset
 CUVID's 1-frame output hold is accounted for by mapping the presented frame's
 `pts` back to its real sender timestamp.
 
-Representative results (Wi-Fi 6, 4K stream → 1080p display):
+Representative results (Wi-Fi 6, 4K stream → 1080p display, Design B):
 
-| Metric | Value | Notes |
-|---|---|---|
-| e2e avg | ~122 ms | includes ~60 ms sim-Python-GIL bias + ~45 ms CUVID 1-frame hold |
-| decode avg | ~11.5 ms | CUVID + NV12→BGRA conversion |
-| one-way | ~2–3 ms | WiFi |
-| queue | ~25 µs | decode-worker pipeline |
+| Metric | Python sim (`mec_sim.py`) | C sender (`vmc-mec-sim`) | Notes |
+|---|---|---|---|
+| e2e avg | ~119 ms | **~66 ms** | Python sim included a ~50 ms GIL/stamping bias, now removed |
+| e2e min | ~101 ms | **~42 ms** | |
+| e2e p95 | ~127 ms | **~95 ms** | |
+| on-screen avg | ~86 ms | **~52 ms** | DRM flip timing (motion-to-photon) |
+| decode avg | ~7.0 ms | ~7.0 ms | CUVID + GPU NV12→BGRA, unchanged |
+| one-way | ~3–8 ms | ~4 ms | WiFi |
+| queue | ~60 µs | ~0.5 ms | decode-worker pipeline |
+
+The residual ~52 ms on-screen is dominated by CUVID's 1-frame hold (~33 ms at
+30 fps) plus the DRM flip cadence — not the network or the sender.
 
 ## Video conversion: the three paths
 
@@ -256,6 +273,8 @@ pixels). The decoder test requires FFmpeg dev headers.
 - [x] Design B components: DRM scanout + flip events, stream-overlapped conversion
 - [x] Wi-Fi driver (MT7902) + auto-connect, persistent services
 - [x] Design B end-to-end: DRM scanout + CUVID CUDA frames + stream-overlapped conversion
+- [x] C/CUDA MEC sender (`vmc-mec-sim`) replacing the Python sim (removes the
+      ~50 ms GIL/stamping bias; e2e avg ~119 → ~66 ms)
 - [ ] E2E latency measurement refinement for Design B (PTS-to-send mapping with CUVID 1-frame hold)
 - [ ] EGL interop or zero-copy decode-NV12 + DRM scanout
 - [ ] Audio I/O (ALSA) + full mixer

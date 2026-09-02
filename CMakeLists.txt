@@ -121,4 +121,7 @@ if(VMC_ENABLE_TESTS)
     add_subdirectory(tests)
 endif()
 
+# MEC simulator (C/CUDA sender).
+add_subdirectory(tools/vmc_sim)
+
 # Example cross-compile toolchain is documented in cmake/README-toolchains.md
