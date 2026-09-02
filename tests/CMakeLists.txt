@@ -1,0 +1,20 @@
+# Test targets
+include_directories(${PROJECT_SOURCE_DIR}/include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+
+function(vmc_add_test name)
+    add_executable(${name} ${name}.c)
+    target_link_libraries(${name} PRIVATE vmc_thinclient)
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+vmc_add_test(test_ringbuf)
+vmc_add_test(test_protocol)
+vmc_add_test(test_jitter_buffer)
+vmc_add_test(test_session)
+vmc_add_test(test_mixer)
+vmc_add_test(test_input_batch)
+vmc_add_test(test_fragment)
+if(VMC_FFMPEG_FOUND)
+    vmc_add_test(test_decoder)
+endif()
