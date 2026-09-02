@@ -32,6 +32,7 @@ typedef struct vmc_video_frame {
     vmc_pixel_format pixfmt;
     u32  stride[3];
     u32  ts_us;         /* sender timestamp */
+    bool device_mem;    /* planes are CUDA device pointers (no CPU access) */
     const u8 *planes[3];
 } vmc_video_frame;
 

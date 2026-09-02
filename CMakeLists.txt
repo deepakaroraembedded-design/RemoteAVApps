@@ -49,6 +49,18 @@ set(VMC_CORE_SOURCES
     src/video/fragment.c
 )
 
+# Optional DRM scanout backend (libdrm).
+find_path(VMC_DRM_INCLUDE_DIR libdrm/drm.h)
+find_library(VMC_DRM_LIBRARY drm)
+if(VMC_DRM_INCLUDE_DIR AND VMC_DRM_LIBRARY)
+    list(APPEND VMC_CORE_SOURCES src/video/drm_scanout.c)
+    set(VMC_DRM_FOUND TRUE)
+    message(STATUS "DRM scanout backend: ENABLED")
+else()
+    set(VMC_DRM_FOUND FALSE)
+    message(STATUS "DRM scanout backend: DISABLED")
+endif()
+
 # Optional FFmpeg H.264 software decoder backend.
 find_path(VMC_FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
 find_library(VMC_AVCODEC_LIBRARY avcodec)
@@ -78,6 +90,22 @@ if(VMC_FFMPEG_FOUND)
     target_compile_definitions(vmc_thinclient PUBLIC VMC_HAVE_FFMPEG=1)
     target_link_libraries(vmc_thinclient PUBLIC
         ${VMC_AVCODEC_LIBRARY} ${VMC_AVUTIL_LIBRARY} ${VMC_SWSCALE_LIBRARY})
+endif()
+if(VMC_DRM_FOUND)
+    target_include_directories(vmc_thinclient PRIVATE
+        ${VMC_DRM_INCLUDE_DIR} ${VMC_DRM_INCLUDE_DIR}/libdrm)
+    target_compile_definitions(vmc_thinclient PUBLIC VMC_DRM_FOUND=1)
+    target_link_libraries(vmc_thinclient PUBLIC ${VMC_DRM_LIBRARY})
+endif()
+
+# Optional CUDA headers (for the CUVID CUDA hw_device_ctx path).
+find_path(VMC_CUDA_INCLUDE_DIR cuda.h)
+find_library(VMC_CUDA_LIBRARY cuda)
+if(VMC_CUDA_INCLUDE_DIR AND VMC_CUDA_LIBRARY)
+    target_compile_definitions(vmc_thinclient PUBLIC VMC_HAVE_CUDA=1)
+    target_include_directories(vmc_thinclient PRIVATE ${VMC_CUDA_INCLUDE_DIR})
+    target_link_libraries(vmc_thinclient PUBLIC ${VMC_CUDA_LIBRARY})
+    message(STATUS "CUDA device-ctx support: ENABLED")
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(vmc_thinclient PRIVATE _DEFAULT_SOURCE=1 _POSIX_C_SOURCE=200809L)

@@ -15,6 +15,7 @@
 #include <string.h>
 #include <signal.h>
 #include <pthread.h>
+#include <dlfcn.h>
 
 #include "vmc/vmc.h"
 #include "vmc/core/logger.h"
@@ -29,6 +30,9 @@
 #include "vmc/input/evdev_input.h"
 #include "vmc/video/fb_display.h"
 #include "vmc/video/fragment.h"
+#ifdef VMC_DRM_FOUND
+#include "vmc/video/drm_scanout.h"
+#endif
 #ifdef VMC_HAVE_FFMPEG
 #include "vmc/video/ffmpeg_decoder.h"
 #endif
@@ -117,6 +121,23 @@ static u16  g_cur_fid = 0;
 static u64  g_frame_arrival_us = 0;
 static u64  g_decode_oks = 0;   /* updated by the decode worker thread */
 static u64  g_presented = 0;
+static u64  g_onscreen_sum = 0, g_onscreen_cnt = 0;
+
+/* --- Design B (GPU scanout) state ---------------------------------- */
+#ifdef VMC_DRM_FOUND
+static vmc_drm_scanout g_drm;
+static bool g_use_drm = false;
+static void *g_cuda_lib = NULL;
+static int (*g_conv_async)(const void *, const void *, int, int, int, int,
+                           int, int, int, void **);
+static const unsigned char *(*g_conv_stage)(int);
+static int (*g_conv_wait)(void *);
+static void (*g_conv_free)(void *);
+static void *g_pending_ev = NULL;
+static int g_prev_stage = 0;
+static int g_stage_idx = 0;
+static u32 g_drm_send_ts[VMC_DRM_MAX_BUFS] = {0};
+#endif
 
 static void latency_update_rtt(vmc_session_ctx *sc, u32 sim_echo_ts) {
     const u64 c1 = sc->last_ka_send_us;
@@ -169,12 +190,15 @@ static void latency_report(void) {
     const u64 havj = g_nframe_cnt ? g_handoff_sum / g_nframe_cnt : 0;
     VMC_LOGI("latency n=%llu: e2e min=%llu avg=%llu p95=%llu max=%llu us | "
              "one-way=%u | queue avg=%llu | decode avg=%llu | "
-             "handoff avg=%llu us",
+             "handoff avg=%llu us | on-screen avg=%llu us",
              (unsigned long long)g_lat_cnt,
              (unsigned long long)g_lat_min, (unsigned long long)avg,
              (unsigned long long)p95, (unsigned long long)g_lat_max,
              (unsigned)g_one_way_us, (unsigned long long)javg,
-             (unsigned long long)davg, (unsigned long long)havj);
+             (unsigned long long)davg, (unsigned long long)havj,
+             (unsigned long long)(g_onscreen_cnt
+                                      ? g_onscreen_sum / g_onscreen_cnt
+                                      : 0));
 }
 
 /* --- On-screen latency overlay --------------------------------------
@@ -407,6 +431,15 @@ static void slot_release(int idx) {
 #ifdef VMC_HAVE_FFMPEG
 static void *decode_worker(void *arg) {
     vmc_decode_ctx *cx = (vmc_decode_ctx *)arg;
+#ifdef VMC_DRM_FOUND
+    /* Make the FFmpeg CUVID hw_device_ctx context current in THIS thread
+     * before any cuvidMapVideoFrame call (CUDA contexts are thread-affine). */
+    if (g_use_drm && g_cuda_lib && cx->dec->cuda_ctx) {
+        int (*setctx)(void *);
+        *(void **)(&setctx) = dlsym(g_cuda_lib, "cuda_set_current");
+        if (setctx) setctx(cx->dec->cuda_ctx);
+    }
+#endif
     while (g_run_decode) {
         int idx = -1;
         pthread_mutex_lock(&g_fmu);
@@ -447,6 +480,56 @@ static void *decode_worker(void *arg) {
             g_decode_oks++;
             i32 e2e = 0;
             u64 decode_us = t_decoded - t_assemble;
+#ifdef VMC_DRM_FOUND
+            if (g_use_drm) {
+                int buf_idx = -1;
+                void *dumb = vmc_drm_scanout_next_idx(&g_drm, &buf_idx);
+                if (!dumb) {
+                    /* all buffers busy: wait for a flip to free one, and
+                     * record the on-screen latency of the buffer reused. */
+                    vmc_drm_scanout_wait_flip(&g_drm, 60);
+                    dumb = vmc_drm_scanout_next_idx(&g_drm, &buf_idx);
+                }
+                if (!dumb) { slot_release(idx); continue; }
+                if (g_drm.bufs[buf_idx].last_flip_ts && g_drm_send_ts[buf_idx]
+                    && g_have_offset) {
+                    i32 onscreen = (i32)((u32)g_drm.bufs[buf_idx].last_flip_ts -
+                                         g_drm_send_ts[buf_idx] - g_offset_us);
+                    g_onscreen_sum += (u64)onscreen;
+                    g_onscreen_cnt++;
+                }
+                int stage = g_stage_idx % 3;
+                g_stage_idx++;
+                void *ev = NULL;
+                g_conv_async(f.planes[0], f.planes[1], f.width, f.height,
+                             f.stride[0], f.stride[1], stage, g_drm.w, g_drm.h,
+                             &ev);
+                if (g_pending_ev) {
+                    g_conv_wait(g_pending_ev);
+                    g_conv_free(g_pending_ev);
+                    memcpy(dumb, g_conv_stage(g_prev_stage),
+                           (size_t)g_drm.w * g_drm.h * 4u);
+                    if (g_have_offset) {
+                        const u64 t_handoff = vmc_time_now_us();
+                        e2e = (i32)((u32)t_handoff - real_send_ts -
+                                    g_offset_us);
+                        const u64 handoff_us = t_handoff - t_decoded;
+                        latency_record((u64)e2e, decode_us, queue_us,
+                                       handoff_us);
+                        g_drm_send_ts[buf_idx] = real_send_ts;
+                    }
+                    draw_overlay((u8 *)dumb, g_drm.w, g_drm.h, e2e, decode_us,
+                                 g_one_way_us);
+                    (void)vmc_drm_scanout_present(&g_drm);
+                    g_presented++;
+                }
+                g_pending_ev = ev;
+                g_prev_stage = stage;
+                (void)vmc_drm_scanout_drain(&g_drm);
+                slot_release(idx);
+                continue;
+            }
+#endif
             draw_overlay((u8 *)f.planes[0], f.width, f.height, e2e, decode_us,
                          g_one_way_us);
             if (g_have_offset) {
@@ -573,21 +656,70 @@ int main(int argc, char **argv) {
     vmc_decode_ctx dctx;
     pthread_t decode_tid;
     bool have_decoder = false;
-    if (have_display &&
-        vmc_ffmpeg_decoder_init(&dec, fbdisp.base.width, fbdisp.base.height) == VMC_OK &&
+    bool use_drm = false;
+#ifdef VMC_DRM_FOUND
+    /* Design B (GPU scanout, CUVID CUDA output) is EXPERIMENTAL: it requires
+     * cuvid output_format=cuda which is unreliable on this driver/FFmpeg.
+     * Enabled only when VMC_DRM=1 is set; otherwise the proven Design-A
+     * (CUVID NV12 -> CUDA conversion -> fb0) path is used. */
+    if (getenv("VMC_DRM") && getenv("VMC_DRM")[0] == '1') {
+        VMC_LOGI("Design B: attempting GPU scanout");
+        g_cuda_lib = dlopen("libnv12conv.so", RTLD_NOW);
+        if (!g_cuda_lib) { VMC_LOGW("Design B: dlopen failed: %s", dlerror()); }
+        else {
+            *(void **)(&g_conv_async) = dlsym(g_cuda_lib, "conv_async");
+            *(void **)(&g_conv_stage) = dlsym(g_cuda_lib, "conv_stage_ptr");
+            *(void **)(&g_conv_wait)  = dlsym(g_cuda_lib, "conv_wait_event");
+            *(void **)(&g_conv_free)  = dlsym(g_cuda_lib, "conv_free_event");
+            if (!(g_conv_async && g_conv_stage && g_conv_wait && g_conv_free)) {
+                VMC_LOGW("Design B: dlsym failed");
+            } else {
+                vmc_status drst = vmc_drm_scanout_init(&g_drm, NULL, 3);
+                if (drst != VMC_OK) {
+                    VMC_LOGW("Design B: scanout init failed (%d)", (int)drst);
+                } else {
+                    dec.output_cuda = true;
+                    use_drm = true;
+                    g_use_drm = true;
+                    VMC_LOGI("Design B (GPU scanout) ENABLED");
+                }
+            }
+        }
+    }
+#endif
+    if (vmc_ffmpeg_decoder_init(&dec, use_drm ? g_drm.w : fbdisp.base.width,
+                                use_drm ? g_drm.h : fbdisp.base.height) == VMC_OK &&
         vmc_decoder_open(&dec.base, VMC_VIDEO_CODEC_H264,
-                         fbdisp.base.width, fbdisp.base.height) == VMC_OK) {
+                         use_drm ? g_drm.w : fbdisp.base.width,
+                         use_drm ? g_drm.h : fbdisp.base.height) == VMC_OK) {
         g_write_slot = slot_take_write();
         if (vmc_frag_init(&frag, g_frames[g_write_slot].buf,
                           sizeof(g_frames[g_write_slot].buf)) == VMC_OK) {
             have_decoder = true;
         }
     }
+    if (!have_decoder && use_drm) {
+        /* decoder failed in cuda mode — fall back to the fb0 path. */
+        vmc_drm_scanout_close(&g_drm);
+        g_use_drm = false;
+        use_drm = false;
+        dec.output_cuda = false;
+        if (vmc_ffmpeg_decoder_init(&dec, fbdisp.base.width,
+                                    fbdisp.base.height) == VMC_OK &&
+            vmc_decoder_open(&dec.base, VMC_VIDEO_CODEC_H264,
+                             fbdisp.base.width, fbdisp.base.height) == VMC_OK) {
+            g_write_slot = slot_take_write();
+            if (vmc_frag_init(&frag, g_frames[g_write_slot].buf,
+                              sizeof(g_frames[g_write_slot].buf)) == VMC_OK) {
+                have_decoder = true;
+            }
+        }
+    }
     if (have_decoder) {
         dctx.dec = &dec;
         dctx.disp = &fbdisp.base;
         (void)pthread_create(&decode_tid, NULL, decode_worker, &dctx);
-        VMC_LOGI("decode worker thread started");
+        VMC_LOGI("decode worker thread started (drm=%d)", use_drm ? 1 : 0);
     }
 #else
     bool have_decoder = false;
@@ -774,6 +906,12 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&g_fmu);
         pthread_join(decode_tid, NULL);
         vmc_decoder_close(&dec.base);
+    }
+#endif
+#ifdef VMC_DRM_FOUND
+    if (g_use_drm) {
+        vmc_drm_scanout_close(&g_drm);
+        if (g_cuda_lib) dlclose(g_cuda_lib);
     }
 #endif
     vmc_mapper_destroy(mapper);

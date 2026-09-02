@@ -1,12 +1,17 @@
 #include "vmc/video/ffmpeg_decoder.h"
 
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
+#ifdef VMC_HAVE_CUDA
+#include <libavutil/hwcontext_cuda.h>
+#endif
 #include <libswscale/swscale.h>
 
 #include "vmc/core/error.h"
@@ -66,9 +71,42 @@ static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
     ctx->thread_count = 1;
     /* CUVID buffers frames unless low-latency mode is enabled. */
     ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-    /* CUVID: copy the decoded frame to system memory as NV12 so the
-     * existing swscale path works unchanged. */
-    av_opt_set(ctx->priv_data, "output_format", "nv12", 0);
+#ifdef VMC_HAVE_CUDA
+    if (fd->output_cuda) {
+        /* Provide our own CUDA device context + frames pool so CUVID's
+         * cuvidMapVideoFrame / cuMemcpy2DAsync bind to a context we can make
+         * current in the decode thread. */
+        AVBufferRef *hwdev = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_CUDA);
+        if (hwdev && av_hwdevice_ctx_init(hwdev) == 0) {
+            AVCUDADeviceContext *cuda_dev =
+                (AVCUDADeviceContext *)hwdev->data;
+            fd->cuda_ctx = (void *)cuda_dev->cuda_ctx;
+            ctx->hw_device_ctx = av_buffer_ref(hwdev);
+            ctx->hw_frames_ctx = av_hwframe_ctx_alloc(hwdev);
+            if (ctx->hw_frames_ctx) {
+                AVHWFramesContext *fc =
+                    (AVHWFramesContext *)ctx->hw_frames_ctx->data;
+                fc->format   = AV_PIX_FMT_CUDA;
+                fc->sw_format = AV_PIX_FMT_NV12;
+                fc->width    = 3840;
+                fc->height   = 2160;
+                fc->initial_pool_size = 4;
+                if (av_hwframe_ctx_init(ctx->hw_frames_ctx) != 0) {
+                    av_buffer_unref(&ctx->hw_frames_ctx);
+                    ctx->hw_frames_ctx = NULL;
+                }
+            }
+        }
+        av_buffer_unref(&hwdev);
+    }
+#endif
+    if (fd->output_cuda) {
+        /* Keep NV12 on the GPU for the Design-B path. */
+        av_opt_set(ctx->priv_data, "output_format", "cuda", 0);
+    } else {
+        /* Copy the decoded frame to system memory as NV12. */
+        av_opt_set(ctx->priv_data, "output_format", "nv12", 0);
+    }
     /* Force zero-frame decode delay: without it, large (4K) frames stay
      * queued in CUVID and avcodec_receive_frame returns EAGAIN forever. */
     av_opt_set(ctx->priv_data, "delay", "0", 0);
@@ -129,6 +167,20 @@ static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
         return VMC_ERR_NOMEM;
     }
     fd->opened = true;
+    /* Try to load the CUDA NV12->BGRA converter (GPU downscale). */
+    fd->cuda_lib = dlopen("libnv12conv.so", RTLD_NOW);
+    if (fd->cuda_lib) {
+        fd->cuda_conv = (int (*)(const u8 *, const u8 *, int, int, int, int,
+                                 u8 *, int, int))dlsym(fd->cuda_lib,
+                                                       "nv12_to_bgra");
+        if (fd->cuda_conv) {
+            VMC_LOGI("ffmpeg: using CUDA NV12->BGRA (libnv12conv.so)");
+        } else {
+            dlclose(fd->cuda_lib);
+            fd->cuda_lib = NULL;
+            fd->cuda_conv = NULL;
+        }
+    }
     VMC_LOGI("ffmpeg: H.264 decoder ready -> %ux%u RGB32",
              (unsigned)fd->out_w, (unsigned)fd->out_h);
     return VMC_OK;
@@ -136,6 +188,11 @@ static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
 
 static void ffmpeg_close(vmc_video_decoder *d) {
     vmc_ffmpeg_decoder *fd = (vmc_ffmpeg_decoder *)d;
+    if (fd->cuda_lib) {
+        dlclose(fd->cuda_lib);
+        fd->cuda_lib = NULL;
+        fd->cuda_conv = NULL;
+    }
     avcodec_cx *cx = (avcodec_cx *)fd->codec_ctx;
     if (cx) {
         if (cx->sws) sws_freeContext(cx->sws);
@@ -194,20 +251,44 @@ static vmc_status ffmpeg_decode(vmc_video_decoder *d, const u8 *data, sz_t len,
     }
     fd->last_frame_pts = cx->frame->pts;
 
-    /* Lazily create the scaler once we know the coded size. */
-    if (!cx->sws) {
-        cx->sws = sws_getContext(cx->frame->width, cx->frame->height,
-                                 (enum AVPixelFormat)cx->frame->format,
-                                 fd->out_w, fd->out_h, AV_PIX_FMT_BGRA,
-                                 SWS_BILINEAR, NULL, NULL, NULL);
-        if (!cx->sws) return VMC_ERR_NOSYS;
+    if (fd->output_cuda) {
+        /* Design B: return device NV12 pointers; conversion happens later on
+         * the GPU conversion stream. planes carry CUDA device addresses. */
+        memset(out, 0, sizeof(*out));
+        out->width      = (u16)cx->frame->width;
+        out->height     = (u16)cx->frame->height;
+        out->pixfmt     = VMC_PIXFMT_NV12;
+        out->stride[0]  = (u32)cx->frame->linesize[0];
+        out->stride[1]  = (u32)cx->frame->linesize[1];
+        out->device_mem = true;
+        out->planes[0]  = (const u8 *)cx->frame->data[0];
+        out->planes[1]  = (const u8 *)cx->frame->data[1];
+        return VMC_OK;
     }
 
-    u8 *dst_planes[4] = { fd->rgb, NULL, NULL, NULL };
-    const int dst_stride[4] = { (int)fd->out_w * 4, 0, 0, 0 };
-    (void)sws_scale(cx->sws, (const u8 *const *)cx->frame->data,
-                    cx->frame->linesize, 0, cx->frame->height,
-                    (u8 *const *)dst_planes, dst_stride);
+    if (fd->cuda_conv) {
+        /* GPU: NV12 -> BGRA (+ scale) in a CUDA kernel. */
+        if (fd->cuda_conv(cx->frame->data[0], cx->frame->data[1],
+                          cx->frame->width, cx->frame->height,
+                          cx->frame->linesize[0], cx->frame->linesize[1],
+                          fd->rgb, fd->out_w, fd->out_h) != 0) {
+            return VMC_ERR_IO;
+        }
+    } else {
+        /* CPU: swscale NV12 -> BGRA (+ scale). */
+        if (!cx->sws) {
+            cx->sws = sws_getContext(cx->frame->width, cx->frame->height,
+                                     (enum AVPixelFormat)cx->frame->format,
+                                     fd->out_w, fd->out_h, AV_PIX_FMT_BGRA,
+                                     SWS_BILINEAR, NULL, NULL, NULL);
+            if (!cx->sws) return VMC_ERR_NOSYS;
+        }
+        u8 *dst_planes[4] = { fd->rgb, NULL, NULL, NULL };
+        const int dst_stride[4] = { (int)fd->out_w * 4, 0, 0, 0 };
+        (void)sws_scale(cx->sws, (const u8 *const *)cx->frame->data,
+                        cx->frame->linesize, 0, cx->frame->height,
+                        (u8 *const *)dst_planes, dst_stride);
+    }
 
     memset(out, 0, sizeof(*out));
     out->width     = fd->out_w;
