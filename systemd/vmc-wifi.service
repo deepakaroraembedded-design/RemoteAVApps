@@ -1,0 +1,15 @@
+[Unit]
+Description=VMC thin client Wi-Fi auto-connect
+After=network-pre.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do ip link show wlp6s0 >/dev/null 2>&1 && break; sleep 1; done'
+ExecStartPre=/usr/sbin/wpa_supplicant -B -i wlp6s0 -c /etc/wpa_supplicant/wpa_supplicant.conf
+ExecStart=/sbin/dhclient wlp6s0
+ExecStartPost=/bin/bash -c 'ip route add 192.168.0.126/32 dev wlp6s0 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

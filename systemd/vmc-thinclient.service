@@ -1,0 +1,16 @@
+[Unit]
+Description=VMC thin client (CUVID decode -> HDMI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deepak7121
+WorkingDirectory=/home/deepak7121/thin-client
+Environment=VMC_DRM=1
+ExecStart=/home/deepak7121/thin-client/build/vmc-thinclient-app 192.168.0.126 9999 1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

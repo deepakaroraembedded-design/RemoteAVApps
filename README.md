@@ -49,6 +49,7 @@ src/          implementations (platform/linux holds Linux-specific code)
 apps/         thin client main application (decode-worker pipeline + overlay)
 tests/        unit tests (8 suites, dependency-free harness)
 tools/        mec_sim.py, wifi_connect.sh, cuda/nv12_conv.cu
+systemd/      vmc-thinclient.service, vmc-wifi.service
 ```
 
 ## Building
@@ -91,14 +92,26 @@ python3 tools/mec_sim.py 192.168.0.126 9999 6000 [width] [height]
 # e.g. ./build/vmc-thinclient-app 192.168.0.126 9999 1
 ```
 
+To enable the GPU scanout path (Design B) instead of the default framebuffer
+path, set `VMC_DRM=1`:
+
+```sh
+VMC_DRM=1 ./build/vmc-thinclient-app 192.168.0.126 9999 1
+```
+
 A green overlay in the top-left shows live E2E / DEC / NET latency; full
 stats + p95 are logged every 5 s.
 
 **3. As persistent services** (systemd, on the client):
 
+Service files are in `systemd/`. Copy them to `/etc/systemd/system/`, edit the
+user, home-directory, and Wi-Fi interface (`wlp6s0`) as needed, then:
+
 ```sh
+sudo cp systemd/*.service /etc/systemd/system/
+sudo systemctl daemon-reload
 systemctl enable --now vmc-wifi.service       # auto-join Wi-Fi at boot
-systemctl enable --now vmc-thinclient.service  # stream at boot
+systemctl enable --now vmc-thinclient.service  # stream at boot (VMC_DRM=1)
 ```
 
 ## Wire protocol
@@ -154,50 +167,43 @@ Isolated kernel is ~2 ms (vs ~13 ms swscale) — **6.7× faster**. In-pipeline t
 decode avg drops 13.0 → 11.5 ms, because CUVID's decode+NV12-copy (~9.5 ms)
 dominates and is unchanged. Enabled automatically when the `.so` is present.
 
-### 3. GPU scanout — Design B / Option 1 (implemented, experimental, BLOCKED)
-The full-GPU path: CUVID → CUDA frames → stream-overlapped conversion →
-DRM page-flip scanout. Opt-in with `VMC_DRM=1`. Components (all built and
-validated individually):
+### 3. GPU scanout — Design B / Option 1 (working, opt-in via `VMC_DRM=1`)
+The full-GPU path: CUVID → CUDA frames → stream-overlapped conversion → DRM
+page-flip scanout. The systemd service now enables this by default. Components:
 
 - **`drm_scanout.c`** — 3 dumb XRGB buffers, `drmModePageFlip` with
   `DRM_EVENT_FLIP_COMPLETE`, per-buffer flip timestamps → the host CPU gets
   **vsync-accurate "on screen" timing** (motion-to-photon).
 - **Stream-overlapped conversion** (`conv_async`/`conv_wait_event`) — a
   dedicated CUDA stream + **pinned staging**; the queue returns in ~0.04 ms and
-  the conversion (~1.5 ms) overlaps with the next frame's decode. Verified in a
-  standalone probe: ~0.9 ms CPU-visible per frame, ~0.05 ms queue.
-- **`output_format=cuda` decoder mode** — keeps NV12 on the GPU.
+  the conversion (~1.5 ms) overlaps with the next frame's decode.
+- **`get_format` + `av_hwdevice_ctx_create` decoder mode** — tells CUVID to expose
+  decoded frames as CUDA device pointers and creates a CUDA context that CUVID can
+  push/pop on this driver/FFmpeg combination.
 
-**Why Design B is blocked (root cause, in detail):**
+**Why Design B was originally blocked (and how it was fixed):**
 
-The enabling piece — CUVID's `output_format=cuda` (delivering decoded frames
-as CUDA device pointers via `cuvidMapVideoFrame`) — **fails on this
-driver/FFmpeg combination**, so the client cannot run the full GPU path. The
-failure chain:
+1. **CUDA context creation.** The old code used `av_hwdevice_ctx_alloc()` +
+   `av_hwdevice_ctx_init()` to create the CUDA context. On the current driver
+   this produces a context that CUVID cannot push (`CUDA_ERROR_INVALID_VALUE` /
+   `CUDA_ERROR_NOT_INITIALIZED`). The fix is to use `av_hwdevice_ctx_create()`
+   and a `get_format` callback that selects `AV_PIX_FMT_CUDA`.
 
-1. **CUDA context thread-affinity.** `cuvidMapVideoFrame` maps a NVDEC surface
-   into the *calling thread's current CUDA context*. CUDA contexts are
-   thread-affine: a context created/current in one thread must be made current
-   in any thread that uses it. Our decoder opens in the main thread but
-   decodes in a worker pthread. Without binding the context in the worker,
-   the map targets the wrong/no context → `CUDA_ERROR_ILLEGAL_ADDRESS`.
+2. **Context thread-affinity.** `cuvidMapVideoFrame` is managed internally by
+   FFmpeg's CUVID decoder. The old code called `cuCtxSetCurrent()` in the worker
+   thread before decoding, which broke CUVID's internal push/pop and caused
+   `CUDA_ERROR_OUT_OF_MEMORY` / `CUDA_ERROR_ILLEGAL_ADDRESS`. The fix is to let
+   FFmpeg manage the decoder context and have the conversion kernel call
+   `cudaSetDevice(0)` to activate the primary context only when it uses the
+   returned CUDA pointers.
 
-2. **Fixing the context isn't enough.** We provide our own CUDA device context
-   (`hw_device_ctx`) and bind it in the worker via `cuCtxSetCurrent`. But with
-   a `hw_device_ctx` set, FFmpeg switches to its generic CUDA hwaccel frame
-   delivery, which performs `cuMemcpy2DAsync` into a `hw_frames_ctx` pool —
-   and that also fails with `CUDA_ERROR_ILLEGAL_ADDRESS` (and
-   `cuvidMapVideoFrame` with `CUDA_ERROR_OUT_OF_MEMORY`). The full-decoder
-   `output_format=cuda` path and the hw_frames_ctx machinery conflict on this
-   driver.
+3. **`output_cuda` flag was reset before use.** `vmc_ffmpeg_decoder_init()` does
+   a `memset()` of the decoder struct, so the old code that set
+   `dec.output_cuda = true` before init silently lost the flag. The flag is now
+   set after init and before `vmc_decoder_open()`.
 
-3. **Why the CLI works but the API path doesn't.** `ffmpeg -c:v h264_cuvid`
-   decodes single-threaded with FFmpeg's internal CUDA machinery (its own
-   context, same thread). Driving the decoder through the raw `avcodec` API
-   from a separate thread trips the same calls with none of the CLI's setup.
-
-Net result: the cuvid-CUDA-frame delivery is the sole blocker; the conversion
-overlap and DRM scanout (the parts we built) are validated and working.
+Net result: the full GPU scanout path is now active, dropping decode latency to
+~6.9 ms (vs ~11.5 ms in Design A) and providing true motion-to-photon timing.
 
 ## GPU / display notes
 
@@ -249,8 +255,9 @@ pixels). The decoder test requires FFmpeg dev headers.
 - [x] GPU NV12→BGRA conversion (Design A, 6.7× faster than swscale)
 - [x] Design B components: DRM scanout + flip events, stream-overlapped conversion
 - [x] Wi-Fi driver (MT7902) + auto-connect, persistent services
-- [ ] Design B end-to-end (blocked: cuvid `output_format=cuda` on this driver;
-      next: EGL interop or decode-NV12 + DRM scanout)
+- [x] Design B end-to-end: DRM scanout + CUVID CUDA frames + stream-overlapped conversion
+- [ ] E2E latency measurement refinement for Design B (PTS-to-send mapping with CUVID 1-frame hold)
+- [ ] EGL interop or zero-copy decode-NV12 + DRM scanout
 - [ ] Audio I/O (ALSA) + full mixer
 - [ ] Mapper protocol hardening + session migration
 - [ ] Degraded-mode / offline fallback UI

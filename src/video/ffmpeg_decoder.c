@@ -35,6 +35,17 @@ typedef struct avcodec_cx {
     struct SwsContext *sws;
 } avcodec_cx;
 
+#ifdef VMC_HAVE_CUDA
+static enum AVPixelFormat get_cuda_format(AVCodecContext *ctx,
+                                          const enum AVPixelFormat *pix_fmts) {
+    (void)ctx;
+    for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        if (*p == AV_PIX_FMT_CUDA) return AV_PIX_FMT_CUDA;
+    }
+    return pix_fmts[0];
+}
+#endif
+
 static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
                               u16 width, u16 height) {
     (void)width;
@@ -56,6 +67,7 @@ static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
             break;
         }
     }
+
     if (!avcodec) {
         avcodec = avcodec_find_decoder(AV_CODEC_ID_H264);
         used = "h264 (software)";
@@ -73,42 +85,29 @@ static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
     ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 #ifdef VMC_HAVE_CUDA
     if (fd->output_cuda) {
-        /* Provide our own CUDA device context + frames pool so CUVID's
-         * cuvidMapVideoFrame / cuMemcpy2DAsync bind to a context we can make
-         * current in the decode thread. */
-        AVBufferRef *hwdev = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_CUDA);
-        if (hwdev && av_hwdevice_ctx_init(hwdev) == 0) {
-            AVCUDADeviceContext *cuda_dev =
-                (AVCUDADeviceContext *)hwdev->data;
-            fd->cuda_ctx = (void *)cuda_dev->cuda_ctx;
-            ctx->hw_device_ctx = av_buffer_ref(hwdev);
-            ctx->hw_frames_ctx = av_hwframe_ctx_alloc(hwdev);
-            if (ctx->hw_frames_ctx) {
-                AVHWFramesContext *fc =
-                    (AVHWFramesContext *)ctx->hw_frames_ctx->data;
-                fc->format   = AV_PIX_FMT_CUDA;
-                fc->sw_format = AV_PIX_FMT_NV12;
-                fc->width    = 3840;
-                fc->height   = 2160;
-                fc->initial_pool_size = 4;
-                if (av_hwframe_ctx_init(ctx->hw_frames_ctx) != 0) {
-                    av_buffer_unref(&ctx->hw_frames_ctx);
-                    ctx->hw_frames_ctx = NULL;
-                }
-            }
+        /* Create a CUDA hw device context that CUVID can push/pop.  Using
+         * av_hwdevice_ctx_create succeeds on this driver; the older
+         * av_hwdevice_ctx_alloc + av_hwdevice_ctx_init path creates a
+         * context that CUVID rejects with CUDA_ERROR_INVALID_VALUE /
+         * CUDA_ERROR_NOT_INITIALIZED. */
+        AVBufferRef *hwdev = NULL;
+        if (av_hwdevice_ctx_create(&hwdev, AV_HWDEVICE_TYPE_CUDA, NULL,
+                                   NULL, 0) != 0) {
+            VMC_LOGW("ffmpeg: CUDA hw_device_ctx creation failed, "
+                     "cannot use Design-B GPU scanout");
+            avcodec_free_context(&ctx);
+            return VMC_ERR_IO;
         }
+        AVCUDADeviceContext *cuda_dev = (AVCUDADeviceContext *)hwdev->data;
+        fd->cuda_ctx = (void *)cuda_dev->cuda_ctx;
+        ctx->hw_device_ctx = av_buffer_ref(hwdev);
+        /* Tell the decoder to expose CUDA device frames. */
+        ctx->get_format = get_cuda_format;
         av_buffer_unref(&hwdev);
     }
 #endif
-    if (fd->output_cuda) {
-        /* Keep NV12 on the GPU for the Design-B path. */
-        av_opt_set(ctx->priv_data, "output_format", "cuda", 0);
-    } else {
-        /* Copy the decoded frame to system memory as NV12. */
-        av_opt_set(ctx->priv_data, "output_format", "nv12", 0);
-    }
     /* Force zero-frame decode delay: without it, large (4K) frames stay
-     * queued in CUVID and avcodec_receive_frame returns EAGAIN forever. */
+      * queued in CUVID and avcodec_receive_frame returns EAGAIN forever. */
     av_opt_set(ctx->priv_data, "delay", "0", 0);
     if (avcodec_open2(ctx, avcodec, NULL) != 0) {
         avcodec_free_context(&ctx);

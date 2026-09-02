@@ -192,8 +192,10 @@ int conv_async(const void *d_y, const void *d_uv, int w, int h, int y_stride,
                void **out_event) {
     static int inited = 0;
     if (!inited) {
-        /* Operate in the CURRENT context (the caller binds CUVID's context);
-         * device pointers are context-specific, so we must NOT switch. */
+        /* Activate the primary CUDA context for this device.  FFmpeg's CUVID
+         * decoder also uses the primary context via av_hwdevice_ctx_create(),
+         * so the device pointers it gives us are valid here. */
+        if (cudaSetDevice(0) != cudaSuccess) return -1;
         if (cudaStreamCreate(&g_conv_stream) != cudaSuccess) return -1;
         inited = 1;
     }

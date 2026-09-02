@@ -432,13 +432,14 @@ static void slot_release(int idx) {
 static void *decode_worker(void *arg) {
     vmc_decode_ctx *cx = (vmc_decode_ctx *)arg;
 #ifdef VMC_DRM_FOUND
-    /* Make the FFmpeg CUVID hw_device_ctx context current in THIS thread
-     * before any cuvidMapVideoFrame call (CUDA contexts are thread-affine). */
-    if (g_use_drm && g_cuda_lib && cx->dec->cuda_ctx) {
-        int (*setctx)(void *);
-        *(void **)(&setctx) = dlsym(g_cuda_lib, "cuda_set_current");
-        if (setctx) setctx(cx->dec->cuda_ctx);
-    }
+    /* Do NOT manually push a CUDA context here.  FFmpeg's CUVID decoder
+     * manages its own context push/pop around cuvidMapVideoFrame; forcing a
+     * different context current in the worker before decoding causes
+     * cuvidMapVideoFrame to fail with CUDA_ERROR_OUT_OF_MEMORY / ILLEGAL_ADDRESS.
+     * The conversion kernel in libnv12conv.so calls cudaSetDevice(0) before
+     * using the returned CUDA device pointers, which brings the primary context
+     * (the same one used by the decoder) current at the right time. */
+    (void)cx;
 #endif
     while (g_run_decode) {
         int idx = -1;
@@ -678,7 +679,6 @@ int main(int argc, char **argv) {
                 if (drst != VMC_OK) {
                     VMC_LOGW("Design B: scanout init failed (%d)", (int)drst);
                 } else {
-                    dec.output_cuda = true;
                     use_drm = true;
                     g_use_drm = true;
                     VMC_LOGI("Design B (GPU scanout) ENABLED");
@@ -688,14 +688,17 @@ int main(int argc, char **argv) {
     }
 #endif
     if (vmc_ffmpeg_decoder_init(&dec, use_drm ? g_drm.w : fbdisp.base.width,
-                                use_drm ? g_drm.h : fbdisp.base.height) == VMC_OK &&
-        vmc_decoder_open(&dec.base, VMC_VIDEO_CODEC_H264,
-                         use_drm ? g_drm.w : fbdisp.base.width,
-                         use_drm ? g_drm.h : fbdisp.base.height) == VMC_OK) {
-        g_write_slot = slot_take_write();
-        if (vmc_frag_init(&frag, g_frames[g_write_slot].buf,
-                          sizeof(g_frames[g_write_slot].buf)) == VMC_OK) {
-            have_decoder = true;
+                                use_drm ? g_drm.h : fbdisp.base.height) == VMC_OK) {
+        /* output_cuda must be set after init (init does memset). */
+        if (use_drm) dec.output_cuda = true;
+        if (vmc_decoder_open(&dec.base, VMC_VIDEO_CODEC_H264,
+                             use_drm ? g_drm.w : fbdisp.base.width,
+                             use_drm ? g_drm.h : fbdisp.base.height) == VMC_OK) {
+            g_write_slot = slot_take_write();
+            if (vmc_frag_init(&frag, g_frames[g_write_slot].buf,
+                              sizeof(g_frames[g_write_slot].buf)) == VMC_OK) {
+                have_decoder = true;
+            }
         }
     }
     if (!have_decoder && use_drm) {
