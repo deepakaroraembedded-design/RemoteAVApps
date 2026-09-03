@@ -36,6 +36,11 @@
 #endif
 #ifdef VMC_HAVE_FFMPEG
 #include "vmc/video/ffmpeg_decoder.h"
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
+#include <libavutil/time.h>
+#include <libswresample/swresample.h>
 #endif
 #ifdef VMC_HAVE_ALSA
 #include "vmc/audio/pipeline.h"
@@ -611,18 +616,384 @@ static void *audio_worker(void *arg) {
 }
 #endif /* VMC_HAVE_ALSA */
 
+#ifdef VMC_HAVE_FFMPEG
+/* Publish one Annex-B access unit to the decode pipeline. */
+static void dash_publish_au(const u8 *data, int size) {
+    const int idx = slot_take_write();
+    if ((sz_t)size <= sizeof(g_frames[idx].buf)) {
+        memcpy(g_frames[idx].buf, data, (sz_t)size);
+        slot_publish(idx, (sz_t)size, 0);
+    } else {
+        pthread_mutex_lock(&g_fmu);
+        g_frames[idx].state = SLOT_FREE;
+        pthread_cond_signal(&g_ffree);
+        pthread_mutex_unlock(&g_fmu);
+    }
+}
+
+/* Live DASH (LL-DASH) source: libavformat dash demuxer over HTTP, converted
+ * to Annex-B access units, fed to the shared decode worker. */
+static void *dash_reader(void *arg) {
+    const char *url = (const char *)arg;
+    AVFormatContext *fmt = NULL;
+    bool opened = false;
+    for (int attempt = 0; attempt < 30 && g_run; attempt++) {
+        AVDictionary *opts = NULL;
+        av_dict_set(&opts, "avioflags", "direct", 0);
+        if (avformat_open_input(&fmt, url, NULL, &opts) == 0) {
+            opened = true;
+            av_dict_free(&opts);
+            break;
+        }
+        av_dict_free(&opts);
+        VMC_LOGW("dash: cannot open %s (attempt %d) — retrying", url,
+                 attempt + 1);
+        av_usleep(2000000);
+    }
+    if (!opened) {
+        VMC_LOGE("dash: giving up on %s", url);
+        return NULL;
+    }
+    if (avformat_find_stream_info(fmt, NULL) < 0) {
+        VMC_LOGE("dash: find_stream_info failed");
+        avformat_close_input(&fmt);
+        return NULL;
+    }
+    int vs = -1;
+    for (unsigned i = 0; i < fmt->nb_streams; i++) {
+        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            vs = (int)i;
+            break;
+        }
+    }
+    if (vs < 0) {
+        VMC_LOGE("dash: no video stream");
+        avformat_close_input(&fmt);
+        return NULL;
+    }
+    VMC_LOGI("dash: live source %s (%dx%d @%d/%d fps)", url,
+             fmt->streams[vs]->codecpar->width, fmt->streams[vs]->codecpar->height,
+             fmt->streams[vs]->avg_frame_rate.num,
+             fmt->streams[vs]->avg_frame_rate.den);
+
+    const AVBitStreamFilter *bsf = av_bsf_get_by_name("h264_mp4toannexb");
+    AVBSFContext *bsfc = NULL;
+    if (bsf && av_bsf_alloc(bsf, &bsfc) == 0 &&
+        avcodec_parameters_copy(bsfc->par_in, fmt->streams[vs]->codecpar) == 0 &&
+        av_bsf_init(bsfc) == 0) {
+        /* ready */
+    } else {
+        if (bsfc) av_bsf_free(&bsfc);
+        bsfc = NULL;
+    }
+
+    /* --- DASH audio: AAC -> FLTP -> resample -> S16 stereo 48k -> FIFO --- */
+    int as = -1;
+    for (unsigned i = 0; i < fmt->nb_streams; i++) {
+        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            as = (int)i;
+            break;
+        }
+    }
+#ifdef VMC_HAVE_ALSA
+    AVCodecContext *actx = NULL;
+    SwrContext *swr = NULL;
+    AVFrame *aframe = NULL;
+    i16 *apcm = NULL;
+    int apcm_cap = 0;
+    if (as >= 0) {
+        const AVCodec *acodec =
+            avcodec_find_decoder(fmt->streams[as]->codecpar->codec_id);
+        if (acodec) {
+            actx = avcodec_alloc_context3(acodec);
+            if (actx &&
+                avcodec_parameters_to_context(
+                    actx, fmt->streams[as]->codecpar) == 0 &&
+                avcodec_open2(actx, acodec, NULL) == 0) {
+#if LIBSWRESAMPLE_VERSION_MAJOR >= 4
+                AVChannelLayout ch_out = AV_CHANNEL_LAYOUT_STEREO;
+                if (swr_alloc_set_opts2(&swr, &ch_out, AV_SAMPLE_FMT_S16,
+                                        VMC_AUDIO_SAMPLE_RATE,
+                                        &actx->ch_layout, actx->sample_fmt,
+                                        actx->sample_rate, 0, NULL) == 0 &&
+                    swr_init(swr) == 0) {
+                    aframe = av_frame_alloc();
+                } else {
+                    if (swr) {
+                        swr_free(&swr);
+                        swr = NULL;
+                    }
+                    avcodec_free_context(&actx);
+                    actx = NULL;
+                }
+#else
+                swr = swr_alloc_set_opts(
+                    NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16,
+                    VMC_AUDIO_SAMPLE_RATE, actx->channel_layout,
+                    actx->sample_fmt, actx->sample_rate, 0, NULL);
+                if (swr && swr_init(swr) == 0) {
+                    aframe = av_frame_alloc();
+                } else {
+                    if (swr) swr_free(&swr);
+                    swr = NULL;
+                    avcodec_free_context(&actx);
+                    actx = NULL;
+                }
+#endif
+                if (actx) {
+                    VMC_LOGI("dash: audio stream %d (%s %d Hz -> S16 %d Hz)",
+                             as, avcodec_get_name(actx->codec_id),
+                             actx->sample_rate, VMC_AUDIO_SAMPLE_RATE);
+                }
+            } else {
+                if (actx) avcodec_free_context(&actx);
+                actx = NULL;
+            }
+        }
+    }
+#else
+    AVCodecContext *actx = NULL;
+    SwrContext *swr = NULL;
+    AVFrame *aframe = NULL;
+    i16 *apcm = NULL;
+    int apcm_cap = 0;
+#endif
+
+    AVPacket *pkt = av_packet_alloc();
+    AVPacket *out = av_packet_alloc();
+    while (g_run) {
+        const int r = av_read_frame(fmt, pkt);
+        if (r < 0) {
+            if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) {
+                av_usleep(20000);
+                continue;
+            }
+            VMC_LOGW("dash: read error %d", r);
+            av_usleep(50000);
+            continue;
+        }
+        if (pkt->stream_index == vs) {
+            if (bsfc) {
+                if (av_bsf_send_packet(bsfc, pkt) == 0) {
+                    while (av_bsf_receive_packet(bsfc, out) == 0) {
+                        if (out->size > 0) dash_publish_au(out->data, out->size);
+                        av_packet_unref(out);
+                    }
+                }
+                av_packet_unref(pkt);
+            } else {
+                if (pkt->size > 0) dash_publish_au(pkt->data, pkt->size);
+                av_packet_unref(pkt);
+            }
+        } else if (pkt->stream_index == as && actx && swr && aframe) {
+            if (avcodec_send_packet(actx, pkt) == 0) {
+                while (avcodec_receive_frame(actx, aframe) == 0) {
+                    const int out_samples =
+                        swr_get_out_samples(swr, aframe->nb_samples);
+                    const int out_bytes = out_samples * 2 * 2;
+                    if (out_bytes > apcm_cap) {
+                        i16 *nb = (i16 *)realloc(apcm, (sz_t)out_bytes);
+                        if (!nb) break;
+                        apcm = nb;
+                        apcm_cap = out_bytes;
+                    }
+                    const int got = swr_convert(
+                        swr, (u8 **)&apcm, out_samples,
+                        (const u8 **)aframe->extended_data, aframe->nb_samples);
+                    if (got > 0) {
+                        pthread_mutex_lock(&g_audio_mu);
+                        (void)vmc_ringbuf_write(
+                            &g_audio_rb, apcm, (sz_t)got * 2 * 2);
+                        pthread_cond_signal(&g_audio_cv);
+                        pthread_mutex_unlock(&g_audio_mu);
+                    }
+                    av_frame_unref(aframe);
+                }
+            }
+            av_packet_unref(pkt);
+        } else {
+            av_packet_unref(pkt);
+        }
+    }
+    av_packet_free(&pkt);
+    av_packet_free(&out);
+    if (bsfc) av_bsf_free(&bsfc);
+#ifdef VMC_HAVE_ALSA
+    if (actx) avcodec_free_context(&actx);
+    if (swr) swr_free(&swr);
+    if (aframe) av_frame_free(&aframe);
+    free(apcm);
+#endif
+    avformat_close_input(&fmt);
+    VMC_LOGI("dash: reader stopped");
+    return NULL;
+}
+
+/* DASH mode entry: display + CUVID decode + DRM scanout driven by the live
+ * DASH reader instead of the UDP transport. */
+static int run_dash(const char *url, vmc_log_level log_level) {
+    vmc_log_set_level(log_level);
+    VMC_LOGI("VMC DASH client %s starting (%s)", VMC_VERSION, url);
+
+    vmc_fb_display fbdisp;
+    u8 *frame_rgb = NULL;
+    bool have_display = vmc_fb_display_init(&fbdisp, "/dev/fb0") == VMC_OK;
+    if (have_display) {
+        have_display = vmc_display_open(&fbdisp.base, 0, 0) == VMC_OK;
+        if (have_display) {
+            frame_rgb = (u8 *)malloc((sz_t)fbdisp.base.width *
+                                     fbdisp.base.height * 4u);
+            if (!frame_rgb) have_display = false;
+            VMC_LOGI("display: %ux%u via /dev/fb0",
+                     (unsigned)fbdisp.base.width, (unsigned)fbdisp.base.height);
+        }
+    }
+    if (!have_display) {
+        VMC_LOGW("display unavailable — running headless (log-only)");
+    }
+
+    vmc_ffmpeg_decoder dec;
+    vmc_decode_ctx dctx;
+    pthread_t decode_tid;
+    bool have_decoder = false;
+    bool use_drm = false;
+#ifdef VMC_DRM_FOUND
+    if (getenv("VMC_DRM") && getenv("VMC_DRM")[0] == '1') {
+        VMC_LOGI("Design B: attempting GPU scanout");
+        g_cuda_lib = dlopen("libnv12conv.so", RTLD_NOW);
+        if (!g_cuda_lib) { VMC_LOGW("Design B: dlopen failed: %s", dlerror()); }
+        else {
+            *(void **)(&g_conv_async) = dlsym(g_cuda_lib, "conv_async");
+            *(void **)(&g_conv_stage) = dlsym(g_cuda_lib, "conv_stage_ptr");
+            *(void **)(&g_conv_wait)  = dlsym(g_cuda_lib, "conv_wait_event");
+            *(void **)(&g_conv_free)  = dlsym(g_cuda_lib, "conv_free_event");
+            if (!(g_conv_async && g_conv_stage && g_conv_wait && g_conv_free)) {
+                VMC_LOGW("Design B: dlsym failed");
+            } else {
+                if (vmc_drm_scanout_init(&g_drm, NULL, 3) == VMC_OK) {
+                    use_drm = true;
+                    g_use_drm = true;
+                    VMC_LOGI("Design B (GPU scanout) ENABLED");
+                }
+            }
+        }
+    }
+#endif
+    if (vmc_ffmpeg_decoder_init(&dec, use_drm ? g_drm.w : fbdisp.base.width,
+                                use_drm ? g_drm.h : fbdisp.base.height) == VMC_OK) {
+        if (use_drm) dec.output_cuda = true;
+        if (vmc_decoder_open(&dec.base, VMC_VIDEO_CODEC_H264,
+                             use_drm ? g_drm.w : fbdisp.base.width,
+                             use_drm ? g_drm.h : fbdisp.base.height) == VMC_OK) {
+            have_decoder = true;
+        }
+    }
+    if (have_decoder) {
+        dctx.dec = &dec;
+        dctx.disp = &fbdisp.base;
+        (void)pthread_create(&decode_tid, NULL, decode_worker, &dctx);
+        VMC_LOGI("decode worker thread started (drm=%d)", use_drm ? 1 : 0);
+    }
+
+#ifdef VMC_HAVE_ALSA
+    if (vmc_ringbuf_init(&g_audio_rb, g_audio_storage,
+                         sizeof(g_audio_storage)) == VMC_OK) {
+        vmc_audio_pipeline_init(&g_audio_pipe);
+        if (vmc_alsa_sink_init(&g_audio_pipe.sink, NULL) == VMC_OK) {
+            if (pthread_create(&g_audio_tid, NULL, audio_worker, NULL) == 0) {
+                g_audio_started = true;
+                VMC_LOGI("audio playback thread started");
+            }
+        }
+    }
+#endif
+
+    pthread_t dash_tid;
+    if (pthread_create(&dash_tid, NULL, dash_reader, (void *)url) != 0) {
+        VMC_LOGE("dash: reader thread failed");
+        return 1;
+    }
+    VMC_LOGI("dash reader thread started");
+
+    u64 last_stats_ms = 0;
+    while (g_run) {
+        const u64 now_ms = vmc_time_now_ms();
+        if (now_ms - last_stats_ms >= 5000) {
+            u64 audio_buf = 0;
+#ifdef VMC_HAVE_ALSA
+            pthread_mutex_lock(&g_audio_mu);
+            audio_buf = vmc_ringbuf_used(&g_audio_rb);
+            pthread_mutex_unlock(&g_audio_mu);
+#endif
+            VMC_LOGI("dash stats: decode=%llu presented=%llu | audio fifo=%llu B",
+                     (unsigned long long)g_decode_oks,
+                     (unsigned long long)g_presented,
+                     (unsigned long long)audio_buf);
+            last_stats_ms = now_ms;
+        }
+        vmc_sleep_ms(200);
+    }
+
+    VMC_LOGI("shutting down (dash)");
+    if (have_decoder) {
+        g_run_decode = false;
+        pthread_mutex_lock(&g_fmu);
+        pthread_cond_broadcast(&g_fready);
+        pthread_mutex_unlock(&g_fmu);
+        pthread_join(decode_tid, NULL);
+        vmc_decoder_close(&dec.base);
+    }
+#ifdef VMC_DRM_FOUND
+    if (g_use_drm) {
+        vmc_drm_scanout_close(&g_drm);
+        if (g_cuda_lib) dlclose(g_cuda_lib);
+    }
+#endif
+#ifdef VMC_HAVE_ALSA
+    if (g_audio_started) {
+        g_run_audio = false;
+        pthread_mutex_lock(&g_audio_mu);
+        pthread_cond_broadcast(&g_audio_cv);
+        pthread_mutex_unlock(&g_audio_mu);
+        pthread_join(g_audio_tid, NULL);
+        vmc_alsa_sink_close(&g_audio_pipe.sink);
+    }
+#endif
+    if (have_display) {
+        vmc_display_close(&fbdisp.base);
+        free(frame_rgb);
+    }
+    return 0;
+}
+#endif /* VMC_HAVE_FFMPEG */
+
 int main(int argc, char **argv) {
     const char *mapper_host = APP_MAPPER_HOST;
     u16 mapper_port = APP_MAPPER_PORT;
     vmc_log_level log_level = VMC_LOG_INFO;
+    const char *dash_url = NULL;
 
-    if (argc > 1) mapper_host = argv[1];
-    if (argc > 2) mapper_port = (u16)atoi(argv[2]);
-    if (argc > 3) log_level = (vmc_log_level)atoi(argv[3]);
+    int pos = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--dash") == 0 && i + 1 < argc) {
+            dash_url = argv[++i];
+            continue;
+        }
+        if (pos == 0) mapper_host = argv[i];
+        else if (pos == 1) mapper_port = (u16)atoi(argv[i]);
+        else if (pos == 2) log_level = (vmc_log_level)atoi(argv[i]);
+        pos++;
+    }
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
     vmc_log_set_level(log_level);
+
+#ifdef VMC_HAVE_FFMPEG
+    if (dash_url) {
+        return run_dash(dash_url, log_level);
+    }
+#endif
 
     VMC_LOGI("VMC thin client %s starting (mapper %s:%u)",
              VMC_VERSION, mapper_host, (unsigned)mapper_port);

@@ -1,0 +1,15 @@
+[Unit]
+Description=VMC LL-DASH live server (ffmpeg DASH packager + HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deepak7121
+WorkingDirectory=/home/deepak7121/REMOTEAPPS/thin-client
+ExecStart=/home/deepak7121/REMOTEAPPS/thin-client/build/tools/vmc-dash-sim/vmc-dash-sim --input /home/deepak7121/FLUX3/1225am0807/swiftrade_av_60s_20260807_110902.mp4 --port 8080
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

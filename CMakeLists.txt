@@ -66,6 +66,8 @@ find_path(VMC_FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
 find_library(VMC_AVCODEC_LIBRARY avcodec)
 find_library(VMC_AVUTIL_LIBRARY avutil)
 find_library(VMC_SWSCALE_LIBRARY swscale)
+find_library(VMC_AVFORMAT_LIBRARY avformat)
+find_library(VMC_SWRESAMPLE_LIBRARY swresample)
 if(VMC_FFMPEG_INCLUDE_DIR AND VMC_AVCODEC_LIBRARY AND VMC_AVUTIL_LIBRARY AND VMC_SWSCALE_LIBRARY)
     list(APPEND VMC_CORE_SOURCES src/video/ffmpeg_decoder.c)
     set(VMC_FFMPEG_FOUND TRUE)
@@ -132,6 +134,12 @@ endif()
 
 add_executable(vmc-thinclient-app apps/thinclient/main.c)
 target_link_libraries(vmc-thinclient-app PRIVATE vmc_thinclient)
+if(VMC_AVFORMAT_LIBRARY)
+    target_link_libraries(vmc-thinclient-app PRIVATE ${VMC_AVFORMAT_LIBRARY})
+endif()
+if(VMC_SWRESAMPLE_LIBRARY)
+    target_link_libraries(vmc-thinclient-app PRIVATE ${VMC_SWRESAMPLE_LIBRARY})
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(vmc-thinclient-app PRIVATE Threads::Threads)
 
@@ -142,5 +150,7 @@ endif()
 
 # MEC simulator (C/CUDA sender).
 add_subdirectory(tools/vmc_sim)
+# LL-DASH live server (ffmpeg DASH packager + HTTP server).
+add_subdirectory(tools/vmc-dash-sim)
 
 # Example cross-compile toolchain is documented in cmake/README-toolchains.md
