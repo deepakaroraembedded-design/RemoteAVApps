@@ -23,11 +23,17 @@ static void flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
     (void)seq;
     /* tv_sec/tv_usec are CLOCK_MONOTONIC at flip-complete (vsync). */
     vmc_drm_scanout *s = (vmc_drm_scanout *)user;
-    vmc_drm_buffer *b = &s->bufs[s->last_presented];
-    b->busy = false;
-    b->last_flip_ts = (u64)tv_sec * 1000000u + (u64)tv_usec;
+    /* Clear the buffer that was ACTUALLY flipped (recorded when the flip was
+     * submitted), not last_presented — that field advances to the next write
+     * target before this event arrives, which would corrupt the busy flags. */
+    if (s->flip_pending >= 0) {
+        vmc_drm_buffer *b = &s->bufs[s->flip_pending];
+        b->busy = false;
+        b->last_flip_ts = (u64)tv_sec * 1000000u + (u64)tv_usec;
+        s->flip_pending = -1;
+    }
     s->flips_done++;
-    s->last_flip_ts_us = b->last_flip_ts;
+    s->last_flip_ts_us = (u64)tv_sec * 1000000u + (u64)tv_usec;
 }
 
 static u32 create_dumb(int fd, u32 w, u32 h, u32 *pitch, u64 *size) {
@@ -99,6 +105,7 @@ vmc_status vmc_drm_scanout_init(vmc_drm_scanout *s, const char *dev, int nbufs) 
     s->crtc = res->crtcs[0];
     s->w = mode.hdisplay;
     s->h = mode.vdisplay;
+    s->flip_pending = -1;
     VMC_LOGI("drm: conn=%u crtc=%u %ux%u@%u", s->conn, s->crtc, s->w, s->h,
              mode.vrefresh);
 
@@ -160,14 +167,32 @@ void *vmc_drm_scanout_next_idx(vmc_drm_scanout *s, int *out_idx) {
 
 vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s) {
     int idx = (int)s->last_presented;
-    if (s->bufs[idx].busy) return VMC_ERR_AGAIN;
-    if (drmModePageFlip(s->fd, s->crtc, s->bufs[idx].fb,
-                        DRM_MODE_PAGE_FLIP_EVENT, s) < 0) {
+    if (s->bufs[idx].busy) {
+        static int busy_warn = 0;
+        if ((busy_warn++ % 100) == 0)
+            VMC_LOGW("drm: scanout buffer %d still busy (flip event missing)",
+                     idx);
+        return VMC_ERR_AGAIN;
+    }
+    /* DRM allows only one page flip per CRTC. If the previous flip is still
+     * pending (we presented faster than a vblank), wait for its completion
+     * event and retry instead of failing — this also paces presentation to
+     * the display refresh. */
+    for (int tries = 0; tries < 5; tries++) {
+        if (drmModePageFlip(s->fd, s->crtc, s->bufs[idx].fb,
+                            DRM_MODE_PAGE_FLIP_EVENT, s) == 0) {
+            s->bufs[idx].busy = true;
+            s->flip_pending = idx;   /* record which buffer this event belongs to */
+            return VMC_OK;
+        }
+        if (errno == EBUSY) {
+            (void)vmc_drm_scanout_wait_flip(s, 20);
+            continue;
+        }
         VMC_LOGW("drm: PageFlip failed: %s", strerror(errno));
         return VMC_ERR_IO;
     }
-    s->bufs[idx].busy = true;
-    return VMC_OK;
+    return VMC_ERR_AGAIN;
 }
 
 static int drain_events(vmc_drm_scanout *s, int timeout_ms) {

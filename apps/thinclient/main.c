@@ -10,12 +10,21 @@
  * Usage: vmc-thinclient-app [mapper_host] [mapper_port]
  * SPDX-License-Identifier: MIT
  */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <poll.h>
+#include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "vmc/vmc.h"
 #include "vmc/core/logger.h"
@@ -130,8 +139,22 @@ static u64 g_nframe_cnt = 0;
 static u16  g_cur_fid = 0;
 static u64  g_frame_arrival_us = 0;
 static u64  g_decode_oks = 0;   /* updated by the decode worker thread */
+static u64  g_decode_fails = 0; /* decoder non-success (updated by worker) */
+static u64 g_dash_pkts = 0;    /* video packets read from demuxer */
+static volatile bool g_run_reader = true; /* dash reader thread run flag */
+static u64  g_dash_pub = 0;     /* AUs published to decode slots */
 static u64  g_presented = 0;
 static u64  g_onscreen_sum = 0, g_onscreen_cnt = 0;
+
+/* On-screen latency overlay is off unless VMC_HUD=1. */
+static bool g_hud = false;
+
+/* Video presentation pacing: the DASH reader delivers one 1 s segment per
+ * fetch, so without pacing the decode worker presents all frames of a segment
+ * back-to-back then idles until the next segment arrives — visible judder.
+ * The CUVID decoder assigns each access unit a monotonic PTS (frame index);
+ * pace the page flip to the stream frame rate anchored on the first frame. */
+static int  g_stream_fps = 0;   /* stream video frame rate (0 = pacing off) */
 
 /* --- Design B (GPU scanout) state ---------------------------------- */
 #ifdef VMC_DRM_FOUND
@@ -386,7 +409,7 @@ static void draw_overlay(u8 *rgb, u32 w, u32 h, u32 pitch, i32 e2e_us,
 /* --- Decode pipeline (producer/consumer) ---------------------------
  * The main loop assembles frames (producer); a decode thread decodes +
  * presents them so receive never blocks on the slow decode/swscale step. */
-#define VMC_FRAME_SLOTS 3
+#define VMC_FRAME_SLOTS 32
 
 enum { SLOT_FREE = 0, SLOT_READY = 1, SLOT_DECODING = 2, SLOT_WRITING = 3 };
 
@@ -445,6 +468,12 @@ static void slot_release(int idx) {
 }
 
 #ifdef VMC_HAVE_FFMPEG
+/* The DASH reader delivers one 1 s segment per fetch, so without pacing each
+ * segment's 24 video access units (and the interleaved audio) would burst
+ * into the pipeline and be presented back-to-back before a long idle — visible
+ * judder. The decode worker paces the presentation to the content frame rate;
+ * the frame slots (VMC_FRAME_SLOTS) absorb the per-segment bursts. */
+
 static void *decode_worker(void *arg) {
     vmc_decode_ctx *cx = (vmc_decode_ctx *)arg;
 #ifdef VMC_DRM_FOUND
@@ -457,7 +486,33 @@ static void *decode_worker(void *arg) {
      * (the same one used by the decoder) current at the right time. */
     (void)cx;
 #endif
+    /* Pace presentation to the content frame rate. The reader delivers each
+     * 1 s segment's frames in a burst; this sleep (done BEFORE taking a slot,
+     * so it never blocks the reader) spreads the page flips to a steady
+     * cadence instead of a burst-then-idle. */
+    u64 pres_cnt = 0;
+    u64 pres_t0 = 0;
+    int pres_fps = -1; /* re-anchor pacing when the frame rate first arrives */
     while (g_run_decode) {
+        if (g_stream_fps != pres_fps) {
+            pres_fps = g_stream_fps;
+            pres_cnt = 0;
+            pres_t0 = 0;
+        }
+        if (g_stream_fps > 0) {
+            if (pres_cnt == 0) {
+                pres_t0 = vmc_time_now_us();
+            } else {
+                const u64 target = pres_t0 +
+                    pres_cnt * 1000000u / (u64)g_stream_fps;
+                const u64 now = vmc_time_now_us();
+                if (target > now) {
+                    u64 d = target - now;
+                    if (d > 500000u) d = 500000u;
+                    av_usleep((unsigned)d);
+                }
+            }
+        }
         int idx = -1;
         pthread_mutex_lock(&g_fmu);
         while (g_run_decode) {
@@ -507,7 +562,11 @@ static void *decode_worker(void *arg) {
                     vmc_drm_scanout_wait_flip(&g_drm, 60);
                     dumb = vmc_drm_scanout_next_idx(&g_drm, &buf_idx);
                 }
-                if (!dumb) { slot_release(idx); continue; }
+                if (!dumb) {
+                    VMC_LOGW("drm: all scanout buffers still busy after wait — dropping frame");
+                    slot_release(idx);
+                    continue;
+                }
                 if (g_drm.bufs[buf_idx].last_flip_ts && g_drm_send_ts[buf_idx]
                     && g_have_offset) {
                     i32 onscreen = (i32)((u32)g_drm.bufs[buf_idx].last_flip_ts -
@@ -547,11 +606,13 @@ static void *decode_worker(void *arg) {
                                        handoff_us);
                         g_drm_send_ts[buf_idx] = real_send_ts;
                     }
-                    draw_overlay((u8 *)dumb, g_drm.w, g_drm.h,
-                                 g_drm.bufs[buf_idx].pitch, e2e, decode_us,
-                                 g_one_way_us);
+                    if (g_hud)
+                        draw_overlay((u8 *)dumb, g_drm.w, g_drm.h,
+                                     g_drm.bufs[buf_idx].pitch, e2e, decode_us,
+                                     g_one_way_us);
                     (void)vmc_drm_scanout_present(&g_drm);
                     g_presented++;
+                    pres_cnt++;
                 }
                 g_pending_ev = ev;
                 g_prev_stage = stage;
@@ -560,8 +621,9 @@ static void *decode_worker(void *arg) {
                 continue;
             }
 #endif
-            draw_overlay((u8 *)f.planes[0], f.width, f.height, f.stride[0],
-                         e2e, decode_us, g_one_way_us);
+            if (g_hud)
+                draw_overlay((u8 *)f.planes[0], f.width, f.height,
+                             f.stride[0], e2e, decode_us, g_one_way_us);
             if (g_have_offset) {
                 const u64 t_handoff = vmc_time_now_us();
                 e2e = (i32)((u32)t_handoff - real_send_ts - g_offset_us);
@@ -571,7 +633,10 @@ static void *decode_worker(void *arg) {
             const u64 t_before_present = vmc_time_now_us();
             (void)vmc_display_present(cx->disp, &f);
             g_presented++;
+            pres_cnt++;
             (void)t_before_present;
+        } else {
+            g_decode_fails++;
         }
         slot_release(idx);
     }
@@ -581,7 +646,7 @@ static void *decode_worker(void *arg) {
 
 #ifdef VMC_HAVE_ALSA
 #define VMC_AUDIO_FRAME_BYTES (960u)   /* 5 ms @ 48 kHz stereo s16 */
-#define VMC_AUDIO_FIFO_BYTES  (262144u) /* 256 KiB (~1.4 s), power of two */
+#define VMC_AUDIO_FIFO_BYTES  (524288u) /* 512 KiB (~2.7 s), power of two */
 
 static u8 g_audio_storage[VMC_AUDIO_FIFO_BYTES];
 static vmc_ringbuf g_audio_rb;
@@ -595,6 +660,17 @@ static bool g_audio_started = false;
 static void *audio_worker(void *arg) {
     (void)arg;
     i16 pcm[VMC_AUDIO_FRAME_BYTES / 2u];
+    /* Pre-buffer audio before starting playback so the reader's per-segment
+     * bursts never underrun the ALSA sink. */
+    {
+        const sz_t prefill = VMC_AUDIO_FIFO_BYTES / 4u; /* ~0.7 s */
+        pthread_mutex_lock(&g_audio_mu);
+        while (g_run_audio &&
+               vmc_ringbuf_used(&g_audio_rb) < prefill) {
+            pthread_cond_wait(&g_audio_cv, &g_audio_mu);
+        }
+        pthread_mutex_unlock(&g_audio_mu);
+    }
     while (g_run_audio) {
         pthread_mutex_lock(&g_audio_mu);
         while (g_run_audio &&
@@ -617,8 +693,11 @@ static void *audio_worker(void *arg) {
 #endif /* VMC_HAVE_ALSA */
 
 #ifdef VMC_HAVE_FFMPEG
-/* Publish one Annex-B access unit to the decode pipeline. */
+/* Publish one Annex-B access unit to the decode pipeline. The reader may
+ * burst a whole segment's AUs here; the decode worker paces presentation to
+ * the content frame rate, so the burst is absorbed by the frame slots. */
 static void dash_publish_au(const u8 *data, int size) {
+    g_dash_pub++;
     const int idx = slot_take_write();
     if ((sz_t)size <= sizeof(g_frames[idx].buf)) {
         memcpy(g_frames[idx].buf, data, (sz_t)size);
@@ -632,14 +711,287 @@ static void dash_publish_au(const u8 *data, int size) {
 }
 
 /* Live DASH (LL-DASH) source: libavformat dash demuxer over HTTP, converted
- * to Annex-B access units, fed to the shared decode worker. */
-static void *dash_reader(void *arg) {
-    const char *url = (const char *)arg;
+ * to Annex-B access units, fed to the shared decode worker. The session is
+ * re-opened when the live-edge timing drifts and the reader stalls. */
+typedef struct {
+    AVFormatContext *fmt;
+    int vs;
+    int as;
+    AVBSFContext *bsfc;
+    AVCodecContext *actx;
+    SwrContext *swr;
+    AVFrame *aframe;
+    i16 *apcm;
+    int apcm_cap;
+} dash_session;
+
+static int dash_session_setup(AVFormatContext *fmt, dash_session *s) {
+    memset(s, 0, sizeof(*s));
+    s->vs = -1;
+    s->as = -1;
+    for (unsigned i = 0; i < fmt->nb_streams; i++) {
+        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+            s->vs < 0) {
+            s->vs = (int)i;
+        } else if (fmt->streams[i]->codecpar->codec_type ==
+                       AVMEDIA_TYPE_AUDIO &&
+                   s->as < 0) {
+            s->as = (int)i;
+        }
+    }
+    if (s->vs < 0) return -1;
+    VMC_LOGI("dash: stream %dx%d @%d/%d fps (audio=%d)",
+             fmt->streams[s->vs]->codecpar->width,
+             fmt->streams[s->vs]->codecpar->height,
+             fmt->streams[s->vs]->avg_frame_rate.num,
+             fmt->streams[s->vs]->avg_frame_rate.den, s->as);
+
+    const AVBitStreamFilter *bsf = av_bsf_get_by_name("h264_mp4toannexb");
+    if (bsf && av_bsf_alloc(bsf, &s->bsfc) == 0 &&
+        avcodec_parameters_copy(s->bsfc->par_in,
+                                fmt->streams[s->vs]->codecpar) == 0 &&
+        av_bsf_init(s->bsfc) == 0) {
+        /* ready */
+    } else {
+        if (s->bsfc) av_bsf_free(&s->bsfc);
+        s->bsfc = NULL;
+    }
+
+#ifdef VMC_HAVE_ALSA
+    if (s->as >= 0) {
+        const AVCodec *acodec =
+            avcodec_find_decoder(fmt->streams[s->as]->codecpar->codec_id);
+        if (acodec) {
+            s->actx = avcodec_alloc_context3(acodec);
+            if (s->actx &&
+                avcodec_parameters_to_context(
+                    s->actx, fmt->streams[s->as]->codecpar) == 0 &&
+                avcodec_open2(s->actx, acodec, NULL) == 0) {
+#if LIBSWRESAMPLE_VERSION_MAJOR >= 4
+                AVChannelLayout ch_out = AV_CHANNEL_LAYOUT_STEREO;
+                if (swr_alloc_set_opts2(&s->swr, &ch_out, AV_SAMPLE_FMT_S16,
+                                        VMC_AUDIO_SAMPLE_RATE,
+                                        &s->actx->ch_layout,
+                                        s->actx->sample_fmt,
+                                        s->actx->sample_rate, 0, NULL) == 0 &&
+                    swr_init(s->swr) == 0) {
+                    s->aframe = av_frame_alloc();
+                } else {
+                    if (s->swr) swr_free(&s->swr);
+                    s->swr = NULL;
+                    avcodec_free_context(&s->actx);
+                    s->actx = NULL;
+                }
+#else
+                s->swr = swr_alloc_set_opts(
+                    NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16,
+                    VMC_AUDIO_SAMPLE_RATE, s->actx->channel_layout,
+                    s->actx->sample_fmt, s->actx->sample_rate, 0, NULL);
+                if (s->swr && swr_init(s->swr) == 0) {
+                    s->aframe = av_frame_alloc();
+                } else {
+                    if (s->swr) swr_free(&s->swr);
+                    s->swr = NULL;
+                    avcodec_free_context(&s->actx);
+                    s->actx = NULL;
+                }
+#endif
+                if (s->actx) {
+                    VMC_LOGI("dash: audio stream (%s %d Hz -> S16 %d Hz)",
+                             avcodec_get_name(s->actx->codec_id),
+                             s->actx->sample_rate, VMC_AUDIO_SAMPLE_RATE);
+                }
+            } else {
+                if (s->actx) avcodec_free_context(&s->actx);
+                s->actx = NULL;
+            }
+        }
+    }
+#endif
+    return 0;
+}
+
+/* In-memory AVIO read context for init/segment demuxing without modifying
+ * caller-owned buffers. */
+typedef struct {
+    const u8 *data;
+    size_t size;
+    size_t pos;
+} mem_read_ctx;
+
+static int read_mem_packet(void *opaque, u8 *buf, int buf_size) {
+    mem_read_ctx *ctx = (mem_read_ctx *)opaque;
+    if (ctx->pos >= ctx->size) return AVERROR_EOF;
+    size_t remaining = ctx->size - ctx->pos;
+    int to_copy = (int)(buf_size < remaining ? buf_size : remaining);
+    memcpy(buf, ctx->data + ctx->pos, to_copy);
+    ctx->pos += (size_t)to_copy;
+    return to_copy;
+}
+
+static AVIOContext *dash_open_mem_io(const u8 *data, size_t len) {
+    u8 *avio_buf = av_malloc(4096);
+    if (!avio_buf) return NULL;
+    mem_read_ctx *ctx = (mem_read_ctx *)av_malloc(sizeof(*ctx));
+    if (!ctx) {
+        av_free(avio_buf);
+        return NULL;
+    }
+    ctx->data = data;
+    ctx->size = len;
+    ctx->pos = 0;
+    AVIOContext *avio = avio_alloc_context(avio_buf, 4096, 0, ctx,
+                                           read_mem_packet, NULL, NULL);
+    if (!avio) {
+        av_free(ctx);
+        av_free(avio_buf);
+        return NULL;
+    }
+    return avio;
+}
+
+static void dash_close_mem_io(AVIOContext **avio) {
+    if (!avio || !*avio) return;
+    av_free((*avio)->opaque);
+    avio_context_free(avio);
+}
+
+/* Demux a standalone init segment and run a stream-specific setup. */
+static int dash_init_setup_one(const u8 *init, size_t init_len, int want_audio,
+                               dash_session *s) {
+    AVIOContext *avio = dash_open_mem_io(init, init_len);
+    if (!avio) return -1;
+    AVFormatContext *fmt = avformat_alloc_context();
+    if (!fmt) {
+        dash_close_mem_io(&avio);
+        return -1;
+    }
+    fmt->pb = avio;
+    int rc = -1;
+    if (avformat_open_input(&fmt, "", NULL, NULL) == 0 &&
+        avformat_find_stream_info(fmt, NULL) == 0) {
+            if (!want_audio) {
+                for (unsigned i = 0; i < fmt->nb_streams; i++) {
+                if (fmt->streams[i]->codecpar->codec_type ==
+                    AVMEDIA_TYPE_VIDEO) {
+                    s->vs = (int)i;
+                    break;
+                }
+            }
+            if (s->vs >= 0) {
+                VMC_LOGI("dash: video %dx%d",
+                         fmt->streams[s->vs]->codecpar->width,
+                         fmt->streams[s->vs]->codecpar->height);
+                const AVRational fr = fmt->streams[s->vs]->avg_frame_rate;
+                if (fr.num > 0 && fr.den > 0 && g_stream_fps <= 0) {
+                    g_stream_fps =
+                        (int)((fr.num + (int64_t)fr.den / 2) / fr.den);
+                }
+                const AVBitStreamFilter *bsf =
+                    av_bsf_get_by_name("h264_mp4toannexb");
+                if (bsf && av_bsf_alloc(bsf, &s->bsfc) == 0 &&
+                    avcodec_parameters_copy(
+                        s->bsfc->par_in,
+                        fmt->streams[s->vs]->codecpar) == 0 &&
+                    av_bsf_init(s->bsfc) == 0) {
+                    /* ready */
+                } else {
+                    if (s->bsfc) av_bsf_free(&s->bsfc);
+                    s->bsfc = NULL;
+                }
+                rc = 0;
+            }
+        } else {
+            for (unsigned i = 0; i < fmt->nb_streams; i++) {
+                if (fmt->streams[i]->codecpar->codec_type ==
+                    AVMEDIA_TYPE_AUDIO) {
+                    s->as = (int)i;
+                    break;
+                }
+            }
+#ifdef VMC_HAVE_ALSA
+            if (s->as >= 0) {
+                const AVCodec *acodec = avcodec_find_decoder(
+                    fmt->streams[s->as]->codecpar->codec_id);
+                if (acodec) {
+                    s->actx = avcodec_alloc_context3(acodec);
+                    if (s->actx &&
+                        avcodec_parameters_to_context(
+                            s->actx, fmt->streams[s->as]->codecpar) == 0 &&
+                        avcodec_open2(s->actx, acodec, NULL) == 0) {
+#if LIBSWRESAMPLE_VERSION_MAJOR >= 4
+                        AVChannelLayout ch_out = AV_CHANNEL_LAYOUT_STEREO;
+                        if (swr_alloc_set_opts2(
+                                &s->swr, &ch_out, AV_SAMPLE_FMT_S16,
+                                VMC_AUDIO_SAMPLE_RATE, &s->actx->ch_layout,
+                                s->actx->sample_fmt, s->actx->sample_rate, 0,
+                                NULL) == 0 &&
+                            swr_init(s->swr) == 0) {
+                            s->aframe = av_frame_alloc();
+                        } else {
+                            if (s->swr) swr_free(&s->swr);
+                            s->swr = NULL;
+                            avcodec_free_context(&s->actx);
+                            s->actx = NULL;
+                        }
+#else
+                        s->swr = swr_alloc_set_opts(
+                            NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16,
+                            VMC_AUDIO_SAMPLE_RATE, s->actx->channel_layout,
+                            s->actx->sample_fmt, s->actx->sample_rate, 0,
+                            NULL);
+                        if (s->swr && swr_init(s->swr) == 0) {
+                            s->aframe = av_frame_alloc();
+                        } else {
+                            if (s->swr) swr_free(&s->swr);
+                            s->swr = NULL;
+                            avcodec_free_context(&s->actx);
+                            s->actx = NULL;
+                        }
+#endif
+                        if (s->actx) {
+                            VMC_LOGI("dash: audio %s %d Hz -> S16 %d Hz",
+                                     avcodec_get_name(s->actx->codec_id),
+                                     s->actx->sample_rate,
+                                     VMC_AUDIO_SAMPLE_RATE);
+                        }
+                        rc = 0;
+                    } else {
+                        if (s->actx) avcodec_free_context(&s->actx);
+                        s->actx = NULL;
+                    }
+                }
+            }
+#endif
+        }
+    }
+    fmt->pb = NULL;
+    avformat_close_input(&fmt);
+    dash_close_mem_io(&avio);
+    return rc;
+}
+
+/* Set up a session from the demuxed init segments (video + audio). */
+static int dash_session_setup_from_init(const u8 *init, size_t init_len,
+                                        const u8 *init_a, size_t init_a_len,
+                                        dash_session *s) {
+    memset(s, 0, sizeof(*s));
+    s->vs = -1;
+    s->as = -1;
+    if (dash_init_setup_one(init, init_len, 0, s) != 0) return -1;
+    if (init_a && init_a_len > 0) {
+        (void)dash_init_setup_one(init_a, init_a_len, 1, s);
+    }
+    return 0;
+}
+
+static int dash_session_open(const char *url, dash_session *s) {
     AVFormatContext *fmt = NULL;
     bool opened = false;
     for (int attempt = 0; attempt < 30 && g_run; attempt++) {
         AVDictionary *opts = NULL;
         av_dict_set(&opts, "avioflags", "direct", 0);
+        av_dict_set(&opts, "rw_timeout", "15000000", 0);
         if (avformat_open_input(&fmt, url, NULL, &opts) == 0) {
             opened = true;
             av_dict_free(&opts);
@@ -650,164 +1002,591 @@ static void *dash_reader(void *arg) {
                  attempt + 1);
         av_usleep(2000000);
     }
-    if (!opened) {
-        VMC_LOGE("dash: giving up on %s", url);
-        return NULL;
-    }
+    if (!opened) return -1;
     if (avformat_find_stream_info(fmt, NULL) < 0) {
-        VMC_LOGE("dash: find_stream_info failed");
         avformat_close_input(&fmt);
-        return NULL;
+        return -1;
     }
-    int vs = -1;
-    for (unsigned i = 0; i < fmt->nb_streams; i++) {
-        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            vs = (int)i;
-            break;
-        }
-    }
-    if (vs < 0) {
-        VMC_LOGE("dash: no video stream");
+    if (dash_session_setup(fmt, s) != 0) {
         avformat_close_input(&fmt);
-        return NULL;
+        return -1;
     }
-    VMC_LOGI("dash: live source %s (%dx%d @%d/%d fps)", url,
-             fmt->streams[vs]->codecpar->width, fmt->streams[vs]->codecpar->height,
-             fmt->streams[vs]->avg_frame_rate.num,
-             fmt->streams[vs]->avg_frame_rate.den);
+    s->fmt = fmt;
+    return 0;
+}
 
-    const AVBitStreamFilter *bsf = av_bsf_get_by_name("h264_mp4toannexb");
-    AVBSFContext *bsfc = NULL;
-    if (bsf && av_bsf_alloc(bsf, &bsfc) == 0 &&
-        avcodec_parameters_copy(bsfc->par_in, fmt->streams[vs]->codecpar) == 0 &&
-        av_bsf_init(bsfc) == 0) {
-        /* ready */
-    } else {
-        if (bsfc) av_bsf_free(&bsfc);
-        bsfc = NULL;
-    }
-
-    /* --- DASH audio: AAC -> FLTP -> resample -> S16 stereo 48k -> FIFO --- */
-    int as = -1;
-    for (unsigned i = 0; i < fmt->nb_streams; i++) {
-        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            as = (int)i;
-            break;
-        }
-    }
+static void dash_session_close(dash_session *s) {
+    if (s->bsfc) av_bsf_free(&s->bsfc);
 #ifdef VMC_HAVE_ALSA
-    AVCodecContext *actx = NULL;
-    SwrContext *swr = NULL;
-    AVFrame *aframe = NULL;
-    i16 *apcm = NULL;
-    int apcm_cap = 0;
-    if (as >= 0) {
-        const AVCodec *acodec =
-            avcodec_find_decoder(fmt->streams[as]->codecpar->codec_id);
-        if (acodec) {
-            actx = avcodec_alloc_context3(acodec);
-            if (actx &&
-                avcodec_parameters_to_context(
-                    actx, fmt->streams[as]->codecpar) == 0 &&
-                avcodec_open2(actx, acodec, NULL) == 0) {
-#if LIBSWRESAMPLE_VERSION_MAJOR >= 4
-                AVChannelLayout ch_out = AV_CHANNEL_LAYOUT_STEREO;
-                if (swr_alloc_set_opts2(&swr, &ch_out, AV_SAMPLE_FMT_S16,
-                                        VMC_AUDIO_SAMPLE_RATE,
-                                        &actx->ch_layout, actx->sample_fmt,
-                                        actx->sample_rate, 0, NULL) == 0 &&
-                    swr_init(swr) == 0) {
-                    aframe = av_frame_alloc();
-                } else {
-                    if (swr) {
-                        swr_free(&swr);
-                        swr = NULL;
-                    }
-                    avcodec_free_context(&actx);
-                    actx = NULL;
-                }
-#else
-                swr = swr_alloc_set_opts(
-                    NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16,
-                    VMC_AUDIO_SAMPLE_RATE, actx->channel_layout,
-                    actx->sample_fmt, actx->sample_rate, 0, NULL);
-                if (swr && swr_init(swr) == 0) {
-                    aframe = av_frame_alloc();
-                } else {
-                    if (swr) swr_free(&swr);
-                    swr = NULL;
-                    avcodec_free_context(&actx);
-                    actx = NULL;
-                }
+    if (s->actx) avcodec_free_context(&s->actx);
+    if (s->swr) swr_free(&s->swr);
+    if (s->aframe) av_frame_free(&s->aframe);
+    free(s->apcm);
 #endif
-                if (actx) {
-                    VMC_LOGI("dash: audio stream %d (%s %d Hz -> S16 %d Hz)",
-                             as, avcodec_get_name(actx->codec_id),
-                             actx->sample_rate, VMC_AUDIO_SAMPLE_RATE);
-                }
-            } else {
-                if (actx) avcodec_free_context(&actx);
-                actx = NULL;
-            }
-        }
-    }
-#else
-    AVCodecContext *actx = NULL;
-    SwrContext *swr = NULL;
-    AVFrame *aframe = NULL;
-    i16 *apcm = NULL;
-    int apcm_cap = 0;
-#endif
+    if (s->fmt) avformat_close_input(&s->fmt);
+    memset(s, 0, sizeof(*s));
+}
 
+static void *dash_reader(void *arg) {
+    const char *url = (const char *)arg;
     AVPacket *pkt = av_packet_alloc();
     AVPacket *out = av_packet_alloc();
-    while (g_run) {
-        const int r = av_read_frame(fmt, pkt);
-        if (r < 0) {
-            if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) {
-                av_usleep(20000);
-                continue;
-            }
-            VMC_LOGW("dash: read error %d", r);
-            av_usleep(50000);
+    while (g_run_reader) {
+        dash_session s;
+        if (dash_session_open(url, &s) != 0) {
+            VMC_LOGW("dash: session open failed — retrying");
+            av_usleep(2000000);
             continue;
         }
-        if (pkt->stream_index == vs) {
-            if (bsfc) {
-                if (av_bsf_send_packet(bsfc, pkt) == 0) {
-                    while (av_bsf_receive_packet(bsfc, out) == 0) {
-                        if (out->size > 0) dash_publish_au(out->data, out->size);
-                        av_packet_unref(out);
+        u64 last_pkt = vmc_time_now_us();
+        while (g_run_reader) {
+            const int r = av_read_frame(s.fmt, pkt);
+            if (r < 0) {
+                const u64 now = vmc_time_now_us();
+                if (now - last_pkt > 20000000u) {
+                    VMC_LOGW("dash: stalled — re-opening manifest");
+                    break;
+                }
+                if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) {
+                    av_usleep(20000);
+                    continue;
+                }
+                VMC_LOGW("dash: read error %d", r);
+                av_usleep(50000);
+                continue;
+            }
+            last_pkt = vmc_time_now_us();
+            if (pkt->stream_index == s.vs) {
+                g_dash_pkts++;
+                if (s.bsfc) {
+                    if (av_bsf_send_packet(s.bsfc, pkt) == 0) {
+                        while (av_bsf_receive_packet(s.bsfc, out) == 0) {
+                            if (out->size > 0)
+                                dash_publish_au(out->data, out->size);
+                            av_packet_unref(out);
+                        }
+                    }
+                    av_packet_unref(pkt);
+                } else {
+                    if (pkt->size > 0) dash_publish_au(pkt->data, pkt->size);
+                    av_packet_unref(pkt);
+                }
+            } else if (pkt->stream_index == s.as && s.actx && s.swr &&
+                       s.aframe) {
+                if (avcodec_send_packet(s.actx, pkt) == 0) {
+                    while (avcodec_receive_frame(s.actx, s.aframe) == 0) {
+                        const int out_samples = swr_get_out_samples(
+                            s.swr, s.aframe->nb_samples);
+                        const int out_bytes = out_samples * 2 * 2;
+                        if (out_bytes > s.apcm_cap) {
+                            i16 *nb = (i16 *)realloc(s.apcm, (sz_t)out_bytes);
+                            if (!nb) break;
+                            s.apcm = nb;
+                            s.apcm_cap = out_bytes;
+                        }
+                        const int got = swr_convert(
+                            s.swr, (u8 **)&s.apcm, out_samples,
+                            (const u8 **)s.aframe->extended_data,
+                            s.aframe->nb_samples);
+                        if (got > 0) {
+                            pthread_mutex_lock(&g_audio_mu);
+                            (void)vmc_ringbuf_write(
+                                &g_audio_rb, s.apcm, (sz_t)got * 2 * 2);
+                            pthread_cond_signal(&g_audio_cv);
+                            pthread_mutex_unlock(&g_audio_mu);
+                        }
+                        av_frame_unref(s.aframe);
                     }
                 }
                 av_packet_unref(pkt);
             } else {
-                if (pkt->size > 0) dash_publish_au(pkt->data, pkt->size);
                 av_packet_unref(pkt);
             }
-        } else if (pkt->stream_index == as && actx && swr && aframe) {
-            if (avcodec_send_packet(actx, pkt) == 0) {
-                while (avcodec_receive_frame(actx, aframe) == 0) {
+        }
+        dash_session_close(&s);
+    }
+    av_packet_free(&pkt);
+    av_packet_free(&out);
+    VMC_LOGI("dash: reader stopped");
+    return NULL;
+}
+
+
+/* --- Direct DASH fetch (bypasses the dash demuxer's unreliable live
+ * timing): fetch each segment over HTTP with a hard socket timeout and
+ * demux it in memory. --- */
+
+static i64 vmc_time_now_wall_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (i64)ts.tv_sec * 1000000LL + (i64)(ts.tv_nsec / 1000);
+}
+
+/* Robust HTTP fetcher for DASH segments/manifest. Uses a non-blocking socket
+ * with a deadline that resets on every forward-progress event (send/recv), so
+ * slow progressive segment transfers complete instead of being truncated by a
+ * fixed per-recv timeout. Supports both Content-Length and chunked bodies. */
+static int http_get(const char *url, u8 **body, size_t *bodylen,
+                    int timeout_ms) {
+    *body = NULL;
+    *bodylen = 0;
+
+    /* Parse URL: scheme://host[:port]/path */
+    const char *p = strstr(url, "://");
+    if (!p) return -1;
+    p += 3;
+    const char *slash = strchr(p, '/');
+    char host_port[256];
+    const char *path;
+    if (slash) {
+        size_t hl = (size_t)(slash - p);
+        if (hl >= sizeof(host_port)) hl = sizeof(host_port) - 1;
+        memcpy(host_port, p, hl);
+        host_port[hl] = '\0';
+        path = slash;
+    } else {
+        snprintf(host_port, sizeof(host_port), "%s", p);
+        path = "/";
+    }
+
+    char host[256];
+    int port = 80;
+    char *colon = strchr(host_port, ':');
+    if (colon) {
+        *colon = '\0';
+        port = atoi(colon + 1);
+    }
+    snprintf(host, sizeof(host), "%s", host_port);
+
+    /* Resolve hostname and create non-blocking socket. */
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
+        if (res) freeaddrinfo(res);
+        return -1;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        freeaddrinfo(res);
+        return -1;
+    }
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    if (rc < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+
+    /* Wait for connect with timeout. */
+    if (rc != 0) {
+        u64 conn_deadline = vmc_time_now_us() + (u64)timeout_ms * 1000u;
+        while (g_run && vmc_time_now_us() < conn_deadline) {
+            int wait = (int)((conn_deadline - vmc_time_now_us()) / 1000u);
+            if (wait < 1) wait = 1;
+            if (wait > 500) wait = 500;
+            struct pollfd pfd = { fd, POLLOUT, 0 };
+            int r = poll(&pfd, 1, wait);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                close(fd);
+                return -1;
+            }
+            if (r == 0) continue;
+            int soerr;
+            socklen_t soerr_len = sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerr_len) < 0 ||
+                soerr != 0) {
+                close(fd);
+                return -1;
+            }
+            break;
+        }
+        if (!g_run || vmc_time_now_us() >= conn_deadline) {
+            close(fd);
+            return -1;
+        }
+    }
+
+    /* Send request; deadline resets on every successful send. */
+    char req[2048];
+    int rl = snprintf(req, sizeof(req),
+                      "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n"
+                      "\r\n", path, host);
+    if (rl < 0 || (size_t)rl >= sizeof(req)) {
+        close(fd);
+        return -1;
+    }
+
+    const char *wr = req;
+    size_t rem = (size_t)rl;
+    u64 deadline = vmc_time_now_us() + (u64)timeout_ms * 1000u;
+    while (rem > 0) {
+        if (!g_run) { close(fd); return -1; }
+        u64 now = vmc_time_now_us();
+        if (now >= deadline) { close(fd); return -1; }
+        int wait = (int)((deadline - now) / 1000u);
+        if (wait < 1) wait = 1;
+        if (wait > 500) wait = 500;
+        struct pollfd pfd = { fd, POLLOUT, 0 };
+        int r = poll(&pfd, 1, wait);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        if (r == 0) continue;
+        ssize_t n = send(fd, wr, rem, 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            close(fd);
+            return -1;
+        }
+        wr += n;
+        rem -= (size_t)n;
+        deadline = vmc_time_now_us() + (u64)timeout_ms * 1000u;
+    }
+
+    /* Read response; deadline resets on every successful recv. */
+    u8 *raw = NULL;
+    size_t raw_len = 0, raw_cap = 0;
+    char rbuf[65536];
+    deadline = vmc_time_now_us() + (u64)timeout_ms * 1000u;
+    for (;;) {
+        if (!g_run) { close(fd); free(raw); return -1; }
+        u64 now = vmc_time_now_us();
+        if (now >= deadline) break;
+        int wait = (int)((deadline - now) / 1000u);
+        if (wait < 1) wait = 1;
+        if (wait > 500) wait = 500;
+        struct pollfd pfd = { fd, POLLIN, 0 };
+        int r = poll(&pfd, 1, wait);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (r == 0) continue;
+        ssize_t n = recv(fd, rbuf, sizeof(rbuf), 0);
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            break;
+        }
+        if (raw_len + (size_t)n > raw_cap) {
+            size_t new_cap = raw_cap ? raw_cap * 2 : 262144;
+            while (new_cap < raw_len + (size_t)n) new_cap *= 2;
+            u8 *nb = (u8 *)realloc(raw, new_cap);
+            if (!nb) {
+                free(raw);
+                close(fd);
+                return -1;
+            }
+            raw = nb;
+            raw_cap = new_cap;
+        }
+        memcpy(raw + raw_len, rbuf, (size_t)n);
+        raw_len += (size_t)n;
+        deadline = vmc_time_now_us() + (u64)timeout_ms * 1000u;
+    }
+    close(fd);
+
+    if (!raw || raw_len < 12) {
+        free(raw);
+        return -1;
+    }
+
+    /* Require HTTP 200. */
+    if (memcmp(raw, "HTTP/1.1 200", 12) != 0 &&
+        memcmp(raw, "HTTP/1.0 200", 12) != 0) {
+        free(raw);
+        return -1;
+    }
+
+    /* Find header/body boundary. */
+    size_t hdr_end = 0;
+    for (size_t i = 0; i + 3 < raw_len; i++) {
+        if (raw[i] == '\r' && raw[i + 1] == '\n' && raw[i + 2] == '\r' &&
+            raw[i + 3] == '\n') {
+            hdr_end = i + 4;
+            break;
+        }
+    }
+    if (hdr_end == 0 || hdr_end > raw_len) {
+        free(raw);
+        return -1;
+    }
+
+    /* Scan headers for Transfer-Encoding and Content-Length. */
+    bool chunked = false;
+    long content_length = -1;
+    for (size_t i = 0; i + 18 < hdr_end; i++) {
+        if (strncasecmp((const char *)raw + i, "Transfer-Encoding:", 18) == 0) {
+            const char *val = (const char *)raw + i + 18;
+            while (val < (const char *)raw + hdr_end &&
+                   (*val == ' ' || *val == '\t' || *val == ':')) val++;
+            if (strncasecmp(val, "chunked", 7) == 0) chunked = true;
+        }
+        if (strncasecmp((const char *)raw + i, "Content-Length:", 15) == 0) {
+            const char *val = (const char *)raw + i + 15;
+            while (val < (const char *)raw + hdr_end &&
+                   (*val == ' ' || *val == '\t' || *val == ':')) val++;
+            content_length = strtol(val, NULL, 10);
+        }
+    }
+
+    u8 *buf = NULL;
+    size_t len = 0;
+
+    if (!chunked) {
+        size_t body_len = raw_len - hdr_end;
+        if (content_length >= 0 && (size_t)content_length < body_len) {
+            body_len = (size_t)content_length;
+        }
+        if (body_len > 0) {
+            buf = (u8 *)malloc(body_len);
+            if (!buf) {
+                free(raw);
+                return -1;
+            }
+            memcpy(buf, raw + hdr_end, body_len);
+            len = body_len;
+        }
+        free(raw);
+        *body = buf;
+        *bodylen = len;
+        return 0;
+    }
+
+    /* Decode chunked transfer encoding. */
+    size_t pos = hdr_end;
+    size_t cap = 0;
+    for (;;) {
+        /* Skip CRLF between chunks. */
+        while (pos < raw_len && (raw[pos] == '\r' || raw[pos] == '\n')) pos++;
+        if (pos >= raw_len) {
+            free(raw);
+            free(buf);
+            return -1;
+        }
+
+        /* Parse chunk-size in hex; tolerate chunk extensions. */
+        char sz_hex[32];
+        size_t hex_len = 0;
+        while (pos < raw_len && hex_len < sizeof(sz_hex) - 1) {
+            char c = (char)raw[pos];
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                       (c >= 'A' && c <= 'F');
+            if (!hex) break;
+            sz_hex[hex_len++] = c;
+            pos++;
+        }
+        sz_hex[hex_len] = '\0';
+        /* Skip chunk extensions and trailing CRLF of the size line. */
+        while (pos < raw_len && raw[pos] != '\n') pos++;
+        if (pos < raw_len) pos++; /* consume \n */
+
+        long sz = strtol(sz_hex, NULL, 16);
+        if (sz == 0) break; /* last chunk */
+        if (sz < 0) {
+            free(raw);
+            free(buf);
+            return -1;
+        }
+
+        if (len + (size_t)sz > cap) {
+            size_t new_cap = cap ? cap * 2 : 262144;
+            while (new_cap < len + (size_t)sz) new_cap *= 2;
+            u8 *nb = (u8 *)realloc(buf, new_cap);
+            if (!nb) {
+                free(raw);
+                free(buf);
+                return -1;
+            }
+            buf = nb;
+            cap = new_cap;
+        }
+
+        /* Chunk must be fully present in the accumulated response. */
+        if (pos + (size_t)sz > raw_len) {
+            free(raw);
+            free(buf);
+            return -1;
+        }
+        memcpy(buf + len, raw + pos, (size_t)sz);
+        len += (size_t)sz;
+        pos += (size_t)sz;
+
+        /* Consume trailing CRLF. */
+        if (pos < raw_len && raw[pos] == '\r') pos++;
+        if (pos < raw_len && raw[pos] == '\n') pos++;
+    }
+
+    free(raw);
+    *body = buf;
+    *bodylen = len;
+    return 0;
+}
+
+typedef struct {
+    char base[256];
+    int start_number;
+    int64_t avail_start_us;
+    int64_t seg_duration_us;
+    int frame_rate;   /* from AdaptationSet frameRate="24/1" (0 if unknown) */
+} dash_manifest;
+
+static int64_t parse_iso8601(const char *s) {
+    int y, mo, d, h, mi;
+    double se = 0.0;
+    if (sscanf(s, "%d-%d-%dT%d:%d:%lf", &y, &mo, &d, &h, &mi, &se) != 6)
+        return -1;
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    t.tm_year = y - 1900;
+    t.tm_mon = mo - 1;
+    t.tm_mday = d;
+    t.tm_hour = h;
+    t.tm_min = mi;
+    t.tm_sec = (int)se;
+    const time_t epoch = timegm(&t);
+    if (epoch < 0) return -1;
+    return (int64_t)epoch * 1000000LL + (int64_t)((se - (int)se) * 1e6);
+}
+
+static int dash_load_manifest(const char *mpd_url, dash_manifest *m) {
+    memset(m, 0, sizeof(*m));
+    u8 *body = NULL;
+    size_t blen = 0;
+    if (http_get(mpd_url, &body, &blen, 5000) != 0) {
+        return -1;
+    }
+    if (!body) return -1;
+    const char *s = (const char *)body;
+    /* availabilityStartTime */
+    const char *at = strstr(s, "availabilityStartTime=\"");
+    if (!at) { free(body); return -1; }
+    const char *ae = strchr(at + strlen("availabilityStartTime=\""), '"');
+    char ast[64] = {0};
+    if (ae) {
+        size_t l = (size_t)(ae - (at + strlen("availabilityStartTime=\"")));
+        if (l > sizeof(ast) - 1) l = sizeof(ast) - 1;
+        memcpy(ast, at + strlen("availabilityStartTime=\""), l);
+        m->avail_start_us = parse_iso8601(ast);
+    } else {
+    }
+    /* startNumber */
+    const char *sn = strstr(s, "startNumber=\"");
+    if (sn) m->start_number = atoi(sn + strlen("startNumber=\""));
+    /* segment duration: SegmentTimeline <S ... d="..." .../> (timescale) */
+    m->seg_duration_us = 1000000;
+    const char *ts = strstr(s, "timescale=\"");
+    const char *stl = ts ? strstr(ts, "<S ") : NULL;
+    const char *d = stl ? strstr(stl, "d=\"") : NULL;
+    if (ts) {
+        const int timescale = atoi(ts + strlen("timescale=\""));
+        if (timescale > 0 && d) {
+            const int64_t dd = (int64_t)atoi(d + strlen("d=\""));
+            if (dd > 0) m->seg_duration_us = dd * 1000000LL / timescale;
+        }
+    }
+    /* frameRate="24/1" on the video AdaptationSet */
+    const char *fr = strstr(s, "frameRate=\"");
+    if (fr) {
+        fr += strlen("frameRate=\"");
+        int fnum = atoi(fr);
+        const char *fden = strchr(fr, '/');
+        int fdenv = 1;
+        if (fden && *(fden + 1)) fdenv = atoi(fden + 1);
+        if (fnum > 0 && fdenv > 0) m->frame_rate = fnum / fdenv;
+    }
+    /* base URL */
+    {
+        const char *b = strstr(mpd_url, "://");
+        if (!b) { free(body); return -1; }
+        b += 3;
+        const char *sl = strchr(b, '/');
+        size_t bl = sl ? (size_t)(sl - b) : strlen(b);
+        if (bl >= sizeof(m->base)) bl = sizeof(m->base) - 1;
+        memcpy(m->base, mpd_url, (size_t)(b - mpd_url) + bl);
+        m->base[(size_t)(b - mpd_url) + bl] = 0;
+    }
+    free(body);
+    return (m->avail_start_us > 0 && m->seg_duration_us > 0) ? 0 : -1;
+}
+
+static void dash_demux_segment(u8 *data, size_t len, dash_session *s,
+                               AVPacket *out) {
+    AVIOContext *avio = dash_open_mem_io(data, len);
+    if (!avio) return;
+    AVFormatContext *fmt = avformat_alloc_context();
+    if (!fmt) {
+        dash_close_mem_io(&avio);
+        return;
+    }
+    fmt->pb = avio;
+    /* The stream parameters come from the init segment (moov), already parsed
+     * once in dash_init_setup_one — the per-segment probe only needs enough
+     * to identify stream types. Default probesize (5 MB) re-reads the whole
+     * segment and makes the demux too slow to sustain real-time playback. */
+    AVDictionary *dopts = NULL;
+    av_dict_set(&dopts, "probesize", "32768", 0);
+    av_dict_set(&dopts, "analyzeduration", "100000", 0);
+    if (avformat_open_input(&fmt, "", NULL, &dopts) < 0 ||
+        avformat_find_stream_info(fmt, NULL) < 0) {
+        av_dict_free(&dopts);
+        fmt->pb = NULL;
+        avformat_close_input(&fmt);
+        dash_close_mem_io(&avio);
+        return;
+    }
+    av_dict_free(&dopts);
+    AVPacket *pkt = av_packet_alloc();
+    int rerr = 0;
+    while ((rerr = av_read_frame(fmt, pkt)) == 0) {
+        const enum AVMediaType st =
+            fmt->streams[pkt->stream_index]->codecpar->codec_type;
+        if (st == AVMEDIA_TYPE_VIDEO && s->bsfc) {
+            g_dash_pkts++;
+            if (av_bsf_send_packet(s->bsfc, pkt) == 0) {
+                while (av_bsf_receive_packet(s->bsfc, out) == 0) {
+                    if (out->size > 0) dash_publish_au(out->data, out->size);
+                    av_packet_unref(out);
+                }
+            }
+            av_packet_unref(pkt);
+        } else if (st == AVMEDIA_TYPE_AUDIO && s->as >= 0 && s->actx &&
+                   s->swr && s->aframe) {
+            if (avcodec_send_packet(s->actx, pkt) == 0) {
+                while (avcodec_receive_frame(s->actx, s->aframe) == 0) {
                     const int out_samples =
-                        swr_get_out_samples(swr, aframe->nb_samples);
+                        swr_get_out_samples(s->swr, s->aframe->nb_samples);
                     const int out_bytes = out_samples * 2 * 2;
-                    if (out_bytes > apcm_cap) {
-                        i16 *nb = (i16 *)realloc(apcm, (sz_t)out_bytes);
+                    if (out_bytes > s->apcm_cap) {
+                        i16 *nb = (i16 *)realloc(s->apcm, (sz_t)out_bytes);
                         if (!nb) break;
-                        apcm = nb;
-                        apcm_cap = out_bytes;
+                        s->apcm = nb;
+                        s->apcm_cap = out_bytes;
                     }
                     const int got = swr_convert(
-                        swr, (u8 **)&apcm, out_samples,
-                        (const u8 **)aframe->extended_data, aframe->nb_samples);
+                        s->swr, (u8 **)&s->apcm, out_samples,
+                        (const u8 **)s->aframe->extended_data,
+                        s->aframe->nb_samples);
                     if (got > 0) {
                         pthread_mutex_lock(&g_audio_mu);
-                        (void)vmc_ringbuf_write(
-                            &g_audio_rb, apcm, (sz_t)got * 2 * 2);
+                        (void)vmc_ringbuf_write(&g_audio_rb, s->apcm,
+                                                (sz_t)got * 2 * 2);
                         pthread_cond_signal(&g_audio_cv);
                         pthread_mutex_unlock(&g_audio_mu);
                     }
-                    av_frame_unref(aframe);
+                    av_frame_unref(s->aframe);
                 }
             }
             av_packet_unref(pkt);
@@ -816,15 +1595,144 @@ static void *dash_reader(void *arg) {
         }
     }
     av_packet_free(&pkt);
-    av_packet_free(&out);
-    if (bsfc) av_bsf_free(&bsfc);
-#ifdef VMC_HAVE_ALSA
-    if (actx) avcodec_free_context(&actx);
-    if (swr) swr_free(&swr);
-    if (aframe) av_frame_free(&aframe);
-    free(apcm);
-#endif
+    fmt->pb = NULL;
     avformat_close_input(&fmt);
+    dash_close_mem_io(&avio);
+}
+
+static void *dash_reader_direct(void *arg) {
+    const char *url = (const char *)arg;
+    u8 *init_v = NULL;
+    size_t init_v_len = 0;
+    u8 *init_a = NULL;
+    size_t init_a_len = 0;
+    AVPacket *out = av_packet_alloc();
+    dash_session s;
+    while (g_run) {
+        dash_manifest m;
+        if (dash_load_manifest(url, &m) != 0) {
+            VMC_LOGW("dash: manifest fetch failed — retrying");
+            av_usleep(2000000);
+            continue;
+        }
+        VMC_LOGI("dash: live manifest base=%s start=%d dur=%lld us", m.base,
+                 m.start_number, (long long)m.seg_duration_us);
+        if (m.frame_rate > 0) g_stream_fps = m.frame_rate;
+
+        char init_url[512], seg_url[512], init_a_url[512];
+        free(init_v); init_v = NULL; init_v_len = 0;
+        free(init_a); init_a = NULL; init_a_len = 0;
+        snprintf(init_url, sizeof(init_url), "%s/init-stream0.m4s", m.base);
+        http_get(init_url, &init_v, &init_v_len, 5000);
+        snprintf(init_a_url, sizeof(init_a_url), "%s/init-stream1.m4s",
+                 m.base);
+        http_get(init_a_url, &init_a, &init_a_len, 5000);
+
+        if (dash_session_setup_from_init(init_v, init_v_len, init_a, init_a_len,
+                                &s) != 0) {
+            VMC_LOGW("dash: init segment not ready — retrying");
+            dash_session_close(&s);
+            av_usleep(2000000);
+            continue;
+        }
+
+        int last_vnum = -1;
+        int last_anum = -1;
+        while (g_run) {
+            const int64_t now = (int64_t)vmc_time_now_wall_us();
+            /* Stay a few segments behind the live edge so the segment has
+             * finished writing on the server before we request it. Segment
+             * files use absolute numbering anchored to availabilityStartTime
+             * (segment 1 = avail_start), so the live edge must be computed as
+             * 1 + elapsed — NOT m.start_number + elapsed: the MPD window
+             * rolls startNumber forward once the oldest segments expire, which
+             * would point past the real edge. */
+            const int live_edge = 1 +
+                (int)((now - m.avail_start_us) / m.seg_duration_us);
+            int num = live_edge - 2;
+            if (num < m.start_number) num = m.start_number;
+            bool did_work = false;
+
+            /* Deliver audio one segment ahead of video so the FIFO always holds
+             * the next segment's audio (a full 1 s of margin against the
+             * per-segment bursts). Audio segment num+1 is already complete on
+             * the server, so the fetch is instant. On the first cycle also
+             * deliver the current segment so A/V playback starts aligned. */
+            if (init_a && init_a_len > 0) {
+                const int targets[2] = { (last_anum < 0) ? num : -1, num + 1 };
+                for (int k = 0; k < 2; k++) {
+                    const int at = targets[k];
+                    if (at < 0 || at <= last_anum) continue;
+                    snprintf(seg_url, sizeof(seg_url),
+                             "%s/chunk-stream1-%05d.m4s", m.base, at);
+                    u8 *seg = NULL;
+                    size_t seg_len = 0;
+                    if (http_get(seg_url, &seg, &seg_len, 30000) == 0 &&
+                        seg_len > 0) {
+                        u8 *whole = (u8 *)malloc(init_a_len + seg_len);
+                        if (whole) {
+                            memcpy(whole, init_a, init_a_len);
+                            memcpy(whole + init_a_len, seg, seg_len);
+                            dash_demux_segment(whole, init_a_len + seg_len,
+                                               &s, out);
+                            free(whole);
+                            last_anum = at;
+                            did_work = true;
+                        }
+                        free(seg);
+                    }
+                }
+            }
+
+            if (num > last_vnum) {
+                snprintf(seg_url, sizeof(seg_url),
+                         "%s/chunk-stream0-%05d.m4s", m.base, num);
+                u8 *seg = NULL;
+                size_t seg_len = 0;
+                if (http_get(seg_url, &seg, &seg_len, 30000) == 0 &&
+                    seg_len > 0) {
+                    u8 *whole = NULL;
+                    size_t wlen = 0;
+                    bool own_whole = false;
+                    if (init_v && init_v_len > 0) {
+                        whole = (u8 *)malloc(init_v_len + seg_len);
+                        if (whole) {
+                            memcpy(whole, init_v, init_v_len);
+                            memcpy(whole + init_v_len, seg, seg_len);
+                            wlen = init_v_len + seg_len;
+                            own_whole = true;
+                        }
+                    } else {
+                        whole = seg;
+                        wlen = seg_len;
+                    }
+                    if (whole) dash_demux_segment(whole, wlen, &s, out);
+                    if (own_whole) free(whole);
+                    free(seg);
+                    last_vnum = num;
+                    did_work = true;
+                }
+            }
+
+            if (num == last_vnum &&
+                (init_a_len == 0 || num == last_anum)) {
+                av_usleep(50000);
+                continue;
+            }
+            if (did_work) {
+                const int64_t next = m.avail_start_us +
+                                     (int64_t)num * m.seg_duration_us;
+                const int64_t wait = next - (int64_t)vmc_time_now_wall_us();
+                if (wait > 0) av_usleep((unsigned)wait);
+            } else {
+                av_usleep(100000);
+            }
+        }
+        dash_session_close(&s);
+    }
+    av_packet_free(&out);
+    free(init_v);
+    free(init_a);
     VMC_LOGI("dash: reader stopped");
     return NULL;
 }
@@ -834,6 +1742,7 @@ static void *dash_reader(void *arg) {
 static int run_dash(const char *url, vmc_log_level log_level) {
     vmc_log_set_level(log_level);
     VMC_LOGI("VMC DASH client %s starting (%s)", VMC_VERSION, url);
+    g_hud = getenv("VMC_HUD") && getenv("VMC_HUD")[0] == '1';
 
     vmc_fb_display fbdisp;
     u8 *frame_rgb = NULL;
@@ -909,13 +1818,19 @@ static int run_dash(const char *url, vmc_log_level log_level) {
 #endif
 
     pthread_t dash_tid;
-    if (pthread_create(&dash_tid, NULL, dash_reader, (void *)url) != 0) {
+    void *(*dash_reader_fn)(void *) =
+        getenv("VMC_DASH_LIBAV") ? dash_reader : dash_reader_direct;
+    VMC_LOGI("dash: using %s reader",
+             dash_reader_fn == dash_reader_direct ? "direct" : "libavformat");
+    if (pthread_create(&dash_tid, NULL, dash_reader_fn, (void *)url) != 0) {
         VMC_LOGE("dash: reader thread failed");
         return 1;
     }
     VMC_LOGI("dash reader thread started");
 
-    u64 last_stats_ms = 0;
+    u64 last_stats_ms = vmc_time_now_ms();
+    u64 last_pkts_seen = 0;
+    u64 last_pkts_time = vmc_time_now_ms();
     while (g_run) {
         const u64 now_ms = vmc_time_now_ms();
         if (now_ms - last_stats_ms >= 5000) {
@@ -925,15 +1840,35 @@ static int run_dash(const char *url, vmc_log_level log_level) {
             audio_buf = vmc_ringbuf_used(&g_audio_rb);
             pthread_mutex_unlock(&g_audio_mu);
 #endif
-            VMC_LOGI("dash stats: decode=%llu presented=%llu | audio fifo=%llu B",
+            VMC_LOGI("dash stats: pkts=%llu pub=%llu decode=%llu fail=%llu "
+                     "presented=%llu | audio fifo=%llu B",
+                     (unsigned long long)g_dash_pkts,
+                     (unsigned long long)g_dash_pub,
                      (unsigned long long)g_decode_oks,
+                     (unsigned long long)g_decode_fails,
                      (unsigned long long)g_presented,
                      (unsigned long long)audio_buf);
+            /* Reader watchdog: if no video packets for 20 s, the dash demuxer
+             * is stuck (e.g. after the server restarted its encoder). Restart
+             * the reader thread so it re-reads the manifest. */
+            if (g_dash_pkts != last_pkts_seen) {
+                last_pkts_seen = g_dash_pkts;
+                last_pkts_time = now_ms;
+            } else if (now_ms - last_pkts_time > 20000u) {
+                VMC_LOGW("dash: reader stalled — restarting reader thread");
+                pthread_cancel(dash_tid);
+                pthread_join(dash_tid, NULL);
+                (void)pthread_create(&dash_tid, NULL, dash_reader_fn,
+                                     (void *)url);
+                last_pkts_time = now_ms;
+            }
             last_stats_ms = now_ms;
         }
         vmc_sleep_ms(200);
     }
 
+    pthread_cancel(dash_tid);
+    pthread_join(dash_tid, NULL);
     VMC_LOGI("shutting down (dash)");
     if (have_decoder) {
         g_run_decode = false;

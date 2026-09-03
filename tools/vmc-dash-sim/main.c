@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -14,6 +15,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #define HTTP_PORT 8080u
 #define OUT_DIR   "/tmp/vmc_dash_out"
@@ -50,6 +52,16 @@ static int make_listen_sock(uint16_t port) {
     return fd;
 }
 
+typedef struct {
+    int fps;
+    int duration_s;
+    int sample_rate;
+} media_info;
+
+/* Probe a media file for frame rate, duration and audio sample rate so the
+ * lavfi loop filter sizes can be computed exactly. */
+static int probe_media(const char *path, media_info *mi);
+
 static int spawn_ffmpeg(const char *input, int width, int height, int fps,
                         const char *outdir) {
     if (width <= 0) width = 1280;
@@ -68,17 +80,49 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
 
     char *argv[64];
     int n = 0;
+    bool has_audio = false;
+    int audio_in_idx = -1;
+    char vfilter[512], afilter[512];
     argv[n++] = "ffmpeg";
     argv[n++] = "-y";
     argv[n++] = "-hide_banner";
     argv[n++] = "-loglevel";
     argv[n++] = "error";
     if (input) {
-        argv[n++] = "-re";
-        argv[n++] = "-stream_loop";
-        argv[n++] = "-1";
-        argv[n++] = "-i";
-        argv[n++] = (char *)input;
+        media_info mi;
+        if (probe_media(input, &mi) == 0) {
+            /* Loop the file with the lavfi movie/amovie loop=0 option (the
+             * separate 'loop' filter does not survive the end of the file on
+             * FFmpeg 4.x — the encoder exits at the boundary) so -re pacing
+             * has continuous timestamps across loop boundaries — the
+             * -re + -stream_loop combo drifts and eventually hangs after
+             * hours. */
+            snprintf(vfilter, sizeof(vfilter), "movie=%s:loop=0,setpts=N/(%d*TB)",
+                     input, mi.fps);
+            argv[n++] = "-re";
+            argv[n++] = "-f";
+            argv[n++] = "lavfi";
+            argv[n++] = "-i";
+            argv[n++] = vfilter;
+            if (mi.sample_rate > 0 && mi.duration_s > 0) {
+                snprintf(afilter, sizeof(afilter),
+                         "amovie=%s:loop=0,asetpts=N/%d/TB", input,
+                         mi.sample_rate);
+                argv[n++] = "-re";
+                argv[n++] = "-f";
+                argv[n++] = "lavfi";
+                argv[n++] = "-i";
+                argv[n++] = afilter;
+                has_audio = true;
+                audio_in_idx = 1;
+            }
+        } else {
+            argv[n++] = "-re";
+            argv[n++] = "-stream_loop";
+            argv[n++] = "-1";
+            argv[n++] = "-i";
+            argv[n++] = (char *)input;
+        }
     } else {
         argv[n++] = "-re";
         argv[n++] = "-f";
@@ -88,9 +132,9 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
     }
     argv[n++] = "-map";
     argv[n++] = "0:v:0";
-    if (input) {
+    if (has_audio) {
         argv[n++] = "-map";
-        argv[n++] = "0:a:0";
+        argv[n++] = (audio_in_idx == 1) ? "1:a:0" : "0:a:0";
         argv[n++] = "-c:a";
         argv[n++] = "aac";
         argv[n++] = "-b:a";
@@ -121,15 +165,15 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
     argv[n++] = "-streaming";
     argv[n++] = "1";
     argv[n++] = "-use_timeline";
-    argv[n++] = "0";
+    argv[n++] = "1";
     argv[n++] = "-use_template";
     argv[n++] = "1";
     argv[n++] = "-seg_duration";
     argv[n++] = "1";
     argv[n++] = "-window_size";
-    argv[n++] = "20";
+    argv[n++] = "100";
     argv[n++] = "-extra_window_size";
-    argv[n++] = "10";
+    argv[n++] = "50";
     argv[n++] = "-index_correction";
     argv[n++] = "1";
     argv[n++] = manifest;
@@ -176,6 +220,64 @@ static void http_headers(int fd, int code, const char *ct, long len,
 static bool file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
+}
+
+/* Highest segment number currently on disk for a stream (-1 if none). */
+static int newest_seg(const char *dir, int stream) {
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "chunk-stream%d-", stream);
+    const size_t plen = strlen(prefix);
+    int best = -1;
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, prefix, plen) != 0) continue;
+        int num = atoi(e->d_name + plen);
+        if (num > best) best = num;
+    }
+    closedir(d);
+    return best;
+}
+
+/* Probe a media file for frame rate, duration and audio sample rate so the
+ * lavfi loop filter sizes can be computed exactly. */
+static int probe_media(const char *path, media_info *mi) {
+    mi->fps = 0;
+    mi->duration_s = 0;
+    mi->sample_rate = 0;
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "ffprobe -v error -select_streams v:0 "
+             "-show_entries stream=r_frame_rate:format=duration "
+             "-of csv=p=0 \"%s\"",
+             path);
+    FILE *p = popen(cmd, "r");
+    if (p) {
+        char line[256];
+        int num = 0, den = 0;
+        if (fgets(line, sizeof(line), p) &&
+            sscanf(line, "%d/%d", &num, &den) == 2 && den > 0) {
+            mi->fps = num / den;
+        }
+        if (fgets(line, sizeof(line), p)) {
+            mi->duration_s = (int)(atof(line) + 0.5);
+        }
+        pclose(p);
+    }
+    snprintf(cmd, sizeof(cmd),
+             "ffprobe -v error -select_streams a:0 "
+             "-show_entries stream=sample_rate -of csv=p=0 \"%s\"",
+             path);
+    p = popen(cmd, "r");
+    if (p) {
+        char line[256];
+        if (fgets(line, sizeof(line), p)) {
+            mi->sample_rate = atoi(line);
+        }
+        pclose(p);
+    }
+    return (mi->fps > 0 && mi->duration_s > 0) ? 0 : -1;
 }
 
 /* Send a complete file with a Content-Length. */
@@ -264,9 +366,25 @@ static void *conn_handler(void *arg) {
                     } else if (file_exists(tp)) {
                         serve_progressive(fd, tp, fp, ct);
                     } else {
-                        /* Segment not created yet (client is ahead of the
-                         * live edge): wait briefly for it to appear. */
-                        for (int i = 0; i < 100 && g_run; i++) {
+                        /* The FFmpeg dash demuxer sometimes computes bogus
+                         * segment numbers far ahead of the live edge; those
+                         * would block the connection until timeout. Reject
+                         * clearly-impossible requests immediately. */
+                        int req_num = -1, req_stream = -1;
+                        if (sscanf(path, "/chunk-stream%d-%d", &req_stream,
+                                   &req_num) == 2) {
+                            const int newest = newest_seg(g_outdir, req_stream);
+                            if (newest >= 0 && req_num > newest + 30) {
+                                http_headers(fd, 404, "text/plain", -1, false);
+                                (void)write(fd, "Not Found\n", 10);
+                                close(fd);
+                                return NULL;
+                            }
+                        }
+                        /* Otherwise the client is only slightly ahead of the
+                         * live edge: hold the connection until the segment
+                         * appears, then serve it progressively. */
+                        for (int i = 0; i < 500 && g_run; i++) {
                             usleep(30000);
                             if (file_exists(fp)) {
                                 serve_full(fd, fp, ct);
@@ -291,6 +409,53 @@ static void *conn_handler(void *arg) {
     }
     close(fd);
     return NULL;
+}
+
+/* Newest chunk mtime in the output dir (ms since epoch), or 0 if none. */
+static uint64_t newest_chunk_ms(void) {
+    DIR *d = opendir(g_outdir);
+    if (!d) return 0;
+    uint64_t best = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "chunk-stream", 12) != 0) continue;
+        char p[512];
+        snprintf(p, sizeof(p), "%s/%s", g_outdir, e->d_name);
+        struct stat st;
+        if (stat(p, &st) == 0) {
+            uint64_t m = (uint64_t)st.st_mtim.tv_sec * 1000u +
+                    (uint64_t)(st.st_mtim.tv_nsec / 1000000);
+            if (m > best) best = m;
+        }
+    }
+    closedir(d);
+    return best;
+}
+
+static void ffmpeg_respawn(const char *input, int width, int height, int fps,
+                           const char *outdir) {
+    if (g_ffmpeg_pid > 0) {
+        kill(g_ffmpeg_pid, SIGTERM);
+        waitpid(g_ffmpeg_pid, NULL, 0);
+        g_ffmpeg_pid = -1;
+    }
+    /* Clear stale segments so the fresh encoder's manifest is consistent. */
+    DIR *d = opendir(outdir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            char p[512];
+            snprintf(p, sizeof(p), "%s/%s", outdir, e->d_name);
+            unlink(p);
+        }
+        closedir(d);
+    }
+    if (spawn_ffmpeg(input, width, height, fps, outdir) != 0) {
+        fprintf(stderr, "[dash] ERROR: encoder respawn failed\n");
+    } else {
+        fprintf(stderr, "[dash] encoder restarted\n");
+    }
 }
 
 int main(int argc, char **argv) {
@@ -323,14 +488,41 @@ int main(int argc, char **argv) {
             (unsigned)port, g_outdir);
 
     while (g_run) {
-        int c = accept(lsock, NULL, NULL);
-        if (c < 0) {
-            if (errno == EINTR) continue;
-            break;
+        struct pollfd pfd = {.fd = lsock, .events = POLLIN};
+        (void)poll(&pfd, 1, 5000);
+        if (pfd.revents & POLLIN) {
+            int c = accept(lsock, NULL, NULL);
+            if (c >= 0) {
+                pthread_t tid;
+                pthread_create(&tid, NULL, conn_handler, (void *)(intptr_t)c);
+                pthread_detach(tid);
+            }
         }
-        pthread_t tid;
-        pthread_create(&tid, NULL, conn_handler, (void *)(intptr_t)c);
-        pthread_detach(tid);
+        /* Watchdog: the encoder drifts/hangs after a while; restart it if it
+         * exits or stops producing segments. */
+        if (g_ffmpeg_pid > 0) {
+            int st = 0;
+            if (waitpid(g_ffmpeg_pid, &st, WNOHANG) == g_ffmpeg_pid) {
+                fprintf(stderr, "[dash] encoder exited; restarting\n");
+                ffmpeg_respawn(input, width, height, fps, g_outdir);
+            } else {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u +
+                                        (uint64_t)(ts.tv_nsec / 1000000);
+                const uint64_t last = newest_chunk_ms();
+                /* Guard against unsigned underflow: if the newest chunk's
+                 * mtime is marginally ahead of now_ms (clock jitter), a naive
+                 * now_ms - last wraps to ~UINT64_MAX and triggers a spurious
+                 * restart that resets the live timeline. */
+                if (last > 0 && now_ms > last && now_ms - last > 10000u) {
+                    fprintf(stderr,
+                            "[dash] encoder stalled (%llu ms); restarting\n",
+                            (unsigned long long)(now_ms - last));
+                    ffmpeg_respawn(input, width, height, fps, g_outdir);
+                }
+            }
+        }
     }
 
     if (g_ffmpeg_pid > 0) {

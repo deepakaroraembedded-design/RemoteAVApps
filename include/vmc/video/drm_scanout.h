@@ -37,7 +37,9 @@ typedef struct vmc_drm_scanout {
     u32            h;
     int            nbufs;
     int            next;      /* round-robin write cursor */
-    u32            last_presented; /* buffer idx submitted for flip */
+    u32            last_presented; /* buffer idx reserved by next_idx */
+    int            flip_pending;   /* buffer idx submitted to drmModePageFlip
+                                      (or -1 if none pending) */
     u64            last_flip_ts_us; /* monotonic us when last flip completed */
     u32            flips_done;   /* total flip-complete events */
     vmc_drm_buffer bufs[VMC_DRM_MAX_BUFS];
