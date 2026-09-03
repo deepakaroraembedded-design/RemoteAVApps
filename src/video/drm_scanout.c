@@ -53,7 +53,23 @@ static int find_connected(drmModeRes *res, int fd, u32 *conn,
         drmModeConnector *c = drmModeGetConnector(fd, res->connectors[i]);
         if (c && c->connection == DRM_MODE_CONNECTED && c->count_modes > 0) {
             *conn = c->connector_id;
-            *mode = c->modes[0];
+            /* Prefer the connector's preferred mode; fall back to the
+             * highest resolution so we never end up on an oddball default. */
+            int best = 0;
+            for (int m = 1; m < c->count_modes; m++) {
+                const drmModeModeInfo *b = &c->modes[best];
+                const drmModeModeInfo *n = &c->modes[m];
+                const bool n_pref = (n->type & DRM_MODE_TYPE_PREFERRED) != 0;
+                const bool b_pref = (b->type & DRM_MODE_TYPE_PREFERRED) != 0;
+                if (n_pref && !b_pref) {
+                    best = m;
+                } else if (n_pref == b_pref &&
+                           (u64)n->hdisplay * n->vdisplay >
+                               (u64)b->hdisplay * b->vdisplay) {
+                    best = m;
+                }
+            }
+            *mode = c->modes[best];
             drmModeFreeConnector(c);
             return 0;
         }

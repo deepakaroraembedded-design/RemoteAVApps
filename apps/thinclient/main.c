@@ -20,6 +20,7 @@
 #include "vmc/vmc.h"
 #include "vmc/core/logger.h"
 #include "vmc/core/platform.h"
+#include "vmc/core/ringbuf.h"
 #include "vmc/session/mapper.h"
 #include "vmc/session/session.h"
 #include "vmc/transport/jitter_buffer.h"
@@ -35,6 +36,10 @@
 #endif
 #ifdef VMC_HAVE_FFMPEG
 #include "vmc/video/ffmpeg_decoder.h"
+#endif
+#ifdef VMC_HAVE_ALSA
+#include "vmc/audio/pipeline.h"
+#include "vmc/audio/alsa_sink.h"
 #endif
 
 #define APP_MAPPER_HOST   "127.0.0.1"
@@ -306,44 +311,50 @@ static const u8 k_font[][7] = {
 #define FONT_W 5
 #define FONT_H 7
 
-static void overlay_px(u8 *rgb, u32 w, u32 h, u32 x, u32 y, u8 r, u8 g, u8 b) {
+static void overlay_px(u8 *rgb, u32 w, u32 h, u32 pitch, u32 x, u32 y,
+                       u8 r, u8 g, u8 b) {
     if (x >= w || y >= h) return;
-    u8 *p = rgb + ((sz_t)y * w + x) * 4u;
+    u8 *p = rgb + (sz_t)y * pitch + (sz_t)x * 4u;
     p[0] = b;
     p[1] = g;
     p[2] = r;
     p[3] = 0;
 }
 
-static void overlay_draw_char(u8 *rgb, u32 w, u32 h, u32 x, u32 y, char c,
-                              u8 r, u8 g, u8 b) {
+static void overlay_draw_char(u8 *rgb, u32 w, u32 h, u32 pitch, u32 x, u32 y,
+                              char c, u8 r, u8 g, u8 b) {
     if (c < 0x20 || c > 0x7E) return;
     const u8 *glyph = k_font[(size_t)(c - 0x20)];
     for (int row = 0; row < FONT_H; row++) {
         for (int col = 0; col < FONT_W; col++) {
             if (glyph[row] & (0x10u >> col)) {       /* 2x scale */
-                overlay_px(rgb, w, h, x + col * 2u, y + (u32)row * 2u, r, g, b);
-                overlay_px(rgb, w, h, x + col * 2u + 1u, y + (u32)row * 2u, r, g, b);
-                overlay_px(rgb, w, h, x + col * 2u, y + (u32)row * 2u + 1u, r, g, b);
-                overlay_px(rgb, w, h, x + col * 2u + 1u, y + (u32)row * 2u + 1u, r, g, b);
+                overlay_px(rgb, w, h, pitch, x + col * 2u,
+                           y + (u32)row * 2u, r, g, b);
+                overlay_px(rgb, w, h, pitch, x + col * 2u + 1u,
+                           y + (u32)row * 2u, r, g, b);
+                overlay_px(rgb, w, h, pitch, x + col * 2u,
+                           y + (u32)row * 2u + 1u, r, g, b);
+                overlay_px(rgb, w, h, pitch, x + col * 2u + 1u,
+                           y + (u32)row * 2u + 1u, r, g, b);
             }
         }
     }
 }
 
-static void overlay_draw_text(u8 *rgb, u32 w, u32 h, u32 x, u32 y,
+static void overlay_draw_text(u8 *rgb, u32 w, u32 h, u32 pitch, u32 x, u32 y,
                               const char *text, u8 r, u8 g, u8 b) {
     u32 cx = x;
     for (const char *p = text; *p; p++) {
-        overlay_draw_char(rgb, w, h, cx, y, *p, r, g, b);
+        overlay_draw_char(rgb, w, h, pitch, cx, y, *p, r, g, b);
         cx += (FONT_W + 1) * 2u;
     }
 }
 
 /* Semi-transparent dark strip behind the text for readability. */
-static void overlay_box(u8 *rgb, u32 w, u32 h, u32 x, u32 y, u32 bw, u32 bh) {
+static void overlay_box(u8 *rgb, u32 w, u32 h, u32 pitch, u32 x, u32 y,
+                        u32 bw, u32 bh) {
     for (u32 yy = y; yy < y + bh && yy < h; yy++) {
-        u8 *row = rgb + ((sz_t)yy * w + x) * 4u;
+        u8 *row = rgb + (sz_t)yy * pitch + (sz_t)x * 4u;
         u32 n = (x + bw <= w) ? bw : (w - x);
         for (u32 xx = 0; xx < n; xx++) {
             row[xx * 4u + 0] = (u8)(row[xx * 4u + 0] / 2u);   /* darken */
@@ -353,8 +364,8 @@ static void overlay_box(u8 *rgb, u32 w, u32 h, u32 x, u32 y, u32 bw, u32 bh) {
     }
 }
 
-static void draw_overlay(u8 *rgb, u32 w, u32 h, i32 e2e_us, u64 decode_us,
-                         u32 one_way_us) {
+static void draw_overlay(u8 *rgb, u32 w, u32 h, u32 pitch, i32 e2e_us,
+                         u64 decode_us, u32 one_way_us) {
     char line[80];
     snprintf(line, sizeof(line), "E2E %d.%dms  DEC %llu.%llums  NET %u.%uums",
              (int)(e2e_us / 1000), (int)((e2e_us % 1000) / 100),
@@ -363,8 +374,8 @@ static void draw_overlay(u8 *rgb, u32 w, u32 h, i32 e2e_us, u64 decode_us,
              one_way_us / 1000u, (one_way_us % 1000u) / 100u);
     const u32 text_h = FONT_H * 2u;
     const u32 text_w = (u32)strlen(line) * (FONT_W + 1) * 2u;
-    overlay_box(rgb, w, h, 8, 8, text_w, text_h + 6u);
-    overlay_draw_text(rgb, w, h, 12, 12, line, 0, 255, 0);
+    overlay_box(rgb, w, h, pitch, 8, 8, text_w, text_h + 6u);
+    overlay_draw_text(rgb, w, h, pitch, 12, 12, line, 0, 255, 0);
 }
 
 /* --- Decode pipeline (producer/consumer) ---------------------------
@@ -508,8 +519,20 @@ static void *decode_worker(void *arg) {
                 if (g_pending_ev) {
                     g_conv_wait(g_pending_ev);
                     g_conv_free(g_pending_ev);
-                    memcpy(dumb, g_conv_stage(g_prev_stage),
-                           (size_t)g_drm.w * g_drm.h * 4u);
+                    /* Copy row-by-row: the DRM dumb-buffer pitch is
+                     * hardware-aligned and can exceed width*4, so a flat
+                     * memcpy would skew every row. */
+                    {
+                        const unsigned char *stage =
+                            g_conv_stage(g_prev_stage);
+                        const u32 pitch = g_drm.bufs[buf_idx].pitch;
+                        u8 *dst = (u8 *)dumb;
+                        for (u32 r = 0; r < g_drm.h; r++) {
+                            memcpy(dst, stage + (size_t)r * g_drm.w * 4u,
+                                   (size_t)g_drm.w * 4u);
+                            dst += pitch;
+                        }
+                    }
                     if (g_have_offset) {
                         const u64 t_handoff = vmc_time_now_us();
                         e2e = (i32)((u32)t_handoff - real_send_ts -
@@ -519,7 +542,8 @@ static void *decode_worker(void *arg) {
                                        handoff_us);
                         g_drm_send_ts[buf_idx] = real_send_ts;
                     }
-                    draw_overlay((u8 *)dumb, g_drm.w, g_drm.h, e2e, decode_us,
+                    draw_overlay((u8 *)dumb, g_drm.w, g_drm.h,
+                                 g_drm.bufs[buf_idx].pitch, e2e, decode_us,
                                  g_one_way_us);
                     (void)vmc_drm_scanout_present(&g_drm);
                     g_presented++;
@@ -531,8 +555,8 @@ static void *decode_worker(void *arg) {
                 continue;
             }
 #endif
-            draw_overlay((u8 *)f.planes[0], f.width, f.height, e2e, decode_us,
-                         g_one_way_us);
+            draw_overlay((u8 *)f.planes[0], f.width, f.height, f.stride[0],
+                         e2e, decode_us, g_one_way_us);
             if (g_have_offset) {
                 const u64 t_handoff = vmc_time_now_us();
                 e2e = (i32)((u32)t_handoff - real_send_ts - g_offset_us);
@@ -549,6 +573,43 @@ static void *decode_worker(void *arg) {
     return NULL;
 }
 #endif /* VMC_HAVE_FFMPEG */
+
+#ifdef VMC_HAVE_ALSA
+#define VMC_AUDIO_FRAME_BYTES (960u)   /* 5 ms @ 48 kHz stereo s16 */
+#define VMC_AUDIO_FIFO_BYTES  (262144u) /* 256 KiB (~1.4 s), power of two */
+
+static u8 g_audio_storage[VMC_AUDIO_FIFO_BYTES];
+static vmc_ringbuf g_audio_rb;
+static pthread_mutex_t g_audio_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_audio_cv = PTHREAD_COND_INITIALIZER;
+static volatile bool g_run_audio = true;
+static vmc_audio_pipeline g_audio_pipe;
+static pthread_t g_audio_tid;
+static bool g_audio_started = false;
+
+static void *audio_worker(void *arg) {
+    (void)arg;
+    i16 pcm[VMC_AUDIO_FRAME_BYTES / 2u];
+    while (g_run_audio) {
+        pthread_mutex_lock(&g_audio_mu);
+        while (g_run_audio &&
+               vmc_ringbuf_used(&g_audio_rb) < sizeof(pcm)) {
+            pthread_cond_wait(&g_audio_cv, &g_audio_mu);
+        }
+        if (!g_run_audio) {
+            pthread_mutex_unlock(&g_audio_mu);
+            break;
+        }
+        const sz_t n = vmc_ringbuf_read(&g_audio_rb, pcm, sizeof(pcm));
+        pthread_mutex_unlock(&g_audio_mu);
+        if (n == sizeof(pcm)) {
+            const sz_t frames = n / 2u / VMC_AUDIO_CHANNELS;
+            (void)vmc_audio_pipeline_render(&g_audio_pipe, pcm, frames);
+        }
+    }
+    return NULL;
+}
+#endif /* VMC_HAVE_ALSA */
 
 int main(int argc, char **argv) {
     const char *mapper_host = APP_MAPPER_HOST;
@@ -728,6 +789,20 @@ int main(int argc, char **argv) {
     bool have_decoder = false;
 #endif
 
+    /* --- 5c. Audio playback (ALSA; degrades to silent) --- */
+#ifdef VMC_HAVE_ALSA
+    if (vmc_ringbuf_init(&g_audio_rb, g_audio_storage,
+                         sizeof(g_audio_storage)) == VMC_OK) {
+        vmc_audio_pipeline_init(&g_audio_pipe);
+        if (vmc_alsa_sink_init(&g_audio_pipe.sink, NULL) == VMC_OK) {
+            if (pthread_create(&g_audio_tid, NULL, audio_worker, NULL) == 0) {
+                g_audio_started = true;
+                VMC_LOGI("audio playback thread started");
+            }
+        }
+    }
+#endif
+
     /* --- 6. Input capture (best-effort; absence is not fatal) --- */
     vmc_evdev_input evdev;
     bool have_input = vmc_evdev_init(&evdev, APP_DEVICE_EVDEV) == VMC_OK;
@@ -762,12 +837,31 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (h.stream == VMC_PROTO_STREAM_VIDEO) {
-                (void)vmc_jb_push(&jb, h.seq, h.ts_us, h.stream, h.flags,
-                                  payload, h.payload_len, vmc_time_now_us());
+                vmc_status ps = vmc_jb_push(&jb, h.seq, h.ts_us, h.stream,
+                                            h.flags, payload, h.payload_len,
+                                            vmc_time_now_us());
+                if (ps != VMC_OK && (h.flags & VMC_PROTO_FLAG_KEYFRAME)) {
+                    /* Out-of-window keyframe: the buffer is out of sync (e.g.
+                     * after a session reconnect). Rebase playout on it so the
+                     * stream recovers instead of being stuck as permanently
+                     * late. */
+                    vmc_jb_reset(&jb, h.seq);
+                    (void)vmc_jb_push(&jb, h.seq, h.ts_us, h.stream,
+                                      h.flags, payload, h.payload_len,
+                                      vmc_time_now_us());
+                }
             }
             if (h.stream == VMC_PROTO_STREAM_CONTROL) {
                 latency_update_rtt(&session, h.ts_us);
             }
+#ifdef VMC_HAVE_ALSA
+            if (h.stream == VMC_PROTO_STREAM_AUDIO) {
+                pthread_mutex_lock(&g_audio_mu);
+                (void)vmc_ringbuf_write(&g_audio_rb, payload, h.payload_len);
+                pthread_cond_signal(&g_audio_cv);
+                pthread_mutex_unlock(&g_audio_mu);
+            }
+#endif
             (void)vmc_session_on_rx(&session, pkt, n);
         }
 
@@ -871,9 +965,15 @@ int main(int argc, char **argv) {
         if (now_ms - last_stats_ms >= 5000) {
             u64 tx_b = 0, rx_b = 0, tx_p = 0, rx_p = 0;
             udp.base.ops->stats(&udp.base, &tx_b, &rx_b, &tx_p, &rx_p);
+            u64 audio_buf = 0;
+#ifdef VMC_HAVE_ALSA
+            pthread_mutex_lock(&g_audio_mu);
+            audio_buf = vmc_ringbuf_used(&g_audio_rb);
+            pthread_mutex_unlock(&g_audio_mu);
+#endif
             VMC_LOGI("stats: rx=%llu B / %llu pkts, tx=%llu B / %llu pkts | "
                      "video pushed=%llu played=%llu gaps=%llu dup=%llu late=%llu "
-                     "| decode=%llu presented=%llu",
+                     "| decode=%llu presented=%llu | audio fifo=%llu B",
                      (unsigned long long)rx_b, (unsigned long long)rx_p,
                      (unsigned long long)tx_b, (unsigned long long)tx_p,
                      (unsigned long long)jb.stats_pushed,
@@ -882,7 +982,8 @@ int main(int argc, char **argv) {
                      (unsigned long long)jb.stats_dropped_dupe,
                      (unsigned long long)jb.stats_dropped_late,
                      (unsigned long long)g_decode_oks,
-                     (unsigned long long)g_presented);
+                     (unsigned long long)g_presented,
+                     (unsigned long long)audio_buf);
             latency_report();
             last_stats_ms = now_ms;
         }
@@ -915,6 +1016,16 @@ int main(int argc, char **argv) {
     if (g_use_drm) {
         vmc_drm_scanout_close(&g_drm);
         if (g_cuda_lib) dlclose(g_cuda_lib);
+    }
+#endif
+#ifdef VMC_HAVE_ALSA
+    if (g_audio_started) {
+        g_run_audio = false;
+        pthread_mutex_lock(&g_audio_mu);
+        pthread_cond_broadcast(&g_audio_cv);
+        pthread_mutex_unlock(&g_audio_mu);
+        pthread_join(g_audio_tid, NULL);
+        vmc_alsa_sink_close(&g_audio_pipe.sink);
     }
 #endif
     vmc_mapper_destroy(mapper);

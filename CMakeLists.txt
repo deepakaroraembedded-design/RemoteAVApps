@@ -79,6 +79,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND VMC_CORE_SOURCES src/platform/linux/time.c)
 endif()
 
+# Optional ALSA playback sink (audio downlink).
+find_path(VMC_ALSA_INCLUDE_DIR alsa/asoundlib.h)
+find_library(VMC_ALSA_LIBRARY asound)
+if(VMC_ALSA_INCLUDE_DIR AND VMC_ALSA_LIBRARY)
+    list(APPEND VMC_CORE_SOURCES src/audio/alsa_sink.c)
+    set(VMC_ALSA_FOUND TRUE)
+    message(STATUS "ALSA audio sink: ENABLED")
+else()
+    set(VMC_ALSA_FOUND FALSE)
+    message(STATUS "ALSA audio sink: DISABLED (no dev headers)")
+endif()
+
 add_library(vmc_thinclient STATIC ${VMC_CORE_SOURCES})
 target_include_directories(vmc_thinclient PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -106,6 +118,13 @@ if(VMC_CUDA_INCLUDE_DIR AND VMC_CUDA_LIBRARY)
     target_include_directories(vmc_thinclient PRIVATE ${VMC_CUDA_INCLUDE_DIR})
     target_link_libraries(vmc_thinclient PUBLIC ${VMC_CUDA_LIBRARY})
     message(STATUS "CUDA device-ctx support: ENABLED")
+endif()
+
+# Optional ALSA playback sink (audio downlink).
+if(VMC_ALSA_FOUND)
+    target_compile_definitions(vmc_thinclient PUBLIC VMC_HAVE_ALSA=1)
+    target_include_directories(vmc_thinclient PRIVATE ${VMC_ALSA_INCLUDE_DIR})
+    target_link_libraries(vmc_thinclient PUBLIC ${VMC_ALSA_LIBRARY})
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(vmc_thinclient PRIVATE _DEFAULT_SOURCE=1 _POSIX_C_SOURCE=200809L)
