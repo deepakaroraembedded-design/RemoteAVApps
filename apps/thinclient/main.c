@@ -190,6 +190,12 @@ static i64 g_av_offset_ewma_us;
 static u64 g_audio_start_wall_us;
 static u64 g_audio_bytes_consumed;
 static u64 g_last_video_deadline_us;
+static u64 g_audio_fetch_ok;
+static u64 g_audio_fetch_fail;
+static u64 g_audio_pcm_bytes;
+static u64 g_audio_pad_bytes;
+static u64 g_audio_pkts;    /* audio packets demuxed */
+static u64 g_audio_frames;  /* decoder output samples (nb_samples sum) */
 #endif
 
 /* --- Design B (GPU scanout) state ---------------------------------- */
@@ -760,6 +766,51 @@ static volatile bool g_run_audio = true;
 static vmc_audio_pipeline g_audio_pipe;
 static pthread_t g_audio_tid;
 static bool g_audio_started = false;
+#ifdef VMC_HAVE_FFMPEG
+/* Adaptive rate compensation: a SwrContext that stretches/compresses the
+ * decoded 48 kHz audio by a servo-adjusted delta so the delivered sample rate
+ * matches the ALSA/HDMI sink clock exactly. Without it, AAC segment
+ * quantization (~46.875 frames/s, or an HDMI clock offset) makes delivered
+ * audio run ~0.2% short of realtime, slowly draining the FIFO into XRUNs /
+ * silence gaps. swr_set_compensation adds `delta` output frames per
+ * VMC_AUDIO_SAMPLE_RATE input frames (positive = stretch = read fewer input
+ * frames per sink second = FIFO fills). */
+static SwrContext *g_rate_swr = NULL;
+static int g_rate_delta = 0;
+static u64 g_rate_check_us = 0;
+#endif
+
+#ifdef VMC_HAVE_FFMPEG
+/* (Re)create the rate-conversion SwrContext with output rate 48 kHz + delta.
+ * An explicit output rate is used instead of swr_set_compensation because the
+ * compensation path on an equal-rate S16->S16 resampler does not apply the
+ * full requested ratio on this FFmpeg. Positive delta = output rate higher =
+ * stretch = fewer input frames read per sink second = FIFO fills. */
+static void audio_rate_swr_recreate(int delta) {
+    if (g_rate_swr) {
+        swr_free(&g_rate_swr);
+        g_rate_swr = NULL;
+    }
+    const int out_rate = (int)VMC_AUDIO_SAMPLE_RATE + delta;
+#if LIBSWRESAMPLE_VERSION_MAJOR >= 4
+    AVChannelLayout ch = AV_CHANNEL_LAYOUT_STEREO;
+    g_rate_swr = swr_alloc();
+    if (g_rate_swr &&
+        (swr_alloc_set_opts2(&g_rate_swr, &ch, AV_SAMPLE_FMT_S16, out_rate,
+                             &ch, AV_SAMPLE_FMT_S16, VMC_AUDIO_SAMPLE_RATE,
+                             0, NULL) < 0 ||
+         swr_init(g_rate_swr) < 0)) {
+        swr_free(&g_rate_swr);
+    }
+#else
+    g_rate_swr = swr_alloc_set_opts(
+        NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, out_rate,
+        AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, VMC_AUDIO_SAMPLE_RATE, 0,
+        NULL);
+    if (g_rate_swr && swr_init(g_rate_swr) < 0) swr_free(&g_rate_swr);
+#endif
+}
+#endif /* VMC_HAVE_FFMPEG */
 
 static void *audio_worker(void *arg) {
     (void)arg;
@@ -778,57 +829,118 @@ static void *audio_worker(void *arg) {
         }
         pthread_mutex_unlock(&g_audio_mu);
     }
+#ifdef VMC_HAVE_FFMPEG
+    if (g_rate_swr == NULL) audio_rate_swr_recreate(0);
+    g_rate_check_us = 0;
+#endif
 #ifdef VMC_DEBUG
     bool low_water = false;
 #endif
     while (g_run_audio) {
         pthread_mutex_lock(&g_audio_mu);
-        while (g_run_audio &&
-               vmc_ringbuf_used(&g_audio_rb) < sizeof(pcm)) {
-            pthread_cond_wait(&g_audio_cv, &g_audio_mu);
+        const sz_t avail = vmc_ringbuf_used(&g_audio_rb);
+        sz_t n = 0;
+        if (avail >= sizeof(pcm)) {
+            n = vmc_ringbuf_read(&g_audio_rb, pcm, sizeof(pcm));
+        } else if (avail > 0) {
+            /* Partial chunk: take the data present and pad the remainder
+             * with silence so ALSA always receives full 5 ms blocks. This
+             * turns short delivery gaps into clean silence instead of an
+             * ALSA underrun (snd_pcm_recover) click/chirp. */
+            n = vmc_ringbuf_read(&g_audio_rb, pcm, avail);
+            memset((u8 *)pcm + n, 0, sizeof(pcm) - n);
+            n = sizeof(pcm);
+        } else {
+            memset(pcm, 0, sizeof(pcm));
+            n = sizeof(pcm);
         }
-        if (!g_run_audio) {
-            pthread_mutex_unlock(&g_audio_mu);
-            break;
-        }
-        const sz_t n = vmc_ringbuf_read(&g_audio_rb, pcm, sizeof(pcm));
 #ifdef VMC_DEBUG
-        const sz_t used_after = vmc_ringbuf_used(&g_audio_rb);
+        const sz_t data_n = (avail >= sizeof(pcm)) ? sizeof(pcm) : avail;
 #endif
         pthread_mutex_unlock(&g_audio_mu);
-        if (n == sizeof(pcm)) {
-#ifdef VMC_DEBUG
-            if (g_audio_bytes_consumed == 0)
-                g_audio_start_wall_us = (u64)vmc_time_now_wall_us();
-            g_audio_bytes_consumed += n;
+        {
+            const sz_t frames = n / 2u / VMC_AUDIO_CHANNELS;
+#ifdef VMC_HAVE_FFMPEG
+            if (g_rate_swr) {
+                static i16 outbuf[VMC_AUDIO_FRAME_BYTES / 2u + 64u];
+                const u8 *inp = (const u8 *)pcm;
+                u8 *outp = (u8 *)outbuf;
+                int out_cnt = swr_get_out_samples(g_rate_swr, (int)frames);
+                if (out_cnt > (int)(VMC_AUDIO_FRAME_BYTES / 2u + 64u))
+                    out_cnt = (int)(VMC_AUDIO_FRAME_BYTES / 2u + 64u);
+                const int got = swr_convert(g_rate_swr, &outp, out_cnt,
+                                            &inp, (int)frames);
+                if (got > 0)
+                    (void)vmc_audio_pipeline_render(&g_audio_pipe, outbuf,
+                                                    (sz_t)got);
+            } else
+#endif
             {
-                const u64 audio_pos_us = g_audio_start_wall_us +
-                    (g_audio_bytes_consumed / 4u) * 1000000u /
-                        VMC_AUDIO_SAMPLE_RATE;
-                const i64 off = (i64)g_last_video_deadline_us -
-                                (i64)audio_pos_us;
-                if (g_av_offset_ewma_us == 0)
-                    g_av_offset_ewma_us = off;
-                else
-                    g_av_offset_ewma_us += (off - g_av_offset_ewma_us) / 16;
+                (void)vmc_audio_pipeline_render(&g_audio_pipe, pcm, frames);
+            }
+#ifdef VMC_HAVE_FFMPEG
+            /* Starved: pace this path so a silent/non-blocking sink does not
+             * spin at 100 % CPU while we wait for the next audio segment. */
+            if (avail < sizeof(pcm)) av_usleep(5000);
+            /* Adaptive rate compensation servo (every 2 s): if the FIFO is
+             * draining, stretch the audio slightly (more output frames per
+             * input) so delivered rate matches the sink clock exactly; if it
+             * overflows, relax. Keeps the FIFO inside the 0.4-1.2 MB band. */
+            if (g_rate_swr) {
+                const u64 now_mono = vmc_time_now_us();
+                if (g_rate_check_us == 0) g_rate_check_us = now_mono;
+                if (now_mono - g_rate_check_us >= 2000000u) {
+                    g_rate_check_us = now_mono;
+                    int nd = g_rate_delta;
+                    if (avail < 250000u) nd += 64;
+                    else if (avail < 400000u) nd += 24;
+                    else if (avail > 1200000u) nd -= 64;
+                    if (nd > 1440) nd = 1440;   /* ±3 % of 48 kHz */
+                    if (nd < -1440) nd = -1440;
+                    if (nd != g_rate_delta) {
+                        g_rate_delta = nd;
+                        audio_rate_swr_recreate(nd);
+                    }
+                }
             }
 #endif
-            const sz_t frames = n / 2u / VMC_AUDIO_CHANNELS;
-            (void)vmc_audio_pipeline_render(&g_audio_pipe, pcm, frames);
         }
 #ifdef VMC_DEBUG
-        if (used_after < VMC_AUDIO_LOW_WATER) {
+        if (data_n > 0) {
+            if (g_audio_bytes_consumed == 0)
+                g_audio_start_wall_us = (u64)vmc_time_now_wall_us();
+            g_audio_bytes_consumed += data_n;
+        }
+        g_audio_pad_bytes += (sz_t)(sizeof(pcm) - data_n);
+        if (g_audio_start_wall_us != 0) {
+            const u64 audio_pos_us = g_audio_start_wall_us +
+                (g_audio_bytes_consumed / 4u) * 1000000u /
+                    VMC_AUDIO_SAMPLE_RATE;
+            const i64 off = (i64)g_last_video_deadline_us -
+                            (i64)audio_pos_us;
+            if (g_av_offset_ewma_us == 0)
+                g_av_offset_ewma_us = off;
+            else
+                g_av_offset_ewma_us += (off - g_av_offset_ewma_us) / 16;
+        }
+        if (avail < VMC_AUDIO_LOW_WATER) {
             if (!low_water) {
                 low_water = true;
                 g_aud_low_water++;
                 VMC_LOGW("audio: fifo below low-water mark (%zu B)",
-                         (sz_t)used_after);
+                         (sz_t)avail);
             }
         } else {
             low_water = false;
         }
 #endif
     }
+#ifdef VMC_HAVE_FFMPEG
+    if (g_rate_swr) {
+        swr_free(&g_rate_swr);
+        g_rate_swr = NULL;
+    }
+#endif
     return NULL;
 }
 #endif /* VMC_HAVE_ALSA */
@@ -1663,6 +1775,34 @@ static int dash_load_manifest(const char *mpd_url, dash_manifest *m) {
     return (m->avail_start_us > 0 && m->seg_duration_us > 0) ? 0 : -1;
 }
 
+/* Convert one decoded audio frame to S16 48 kHz stereo and push it into the
+ * audio FIFO. Shared by the per-packet drain and the end-of-segment flush. */
+#ifdef VMC_HAVE_ALSA
+static void dash_audio_write_frame(dash_session *s) {
+    const int out_samples = swr_get_out_samples(s->swr, s->aframe->nb_samples);
+    const int out_bytes = out_samples * 2 * 2;
+    if (out_bytes > s->apcm_cap) {
+        i16 *nb = (i16 *)realloc(s->apcm, (sz_t)out_bytes);
+        if (!nb) return;
+        s->apcm = nb;
+        s->apcm_cap = out_bytes;
+    }
+    const int got = swr_convert(s->swr, (u8 **)&s->apcm, out_samples,
+                                (const u8 **)s->aframe->extended_data,
+                                s->aframe->nb_samples);
+    if (got > 0) {
+        pthread_mutex_lock(&g_audio_mu);
+        (void)vmc_ringbuf_write(&g_audio_rb, s->apcm, (sz_t)got * 2 * 2);
+        pthread_cond_signal(&g_audio_cv);
+        pthread_mutex_unlock(&g_audio_mu);
+#ifdef VMC_DEBUG
+        g_audio_pcm_bytes += (u64)got * 2u * 2u;
+#endif
+    }
+    av_frame_unref(s->aframe);
+}
+#endif /* VMC_HAVE_ALSA */
+
 static u64 dash_au_deadline(int seg_num, int k) {
     const u64 frame_period_us = (g_stream_fps > 0)
         ? 1000000u / (u64)g_stream_fps : 1000000u / 30u;
@@ -1723,30 +1863,26 @@ static void dash_demux_segment(u8 *data, size_t len, dash_session *s,
             av_packet_unref(pkt);
         } else if (st == AVMEDIA_TYPE_AUDIO && s->as >= 0 && s->actx &&
                    s->swr && s->aframe) {
-            if (avcodec_send_packet(s->actx, pkt) == 0) {
-                while (avcodec_receive_frame(s->actx, s->aframe) == 0) {
-                    const int out_samples =
-                        swr_get_out_samples(s->swr, s->aframe->nb_samples);
-                    const int out_bytes = out_samples * 2 * 2;
-                    if (out_bytes > s->apcm_cap) {
-                        i16 *nb = (i16 *)realloc(s->apcm, (sz_t)out_bytes);
-                        if (!nb) break;
-                        s->apcm = nb;
-                        s->apcm_cap = out_bytes;
-                    }
-                    const int got = swr_convert(
-                        s->swr, (u8 **)&s->apcm, out_samples,
-                        (const u8 **)s->aframe->extended_data,
-                        s->aframe->nb_samples);
-                    if (got > 0) {
-                        pthread_mutex_lock(&g_audio_mu);
-                        (void)vmc_ringbuf_write(&g_audio_rb, s->apcm,
-                                                (sz_t)got * 2 * 2);
-                        pthread_cond_signal(&g_audio_cv);
-                        pthread_mutex_unlock(&g_audio_mu);
-                    }
-                    av_frame_unref(s->aframe);
+#ifdef VMC_DEBUG
+            g_audio_pkts++;
+#endif
+            /* Send can return EAGAIN if the decoder's input queue is full
+             * (a frame is held for output). Drain first, then retry once so
+             * no packet is dropped at a segment boundary. */
+            if (avcodec_send_packet(s->actx, pkt) < 0) {
+                while (avcodec_receive_frame(s->actx, s->aframe) == 0)
+                    dash_audio_write_frame(s);
+                if (avcodec_send_packet(s->actx, pkt) < 0) {
+#ifdef VMC_DEBUG
+                    g_audio_fetch_fail++; /* decode-side drop */
+#endif
                 }
+            }
+            while (avcodec_receive_frame(s->actx, s->aframe) == 0) {
+#ifdef VMC_DEBUG
+                g_audio_frames += (u64)s->aframe->nb_samples;
+#endif
+                dash_audio_write_frame(s);
             }
             av_packet_unref(pkt);
         } else {
@@ -1834,10 +1970,12 @@ static void *dash_reader_direct(void *arg) {
              * the server, so the fetch is instant. On the first cycle also
              * deliver the current segment so A/V playback starts aligned. */
             if (init_a && init_a_len > 0) {
-                const int targets[2] = { (last_anum < 0) ? num : -1, num + 1 };
-                for (int k = 0; k < 2; k++) {
-                    const int at = targets[k];
-                    if (at < 0 || at <= last_anum) continue;
+                /* Fetch the next audio segment not yet delivered. Target
+                 * last_anum+1 (seeded from num) so a failed fetch is retried
+                 * on the next cycle instead of being skipped forever as num
+                 * advances — a skipped audio segment is a permanent 1 s hole. */
+                const int at = (last_anum < 0) ? num : (last_anum + 1);
+                if (at <= num + 1) {
                     snprintf(seg_url, sizeof(seg_url),
                              "%s/chunk-stream1-%05d.m4s", m.base, at);
                     u8 *seg = NULL;
@@ -1853,7 +1991,15 @@ static void *dash_reader_direct(void *arg) {
                             free(whole);
                             last_anum = at;
                             did_work = true;
+#ifdef VMC_DEBUG
+                            g_audio_fetch_ok++;
+#endif
                         }
+                        free(seg);
+                    } else {
+#ifdef VMC_DEBUG
+                        g_audio_fetch_fail++;
+#endif
                         free(seg);
                     }
                 }
@@ -2114,8 +2260,11 @@ static int run_dash(const char *url, vmc_log_level log_level) {
 #endif
             VMC_LOGI("dash dbg: seg ok=%llu fail=%llu miss=%llu avg=%llu "
                      "max=%llu us | early=%llu late=%llu drop=%llu "
-                     "resync=%llu | audio low=%llu xrun(r/f)=%llu/%llu | "
-                     "av-offset=%lld us | interval=%lld rate-adj=%lld us",
+                     "resync=%llu | audio low=%llu xrun(r/f)=%llu/%llu "
+                     "afetch(ok/fail)=%llu/%llu pcm=%llu pad=%llu B "
+                     "apkt=%llu afrm=%llu | "
+                     "av-offset=%lld us | interval=%lld rate-adj=%lld us "
+                     "adelta=%d",
                      (unsigned long long)g_seg_fetch_ok,
                      (unsigned long long)g_seg_fetch_fail,
                      (unsigned long long)g_seg_miss,
@@ -2131,9 +2280,16 @@ static int run_dash(const char *url, vmc_log_level log_level) {
                      (unsigned long long)g_aud_low_water,
                      (unsigned long long)aud_xrun_recover,
                      (unsigned long long)aud_xrun_fatal,
+                     (unsigned long long)g_audio_fetch_ok,
+                     (unsigned long long)g_audio_fetch_fail,
+                     (unsigned long long)g_audio_pcm_bytes,
+                     (unsigned long long)g_audio_pad_bytes,
+                     (unsigned long long)g_audio_pkts,
+                     (unsigned long long)g_audio_frames,
                      (long long)g_av_offset_ewma_us,
                      (long long)g_seg_interval_ewma,
-                     (long long)g_timeline_adj_us);
+                     (long long)g_timeline_adj_us,
+                     g_rate_delta);
 #endif
             /* Reader watchdog: if no video packets for 20 s, the dash demuxer
              * is stuck (e.g. after the server restarted its encoder). Restart
