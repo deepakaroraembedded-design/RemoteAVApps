@@ -11,6 +11,11 @@ typedef struct {
     u64 frames_played;
 } alsa_ctx;
 
+#ifdef VMC_DEBUG
+static u64 g_xrun_recover;
+static u64 g_xrun_fatal;
+#endif
+
 /* NVIDIA HDA HDMI outputs are digitally muted (IEC958 playback switch off) by
  * default. Turn the switch on for every IEC958 element so the PCM we write
  * actually reaches the monitor. */
@@ -43,12 +48,18 @@ static vmc_status alsa_play(void *ctx, const i16 *pcm, sz_t frames) {
     if (r < 0) {
         r = snd_pcm_recover(a->pcm, (int)r, 1);
         if (r < 0) {
+#ifdef VMC_DEBUG
+            g_xrun_fatal++;
+#endif
             VMC_LOGW("alsa: writei failed permanently: %s",
                      snd_strerror((int)r));
             snd_pcm_close(a->pcm);
             a->pcm = NULL;
             return VMC_ERR_IO;
         }
+#ifdef VMC_DEBUG
+        g_xrun_recover++;
+#endif
     }
     a->frames_played += (u64)frames;
     return VMC_OK;
@@ -92,3 +103,11 @@ void vmc_alsa_sink_close(vmc_audio_sink *sink) {
     sink->ctx = NULL;
     sink->play = NULL;
 }
+
+#ifdef VMC_DEBUG
+void vmc_alsa_sink_stats(const vmc_audio_sink *sink, u64 *recover, u64 *fatal) {
+    if (recover) *recover = g_xrun_recover;
+    if (fatal) *fatal = g_xrun_fatal;
+    (void)sink;
+}
+#endif

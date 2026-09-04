@@ -10,6 +10,7 @@ set(VMC_THINCLIENT_VERSION ${PROJECT_VERSION})
 
 option(VMC_ENABLE_TESTS "Build unit tests" ON)
 option(VMC_ENABLE_SANITIZERS "Build with ASan/UBSan" OFF)
+option(VMC_DEBUG "DASH jitter instrumentation" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -142,6 +143,11 @@ if(VMC_SWRESAMPLE_LIBRARY)
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(vmc-thinclient-app PRIVATE Threads::Threads)
+
+if(VMC_DEBUG)
+    target_compile_definitions(vmc_thinclient PUBLIC VMC_DEBUG=1)
+    target_compile_definitions(vmc-thinclient-app PRIVATE VMC_DEBUG=1)
+endif()
 
 if(VMC_ENABLE_TESTS)
     enable_testing()

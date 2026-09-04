@@ -147,9 +147,11 @@ used; only the transport changes.
 **1. Start the LL-DASH server** (on the machine with the encoder GPU):
 
 ```sh
-./build/tools/vmc-dash-sim/vmc-dash-sim --input <file.mp4> [--port 8080] [--fps N]
-# encodes the file with NVENC + AAC and serves a live dynamic MPD with
-# SegmentTimeline, availabilityTimeOffset and progressive CMAF segments
+./build/tools/vmc-dash-sim/vmc-dash-sim --input <file.mp4> [--port 8080] [--fps N] [--log-level 0-4]
+# encodes the file with NVENC + AAC into a live Low-Latency DASH stream
+# (-f dash -ldash 1 -use_timeline/-use_template, 1 s aligned A/V segments).
+# --log-level selects verbosity (0=TRACE..4=ERROR); a VMC_DEBUG build adds a
+# 5 s request/hold/404/restart stats line to the server log.
 ```
 
 A systemd unit is provided: `systemd/vmc-dash-sim.service` (run as a user
@@ -159,6 +161,8 @@ service on the host: `systemctl --user enable --now vmc-dash-sim`).
 
 ```sh
 VMC_DRM=1 ./build/vmc-thinclient-app --dash http://192.168.0.126:8080/live.mpd 1
+# build with the CMake option -DVMC_DEBUG=1 to enable jitter instrumentation
+# counters and the per-5 s 'dash dbg' stats line (see "DASH playback quality").
 ```
 
 The client uses a **direct segment-fetch reader** by default. It fetches the
@@ -180,18 +184,32 @@ The DASH path is tuned for smooth, glitch-free A/V at the live edge:
   manifest's wall-clock start, instead of `startNumber + elapsed`. This stays
   correct after the dynamic MPD window rolls `startNumber` forward (a stale
   anchor made the client request phantom segment numbers and stall).
-- **Presentation is paced to the content frame rate.** The reader bursts each
-  1 s segment's frames into a 32-slot pipeline; a decode worker paces the DRM
-  page flips to `frameRate` (parsed from the MPD) so playback is a steady
-  cadence instead of a burst-then-idle judder.
+- **Presentation is paced by per-access-unit deadlines.** The reader bursts each
+  1 s segment's frames into a 64-slot pipeline; every access unit is stamped
+  with a wall-clock deadline anchored on the first segment's arrival. The decode
+  worker presents the earliest-deadline frame, holds to the deadline, and never
+  does an unthrottled catch-up burst: a frame more than 3 frame periods late is
+  dropped and the timeline re-anchored. This replaces the old presentation-count
+  pacing and absorbs Wi-Fi/live-edge jitter (sustained runs show
+  `early=0 late=0 drop=0`).
+- **One-segment prefetch.** The reader fetches segment `n+1` while `n` is being
+  presented, so the presenter never blocks on the network in steady state.
+- **Drift estimation + resync.** A per-segment EWMA of the arrival cadence
+  (vs. the nominal segment duration) shifts deadlines by a clamped ±2 frame
+  periods so playback tracks the encoder's real rate (the dash-sim encoder in
+  this repo runs ~1.4% fast; `rate-adj` saturates at the clamp). On a real
+  discontinuity (late frame, reader watchdog restart, frame-rate change) the
+  timeline re-anchors.
 - **DRM flip bookkeeping is correct.** The flip-complete handler frees the
   buffer that was *actually* submitted (tracked via `flip_pending`), and a
   page-flip that hits a busy CRTC waits for the pending flip and retries —
   eliminating the `PageFlip: Device or resource busy` drops and pacing
   presentation to the display vblank.
-- **Audio is delivered one segment ahead** of video into a 512 KiB FIFO
-  (pre-filled before playback starts), so the per-segment bursts never underrun
-  the ALSA sink.
+- **Audio pipeline.** Audio is delivered one segment ahead into a 2 MiB FIFO
+  with a 1.0 s prefill, A/V start is aligned (audio waits for the first video
+  present), and a 400 KB low-water mark warns before an underrun. ALSA XRUNs are
+  tracked (recover vs. fatal) and the A/V offset is measured as an EWMA and
+  reported every 5 s (measurement-only — no sample insert/drop loop yet).
 - **The encoder loops indefinitely.** The lavfi source uses
   `movie=file:loop=0,setpts=N/(fps*TB)` — the separate `loop=loop=0:size=N`
   filter exits at the end of the file on FFmpeg 4.x, forcing a restart every
@@ -199,13 +217,18 @@ The DASH path is tuned for smooth, glitch-free A/V at the live edge:
   underflow (a marginally-future chunk mtime no longer triggers a spurious
   restart that resets the live timeline).
 
-Measured over a sustained run (1080p24 NVENC, WiFi 6E): the reader fetches
-exactly 1.0 segment/s with **no skipped segments**, the client decodes/presents
-at the full **24 fps**, there are zero flip failures or decoder warnings, and
-the audio FIFO holds a healthy 50–200 KB. Live-edge lag is ~1–2 s (the
-configured 2-segment safety lag). Under sustained GPU load the client
-occasionally drops to ~15 fps once the per-frame decode work exceeds the
-41.7 ms frame budget — a device throughput limit, not a pipeline error.
+All jitter instrumentation is compiled only when the CMake option `VMC_DEBUG`
+is ON, and is preserved in the source under `#ifdef VMC_DEBUG` blocks (counters
+are never deleted). A debug build logs a `dash dbg:` line every 5 s:
+`seg ok/fail/miss`, fetch-time avg/max, `early/late/drop/resync`, audio
+`low/xrun`, A/V `av-offset`, and the drift `interval/rate-adj`.
+
+Measured over a sustained run (1080p24 NVENC, Wi-Fi 6E, this branch): the
+reader fetches exactly 1.0 segment/s with **no skipped segments**, the client
+decodes/presents at a steady **24 fps**, `early=0 late=0 drop=0`, `resync=1`
+(startup only), the audio FIFO holds ~0.7 MB with `xrun=0`, and the measured
+A/V offset is ~−240 ms (audio leads). Live-edge lag is ~1–2 s (the configured
+2-segment safety lag).
 
 ## Deployment guide (live topology)
 
@@ -237,6 +260,9 @@ occasionally drops to ~15 fps once the per-frame decode work exceeds the
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ctest --test-dir build --output-on-failure
+# optional instrumentation build (jitter counters + 'dash dbg' stats):
+cmake -S . -B build-debug -DVMC_DEBUG=1 -DVMC_ENABLE_TESTS=OFF
+cmake --build build-debug
 # optional GPU conversion library (host):
 cd tools/cuda && nvcc -O3 -shared -Xcompiler -fPIC -o libnv12conv.so nv12_conv.cu -lcuda
 ```
@@ -258,11 +284,18 @@ LL-DASH mode (standards-based, ~1–3 s):
 ```sh
 ./build/tools/vmc-dash-sim/vmc-dash-sim \
   --input /home/deepak7121/FLUX3/1225am0807/swiftrade_av_60s_20260807_110902.mp4 \
-  --port 8080
+  --port 8080 --log-level 1
 # persistent: systemctl --user enable --now vmc-dash-sim
 ```
 
 ### 3. Thin client (`192.168.0.145`) — display + audio + service
+
+Framebuffer/display access (the client renders to `/dev/fb0` or DRM). It must be
+able to open the device — run it as root, or add the user to the `video` group
+and re-login (`sudo usermod -aG video deepak7121`). A monitor must be connected
+to the GPU and the console VT active: with no monitor attached the driver does
+not scan out the framebuffer and the screen shows a stale/frozen console frame
+(the client itself still decodes/presents correctly).
 
 Audio output to the HDMI monitor (one-time setup):
 
@@ -304,7 +337,10 @@ sudo cat /proc/asound/card1/pcm3p/sub0/status   # state: RUNNING
 ```
 
 On the client, `gaps=0 late=0` (UDP) or `pkts≈pub≈decode` (DASH), `decode`
-growing at ~24 fps, and ALSA `state: RUNNING` confirm a healthy stream.
+growing at ~24 fps, and ALSA `state: RUNNING` confirm a healthy stream. A
+`VMC_DEBUG` build also prints `dash dbg:` with `early/late/drop/resync`,
+audio `low/xrun`, `av-offset`, and drift `interval/rate-adj` — sustained runs
+should show `early=0 late=0 drop=0` and `resync=1` (startup only).
 
 ## Wire protocol
 

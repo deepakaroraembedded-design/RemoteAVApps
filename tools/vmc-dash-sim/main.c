@@ -17,6 +17,46 @@
 #include <unistd.h>
 #include <dirent.h>
 
+int g_log_level = 2;
+
+#define DLOG_TRC(...)                                                         \
+    do {                                                                      \
+        if (g_log_level <= 0)                                                 \
+            fprintf(stderr, "[dash] T: " __VA_ARGS__);                        \
+    } while (0)
+#define DLOG_DBG(...)                                                         \
+    do {                                                                      \
+        if (g_log_level <= 1)                                                 \
+            fprintf(stderr, "[dash] D: " __VA_ARGS__);                        \
+    } while (0)
+#define DLOG_INF(...)                                                         \
+    do {                                                                      \
+        if (g_log_level <= 2)                                                 \
+            fprintf(stderr, "[dash] I: " __VA_ARGS__);                        \
+    } while (0)
+#define DLOG_WRN(...)                                                         \
+    do {                                                                      \
+        if (g_log_level <= 3)                                                 \
+            fprintf(stderr, "[dash] W: " __VA_ARGS__);                        \
+    } while (0)
+#define DLOG_ERR(...)                                                         \
+    do {                                                                      \
+        if (g_log_level <= 4)                                                 \
+            fprintf(stderr, "[dash] E: " __VA_ARGS__);                        \
+    } while (0)
+
+#ifdef VMC_DEBUG
+static uint64_t g_req_total;
+static uint64_t g_req_mpd;
+static uint64_t g_req_seg;
+static uint64_t g_req_404;
+static uint64_t g_serve_full;
+static uint64_t g_serve_progressive;
+static uint64_t g_hold_wait_count;
+static uint64_t g_hold_wait_us_sum;
+static uint64_t g_encoder_restarts;
+#endif
+
 #define HTTP_PORT 8080u
 #define OUT_DIR   "/tmp/vmc_dash_out"
 
@@ -78,7 +118,7 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
              fps);
     snprintf(manifest, sizeof(manifest), "%s/live.mpd", outdir);
 
-    char *argv[64];
+    char *argv[128];
     int n = 0;
     bool has_audio = false;
     int audio_in_idx = -1;
@@ -176,6 +216,8 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
     argv[n++] = "50";
     argv[n++] = "-index_correction";
     argv[n++] = "1";
+    argv[n++] = "-ldash";
+    argv[n++] = "1";
     argv[n++] = manifest;
     argv[n] = NULL;
 
@@ -189,8 +231,8 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
         _exit(127);
     }
     g_ffmpeg_pid = pid;
-    fprintf(stderr, "[dash] encoder: %s (%dx%d @%d fps) -> DASH live\n",
-            input ? input : "testsrc2", width, height, fps);
+    DLOG_INF("encoder: %s (%dx%d @%d fps) -> DASH live\n",
+             input ? input : "testsrc2", width, height, fps);
     return 0;
 }
 
@@ -282,9 +324,15 @@ static int probe_media(const char *path, media_info *mi) {
 
 /* Send a complete file with a Content-Length. */
 static void serve_full(int fd, const char *path, const char *ct) {
+#ifdef VMC_DEBUG
+    g_serve_full++;
+#endif
     int f = open(path, O_RDONLY);
     if (f < 0) {
         http_headers(fd, 404, "text/plain", -1, false);
+#ifdef VMC_DEBUG
+        g_req_404++;
+#endif
         (void)write(fd, "Not Found\n", 10);
         return;
     }
@@ -304,6 +352,9 @@ static void serve_full(int fd, const char *path, const char *ct) {
  * finalized (renamed to .m4s). */
 static void serve_progressive(int fd, const char *tmp_path,
                               const char *final_path, const char *ct) {
+#ifdef VMC_DEBUG
+    g_serve_progressive++;
+#endif
     (void)final_path;
     http_headers(fd, 200, ct, -1, true);
     int f = open(tmp_path, O_RDONLY);
@@ -350,7 +401,15 @@ static void *conn_handler(void *arg) {
             char method[8] = {0}, path[512] = {0};
             if (sscanf(req, "%7s %511s", method, path) == 2 &&
                 strcmp(method, "GET") == 0) {
-                fprintf(stderr, "[dash] GET %s\n", path);
+                DLOG_DBG("GET %s\n", path);
+#ifdef VMC_DEBUG
+                g_req_total++;
+                if (strcmp(path, "/live.mpd") == 0) {
+                    g_req_mpd++;
+                } else if (strstr(path, ".m4s") != NULL) {
+                    g_req_seg++;
+                }
+#endif
                 if (strcmp(path, "/live.mpd") == 0) {
                     char mp[512];
                     snprintf(mp, sizeof(mp), "%s/live.mpd", g_outdir);
@@ -376,6 +435,9 @@ static void *conn_handler(void *arg) {
                             const int newest = newest_seg(g_outdir, req_stream);
                             if (newest >= 0 && req_num > newest + 30) {
                                 http_headers(fd, 404, "text/plain", -1, false);
+#ifdef VMC_DEBUG
+                                g_req_404++;
+#endif
                                 (void)write(fd, "Not Found\n", 10);
                                 close(fd);
                                 return NULL;
@@ -384,6 +446,10 @@ static void *conn_handler(void *arg) {
                         /* Otherwise the client is only slightly ahead of the
                          * live edge: hold the connection until the segment
                          * appears, then serve it progressively. */
+#ifdef VMC_DEBUG
+                        struct timespec hw_start, hw_end;
+                        clock_gettime(CLOCK_REALTIME, &hw_start);
+#endif
                         for (int i = 0; i < 500 && g_run; i++) {
                             usleep(30000);
                             if (file_exists(fp)) {
@@ -395,13 +461,27 @@ static void *conn_handler(void *arg) {
                                 break;
                             }
                         }
+#ifdef VMC_DEBUG
+                        clock_gettime(CLOCK_REALTIME, &hw_end);
+                        g_hold_wait_count++;
+                        g_hold_wait_us_sum +=
+                            (uint64_t)(hw_end.tv_sec - hw_start.tv_sec) *
+                                1000000u +
+                            (uint64_t)(hw_end.tv_nsec - hw_start.tv_nsec) / 1000u;
+#endif
                         if (g_run && !file_exists(fp) && !file_exists(tp)) {
                             http_headers(fd, 404, "text/plain", -1, false);
+#ifdef VMC_DEBUG
+                            g_req_404++;
+#endif
                             (void)write(fd, "Not Found\n", 10);
                         }
                     }
                 } else {
                     http_headers(fd, 404, "text/plain", -1, false);
+#ifdef VMC_DEBUG
+                    g_req_404++;
+#endif
                     (void)write(fd, "Not Found\n", 10);
                 }
             }
@@ -434,6 +514,9 @@ static uint64_t newest_chunk_ms(void) {
 
 static void ffmpeg_respawn(const char *input, int width, int height, int fps,
                            const char *outdir) {
+#ifdef VMC_DEBUG
+    g_encoder_restarts++;
+#endif
     if (g_ffmpeg_pid > 0) {
         kill(g_ffmpeg_pid, SIGTERM);
         waitpid(g_ffmpeg_pid, NULL, 0);
@@ -452,9 +535,9 @@ static void ffmpeg_respawn(const char *input, int width, int height, int fps,
         closedir(d);
     }
     if (spawn_ffmpeg(input, width, height, fps, outdir) != 0) {
-        fprintf(stderr, "[dash] ERROR: encoder respawn failed\n");
+        DLOG_ERR("ERROR: encoder respawn failed\n");
     } else {
-        fprintf(stderr, "[dash] encoder restarted\n");
+        DLOG_INF("encoder restarted\n");
     }
 }
 
@@ -466,7 +549,12 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) input = argv[++i];
         else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) fps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = (uint16_t)atoi(argv[++i]);
-        else if (width == 0) width = atoi(argv[i]);
+        else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
+            int lvl = atoi(argv[++i]);
+            if (lvl < 0) lvl = 0;
+            if (lvl > 4) lvl = 4;
+            g_log_level = lvl;
+        } else if (width == 0) width = atoi(argv[i]);
         else if (height == 0) height = atoi(argv[i]);
     }
 
@@ -479,13 +567,43 @@ int main(int argc, char **argv) {
 
     if (spawn_ffmpeg(input, width, height, fps, g_outdir) != 0) return 1;
 
+#ifdef VMC_DEBUG
+    {
+        char mp_path[512];
+        snprintf(mp_path, sizeof(mp_path), "%s/live.mpd", g_outdir);
+        for (int i = 0; i < 50 && !file_exists(mp_path); i++) {
+            usleep(100000);
+        }
+        if (file_exists(mp_path)) {
+            FILE *mf = fopen(mp_path, "r");
+            if (mf) {
+                char mdata[8192];
+                size_t r = fread(mdata, 1, sizeof(mdata) - 1, mf);
+                fclose(mf);
+                if (r > 0) {
+                    mdata[r] = 0;
+                    const char *ast = strstr(mdata, "availabilityStartTime=");
+                    const char *fr = strstr(mdata, "frameRate=");
+                    const char *st = strstr(mdata, "SegmentTemplate");
+                    const char *sdl = strstr(mdata, "SegmentTimeline");
+                    DLOG_INF("manifest live.mpd: availabilityStartTime=%s "
+                             "frameRate=%s SegmentTemplate=%s "
+                             "SegmentTimeline=%s\n",
+                             ast ? "yes" : "no", fr ? "yes" : "no",
+                             st ? "yes" : "no", sdl ? "yes" : "no");
+                }
+            }
+        }
+    }
+#endif
+
     int lsock = make_listen_sock(port);
     if (lsock < 0) {
         if (g_ffmpeg_pid > 0) kill(g_ffmpeg_pid, SIGTERM);
         return 1;
     }
-    fprintf(stderr, "[dash] serving MPD at http://0.0.0.0:%u/live.mpd (%s)\n",
-            (unsigned)port, g_outdir);
+    DLOG_INF("serving MPD at http://0.0.0.0:%u/live.mpd (%s)\n",
+             (unsigned)port, g_outdir);
 
     while (g_run) {
         struct pollfd pfd = {.fd = lsock, .events = POLLIN};
@@ -503,7 +621,7 @@ int main(int argc, char **argv) {
         if (g_ffmpeg_pid > 0) {
             int st = 0;
             if (waitpid(g_ffmpeg_pid, &st, WNOHANG) == g_ffmpeg_pid) {
-                fprintf(stderr, "[dash] encoder exited; restarting\n");
+                DLOG_INF("encoder exited; restarting\n");
                 ffmpeg_respawn(input, width, height, fps, g_outdir);
             } else {
                 struct timespec ts;
@@ -516,13 +634,42 @@ int main(int argc, char **argv) {
                  * now_ms - last wraps to ~UINT64_MAX and triggers a spurious
                  * restart that resets the live timeline. */
                 if (last > 0 && now_ms > last && now_ms - last > 10000u) {
-                    fprintf(stderr,
-                            "[dash] encoder stalled (%llu ms); restarting\n",
-                            (unsigned long long)(now_ms - last));
+                    DLOG_WRN("encoder stalled (%llu ms); restarting\n",
+                             (unsigned long long)(now_ms - last));
                     ffmpeg_respawn(input, width, height, fps, g_outdir);
                 }
             }
         }
+#ifdef VMC_DEBUG
+        {
+            struct timespec ts_stats;
+            clock_gettime(CLOCK_REALTIME, &ts_stats);
+            const uint64_t now_stats_ms =
+                (uint64_t)ts_stats.tv_sec * 1000u +
+                (uint64_t)(ts_stats.tv_nsec / 1000000);
+            static uint64_t last_stats_ms = 0;
+            if (now_stats_ms >= last_stats_ms &&
+                now_stats_ms - last_stats_ms >= 5000u) {
+                last_stats_ms = now_stats_ms;
+                const uint64_t hold_avg_ms =
+                    g_hold_wait_count
+                        ? g_hold_wait_us_sum / 1000u / g_hold_wait_count
+                        : 0u;
+                DLOG_INF("stats: req=%llu mpd=%llu seg=%llu 404=%llu "
+                         "full=%llu prog=%llu hold=%llu (%llu ms avg) "
+                         "restart=%llu\n",
+                         (unsigned long long)g_req_total,
+                         (unsigned long long)g_req_mpd,
+                         (unsigned long long)g_req_seg,
+                         (unsigned long long)g_req_404,
+                         (unsigned long long)g_serve_full,
+                         (unsigned long long)g_serve_progressive,
+                         (unsigned long long)g_hold_wait_count,
+                         (unsigned long long)hold_avg_ms,
+                         (unsigned long long)g_encoder_restarts);
+            }
+        }
+#endif
     }
 
     if (g_ffmpeg_pid > 0) {
