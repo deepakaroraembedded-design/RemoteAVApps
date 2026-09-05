@@ -522,6 +522,11 @@ static void ffmpeg_respawn(const char *input, int width, int height, int fps,
         waitpid(g_ffmpeg_pid, NULL, 0);
         g_ffmpeg_pid = -1;
     }
+    /* Pause 5 s before relaunching the encoder so the old session's tail is
+     * flushed and a clean, clearly-separated live session is recorded for
+     * easier debugging (manifest + segment windows do not overlap). */
+    DLOG_INF("encoder restart in 5 s (clean-session gap)\n");
+    usleep(5000000);
     /* Clear stale segments so the fresh encoder's manifest is consistent. */
     DIR *d = opendir(outdir);
     if (d) {

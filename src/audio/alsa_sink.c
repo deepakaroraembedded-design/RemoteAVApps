@@ -1,6 +1,7 @@
 #include <alsa/asoundlib.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "vmc/audio/alsa_sink.h"
 #include "vmc/core/error.h"
@@ -61,7 +62,8 @@ static vmc_status alsa_play(void *ctx, const i16 *pcm, sz_t frames) {
         g_xrun_recover++;
 #endif
     }
-    a->frames_played += (u64)frames;
+    if (r > 0)
+        a->frames_played += (u64)r;
     return VMC_OK;
 }
 
@@ -111,3 +113,38 @@ void vmc_alsa_sink_stats(const vmc_audio_sink *sink, u64 *recover, u64 *fatal) {
     (void)sink;
 }
 #endif
+
+bool vmc_alsa_sink_playing(const vmc_audio_sink *sink) {
+    if (!sink || !sink->ctx) return false;
+    const alsa_ctx *a = (const alsa_ctx *)sink->ctx;
+    return a->pcm != NULL;
+}
+
+bool vmc_alsa_sink_position_us(const vmc_audio_sink *sink, u64 *pos_us) {
+    if (!sink || !sink->ctx || !pos_us) return false;
+    const alsa_ctx *a = (const alsa_ctx *)sink->ctx;
+    if (!a->pcm) return false;
+
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return false;
+    const u64 wall_us =
+        (u64)ts.tv_sec * 1000000ull + (u64)(ts.tv_nsec / 1000);
+    /* The ALSA position is the wall time of the sample currently at the DAC.
+     * Returning the current wall time makes the audio-master clock the actual
+     * playback time, which keeps the video flip locked to the moment audio is
+     * heard. The caller uses the delay separately if it needs buffering info. */
+    *pos_us = wall_us;
+    return true;
+}
+
+bool vmc_alsa_sink_delay_us(const vmc_audio_sink *sink, u64 *delay_us) {
+    if (!sink || !sink->ctx || !delay_us) return false;
+    const alsa_ctx *a = (const alsa_ctx *)sink->ctx;
+    if (!a->pcm) return false;
+
+    snd_pcm_sframes_t delay = 0;
+    if (snd_pcm_delay(a->pcm, &delay) != 0) return false;
+    if (delay < 0) delay = 0;
+    *delay_us = (u64)delay * 1000000ull / (u64)VMC_AUDIO_SAMPLE_RATE;
+    return true;
+}

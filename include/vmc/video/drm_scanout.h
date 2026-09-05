@@ -17,7 +17,7 @@
 
 VMC_BEGIN_DECLS
 
-#define VMC_DRM_MAX_BUFS 3
+#define VMC_DRM_MAX_BUFS 5
 
 typedef struct vmc_drm_buffer {
     u32     handle;
@@ -25,6 +25,7 @@ typedef struct vmc_drm_buffer {
     u32     pitch;
     sz_t    size;
     void   *map;      /* host (BGRA) mapping, the D2H target */
+    int     prime_fd; /* dma-buf prime fd for CUDA import, -1 if unavailable */
     bool    busy;     /* flipped and not yet flip-completed */
     u64     last_flip_ts; /* monotonic us when this buffer was scanned out */
 } vmc_drm_buffer;
@@ -40,8 +41,11 @@ typedef struct vmc_drm_scanout {
     u32            last_presented; /* buffer idx reserved by next_idx */
     int            flip_pending;   /* buffer idx submitted to drmModePageFlip
                                       (or -1 if none pending) */
+    int            on_screen;      /* buffer idx currently scanned out */
     u64            last_flip_ts_us; /* monotonic us when last flip completed */
     u32            flips_done;   /* total flip-complete events */
+    u32            vrefresh;     /* reported refresh rate (Hz) */
+    u32            vblank_period_us; /* 1000000 / vrefresh */
     vmc_drm_buffer bufs[VMC_DRM_MAX_BUFS];
     bool           crtc_set;
 } vmc_drm_scanout;
@@ -57,9 +61,9 @@ void *vmc_drm_scanout_next(vmc_drm_scanout *s);
 /* Like vmc_drm_scanout_next but also returns the buffer index. */
 void *vmc_drm_scanout_next_idx(vmc_drm_scanout *s, int *out_idx);
 
-/* Present the buffer last returned by vmc_drm_scanout_next via page-flip.
- * Returns VMC_ERR_AGAIN if a flip is still pending on the CRTC. */
-vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s);
+/* Present the buffer with index idx (or the last returned by next if idx < 0)
+ * via page-flip. Returns VMC_ERR_AGAIN if a flip is still pending on the CRTC. */
+vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s, int idx);
 
 /* Block (up to timeout_ms) for flip-complete events; marks buffers free.
  * Returns the number of flips completed, or <0 on error. */

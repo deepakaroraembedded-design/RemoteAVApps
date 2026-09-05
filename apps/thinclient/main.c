@@ -64,6 +64,19 @@
  * hold long enough to reorder, and let the assembler+decoder pace frames. */
 #define APP_JB_TARGET_US  2000u
 
+/* DASH live-buffer strategy: start with a 5 s prefetch for fast startup,
+ * aim for 10 s during steady playback, and allow the buffer to grow to 30 s
+ * when the network is slow (the DASH simulator needs ~1 s to finish a 1 s
+ * segment before it can be served). */
+#define VMC_AUDIO_PREFETCH_US  (1000000u)
+#define VMC_AUDIO_STEADY_US    (10000000u)
+#define VMC_AUDIO_MAX_US       (30000000u)
+#define VMC_VIDEO_PREFETCH_US  (1000000u)
+#define VMC_VIDEO_STEADY_US    (10000000u)
+#define VMC_VIDEO_MAX_US       (30000000u)
+#define VMC_VIDEO_TARGET_US    (VMC_VIDEO_STEADY_US)
+#define VMC_AUDIO_TARGET_US    (VMC_AUDIO_STEADY_US)
+
 static volatile sig_atomic_t g_run = 1;
 
 static void on_sig(int sig) {
@@ -144,6 +157,7 @@ static u64 g_dash_pkts = 0;    /* video packets read from demuxer */
 static volatile bool g_run_reader = true; /* dash reader thread run flag */
 static u64  g_dash_pub = 0;     /* AUs published to decode slots */
 static u64  g_presented = 0;
+static volatile bool g_first_video_ready = false;
 static u64  g_onscreen_sum = 0, g_onscreen_cnt = 0;
 
 /* On-screen latency overlay is off unless VMC_HUD=1. */
@@ -160,12 +174,39 @@ static u64 g_seg_duration_us = 0;      /* nominal DASH segment duration */
 static u64 g_anchor_wall_us = 0;       /* wall-clock anchor (segment arrival) */
 static int g_anchor_seg = 0;           /* anchor segment number */
 static i64 g_timeline_adj_us = 0;      /* deadline shift from drift estimator */
-static u64 g_playout_latency_us = 100000u;
+static u64 g_playout_latency_us = 85000u;
 static i64 g_seg_interval_ewma = 0;    /* measured segment cadence (drift) */
 static u64 g_last_seg_arrival_wall = 0;
 static u64 g_last_resync_wall = 0;
+static pthread_mutex_t g_anchor_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static volatile bool g_av_armed = false; /* video presented first frame */
+
+/* Separate present thread for DRM scanout: the decode worker decodes, converts,
+ * and copies into a free DRM dumb buffer, then queues the DRM buffer index for
+ * a dedicated thread. The present worker only waits for the audio-master
+ * deadline and submits the page flip, so the 24 fps cadence is independent of
+ * the (much slower) CPU copy out of the CUDA conversion stage. */
+#define VMC_PRESENT_QUEUE_SIZE 128
+
+typedef struct {
+    int  buf_idx;
+    u64  deadline_us;
+} present_entry;
+static present_entry g_present_queue[VMC_PRESENT_QUEUE_SIZE];
+static int g_present_qhead = 0;
+static int g_present_qtail = 0;
+static int g_present_qcount = 0;
+static pthread_mutex_t g_present_qmu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_present_qready = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_present_qspace = PTHREAD_COND_INITIALIZER;
+
+/* Audio-master clock: the audio content position (wall-clock domain) and
+ * whether audio playback is active. The video presenter is gated on this so
+ * A/V stays locked even when delivered audio runs slightly short of the sink
+ * clock (the DASH/AAC boundary-frame loss) — video simply follows audio. */
+static u64 g_audio_pos_us = 0;
+static bool g_audio_active = false;
 
 /* Wall clock (CLOCK_REALTIME) in microseconds. Used only for the DASH
  * deadline timeline; all transport timing stays on the monotonic clock. */
@@ -187,16 +228,31 @@ static u64 g_frames_dropped_resync;
 static u64 g_resync_count;
 static u64 g_aud_low_water;
 static i64 g_av_offset_ewma_us;
-static u64 g_audio_start_wall_us;
-static u64 g_audio_bytes_consumed;
-static u64 g_last_video_deadline_us;
 static u64 g_audio_fetch_ok;
 static u64 g_audio_fetch_fail;
 static u64 g_audio_pcm_bytes;
 static u64 g_audio_pad_bytes;
 static u64 g_audio_pkts;    /* audio packets demuxed */
 static u64 g_audio_frames;  /* decoder output samples (nb_samples sum) */
+static u64 g_rate_out;      /* resampler output frames (stretch check) */
+static u64 g_rate_in;       /* resampler input frames */
 #endif
+
+/* Shared by the audio worker and the audio-master video lock. */
+static u64 g_audio_start_wall_us;
+static u64 g_audio_delay_us;            /* ALSA sink delay at startup */
+static u64 g_audio_bytes_consumed;
+static u64 g_audio_last_advance_wall; /* last time audio content advanced */
+static u64 g_last_video_deadline_us;  /* deadline of last presented frame */
+
+
+
+/* Dynamic live buffers: start at the prefetch value, grow to the target, and
+ * can expand to the max when measured segment-fetch latency is high. */
+static u64 g_audio_live_buffer_us = VMC_AUDIO_PREFETCH_US;
+static u64 g_video_live_buffer_us = VMC_VIDEO_PREFETCH_US;
+static u64 g_seg_fetch_ewma_us = 0;
+static int  g_prefetch_done = 0;
 
 /* --- Design B (GPU scanout) state ---------------------------------- */
 #ifdef VMC_DRM_FOUND
@@ -208,11 +264,69 @@ static int (*g_conv_async)(const void *, const void *, int, int, int, int,
 static const unsigned char *(*g_conv_stage)(int);
 static int (*g_conv_wait)(void *);
 static void (*g_conv_free)(void *);
+
+/* Optional CUDA host-register path: pin the DRM dumb buffers so the GPU can
+ * DMA the converted BGRA stage directly into them, avoiding the CPU memcpy. */
+#define CUDA_HOST_REGISTER_DEFAULT 0
+#define CUDA_HOST_REGISTER_IO_MEMORY 4
+#define CUDA_MEMCPY_HOST_TO_HOST     0
+#define CUDA_MEMCPY_HOST_TO_DEVICE 1
+#define CUDA_MEMCPY_DEVICE_TO_HOST 2
+#define CUDA_MEMCPY_DEVICE_TO_DEVICE 3
+
+#if defined(__x86_64__) || defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+/* Copy a BGRA staging image to a DRM dumb buffer with streaming stores on x86.
+ * DRM dumb buffers are often write-combining; non-temporal stores avoid cache
+ * thrashing and can be much faster than plain memcpy. */
+static void copy_stage_to_drm_wc(const u8 *src, size_t src_pitch,
+                                 u8 *dst, size_t dst_pitch,
+                                 u32 w, u32 h) {
+    const size_t row_bytes = (size_t)w * 4u;
+    for (u32 r = 0; r < h; r++) {
+        const u8 *srow = src + r * src_pitch;
+        u8 *drow = dst + r * dst_pitch;
+#if defined(__x86_64__) && defined(__SSE2__)
+        size_t n = row_bytes;
+        const __m128i *s = (const __m128i *)srow;
+        __m128i *d = (__m128i *)drow;
+        while (n >= 64) {
+            _mm_stream_si128(d + 0, _mm_loadu_si128(s + 0));
+            _mm_stream_si128(d + 1, _mm_loadu_si128(s + 1));
+            _mm_stream_si128(d + 2, _mm_loadu_si128(s + 2));
+            _mm_stream_si128(d + 3, _mm_loadu_si128(s + 3));
+            d += 4; s += 4; n -= 64;
+        }
+        while (n >= 16) {
+            _mm_stream_si128(d++, _mm_loadu_si128(s++));
+            n -= 16;
+        }
+        if (n > 0) memcpy((u8 *)d, s, n);
+        _mm_sfence();
+#else
+        memcpy(drow, srow, row_bytes);
+#endif
+    }
+}
+
+static int (*g_cuda_host_register)(void *, size_t, unsigned int);
+static int (*g_cuda_host_unregister)(void *);
+static int (*g_cuda_memcpy2d)(void *, size_t, const void *, size_t,
+                              size_t, size_t, int);
+static int (*g_cuda_import_fd)(int fd, size_t size, void **dev_ptr);
+static bool g_drm_pinned = false;
+static void *g_cuda_rt_lib = NULL; /* libcudart.so handle for cudaHostRegister */
+static void *g_drm_dev_ptrs[VMC_DRM_MAX_BUFS] = {0}; /* imported CUDA device pointers */
+
 static void *g_pending_ev = NULL;
 static u64 g_pending_deadline_us = 0;
 static int g_prev_stage = 0;
 static int g_stage_idx = 0;
-static u32 g_drm_send_ts[VMC_DRM_MAX_BUFS] = {0};
+static int g_pending_buf_idx = -1;
+static void *g_pending_map = NULL;
+static u32 g_pending_pitch = 0;
 #endif
 
 static void latency_update_rtt(vmc_session_ctx *sc, u32 sim_echo_ts) {
@@ -452,7 +566,7 @@ static void draw_overlay(u8 *rgb, u32 w, u32 h, u32 pitch, i32 e2e_us,
 /* --- Decode pipeline (producer/consumer) ---------------------------
  * The main loop assembles frames (producer); a decode thread decodes +
  * presents them so receive never blocks on the slow decode/swscale step. */
-#define VMC_FRAME_SLOTS 64
+#define VMC_FRAME_SLOTS 128
 
 enum { SLOT_FREE = 0, SLOT_READY = 1, SLOT_DECODING = 2, SLOT_WRITING = 3 };
 
@@ -519,7 +633,118 @@ static void slot_release(int idx) {
  * judder. The decode worker paces the presentation to the content frame rate;
  * the frame slots (VMC_FRAME_SLOTS) absorb the per-segment bursts. */
 
-static void dash_resync(int next_seg);
+static void dash_resync(int next_seg, int live_edge, const char *reason);
+
+/* Presentation clock: when audio is active it is the master, so the video
+ * presenter follows the audio content position instead of wall time. This
+ * keeps A/V locked even though the DASH/AAC decoder delivers ~2% fewer audio
+ * samples than realtime (video simply runs at the audio rate). Falls back to
+ * wall time before audio starts (or with a silent sink). */
+/* Presentation clock: when audio is active it is the master, so the video
+ * presenter follows the audio content position instead of wall time. This
+ * keeps A/V locked even though the DASH/AAC decoder delivers ~2% fewer audio
+ * samples than realtime (video simply runs at the audio rate, ~23.5 fps —
+ * imperceptible) instead of letting lip-sync drift. Falls back to wall time
+ * if audio is stalled (>1 s without advancing) so a dead audio feed can
+ * never freeze video. The audio clock is clamped to wall+200 ms as a safety
+ * net against a broken sink racing ahead. */
+static u64 dash_pres_clock(void) {
+    if (g_audio_active && g_audio_pos_us != 0 &&
+        vmc_time_now_wall_us() - g_audio_last_advance_wall <= 1000000u) {
+        const u64 wall = (u64)vmc_time_now_wall_us();
+        if (g_audio_pos_us <= wall + 200000u)
+            return g_audio_pos_us;
+    }
+    return (u64)vmc_time_now_wall_us();
+}
+
+static void present_push(int buf_idx, u64 deadline_us) {
+    pthread_mutex_lock(&g_present_qmu);
+    while (g_present_qcount >= VMC_PRESENT_QUEUE_SIZE && g_run) {
+        pthread_cond_wait(&g_present_qspace, &g_present_qmu);
+    }
+    g_present_queue[g_present_qtail] = (present_entry){buf_idx, deadline_us};
+    g_present_qtail = (g_present_qtail + 1) % VMC_PRESENT_QUEUE_SIZE;
+    g_present_qcount++;
+    pthread_cond_signal(&g_present_qready);
+    pthread_mutex_unlock(&g_present_qmu);
+}
+
+static bool present_pop(present_entry *e) {
+    pthread_mutex_lock(&g_present_qmu);
+    while (g_present_qcount == 0 && g_run) {
+        pthread_cond_wait(&g_present_qready, &g_present_qmu);
+    }
+    if (g_present_qcount == 0) {
+        pthread_mutex_unlock(&g_present_qmu);
+        return false;
+    }
+    *e = g_present_queue[g_present_qhead];
+    g_present_qhead = (g_present_qhead + 1) % VMC_PRESENT_QUEUE_SIZE;
+    g_present_qcount--;
+    pthread_cond_signal(&g_present_qspace);
+    pthread_mutex_unlock(&g_present_qmu);
+    return true;
+}
+
+static void *present_worker(void *arg) {
+    (void)arg;
+    while (g_run) {
+        /* Wait a short while for audio playback to start so the first frame
+         * is anchored to the audio clock, but never gate video permanently on
+         * audio: with a silent sink (or a dead audio feed) the present worker
+         * falls back to wall-clock pacing (dash_pres_clock) after ~3 s. */
+        if (g_audio_start_wall_us == 0) {
+            int waits = 0;
+            while (g_run && g_audio_start_wall_us == 0 && waits < 1000) {
+                av_usleep(3000);
+                waits++;
+            }
+        }
+        if (!g_run) break;
+        present_entry e;
+        if (!present_pop(&e)) break;
+        const u64 frame_period_us = (g_stream_fps > 0)
+            ? 1000000u / (u64)g_stream_fps : 1000000u / 24u;
+        if (e.deadline_us != 0) {
+            for (int i = 0; i < 600; i++) {
+                const u64 c = dash_pres_clock();
+                if (c >= e.deadline_us) break;
+                av_usleep(3000);
+                if (!g_run) break;
+            }
+            const u64 now2 = dash_pres_clock();
+            if (now2 > e.deadline_us + frame_period_us) {
+#ifdef VMC_DEBUG
+                g_frames_late++;
+#endif
+            } else if (e.deadline_us > now2 + frame_period_us) {
+#ifdef VMC_DEBUG
+                g_frames_early++;
+#endif
+            }
+        }
+        /* The decode worker already copied the frame into a DRM dumb buffer.
+         * Wait for the audio-master deadline, then submit the page flip; the
+         * kernel queues it for the next vblank, so a 24 fps stream on a 60 Hz
+         * panel naturally cadences as 2-3 vblank intervals. */
+        (void)vmc_drm_scanout_drain(&g_drm);
+        for (int tries = 0; g_run && tries < 50; tries++) {
+            vmc_status st = vmc_drm_scanout_present(&g_drm, e.buf_idx);
+            if (st == VMC_OK) break;
+            if (st == VMC_ERR_AGAIN) {
+                if (vmc_drm_scanout_wait_flip(&g_drm, 20) < 0) break;
+                continue;
+            }
+            VMC_LOGW("present: PageFlip failed for buf %d", e.buf_idx);
+            break;
+        }
+        g_presented++;
+        g_av_armed = true;
+        g_last_video_deadline_us = e.deadline_us - g_playout_latency_us;
+    }
+    return NULL;
+}
 
 static void *decode_worker(void *arg) {
     vmc_decode_ctx *cx = (vmc_decode_ctx *)arg;
@@ -533,16 +758,16 @@ static void *decode_worker(void *arg) {
      * (the same one used by the decoder) current at the right time. */
     (void)cx;
 #endif
-    /* Pace presentation to the content frame rate. The reader delivers each
-     * 1 s segment's frames in a burst; a per-AU deadline (anchored on the
-     * first segment's arrival) spreads the page flips to a steady cadence
-     * instead of a burst-then-idle. */
+    /* The reader delivers each 1 s segment's frames in a burst; a per-AU
+     * deadline (anchored on the first segment's arrival) carries the target
+     * presentation time. The present worker paces the actual flips, so the
+     * decode worker can run as fast as the reader delivers AUs. */
     u64 pres_cnt = 0;
     while (g_run_decode) {
         int idx = -1;
         u64 deadline_us = 0;
         const u64 frame_period_us = (g_stream_fps > 0)
-            ? 1000000u / (u64)g_stream_fps : 0u;
+            ? 1000000u / (u64)g_stream_fps : 1000000u / 24u;
         pthread_mutex_lock(&g_fmu);
         while (g_run_decode) {
             u64 best = UINT64_MAX;
@@ -561,29 +786,6 @@ static void *decode_worker(void *arg) {
         deadline_us = g_frames[idx].deadline_us;
         pthread_mutex_unlock(&g_fmu);
 
-        if (frame_period_us > 0 && deadline_us != 0) {
-            const u64 now = (u64)vmc_time_now_wall_us();
-            if (now + 2000u < deadline_us) {
-                u64 d = deadline_us - now;
-                if (d > 5000u) d = 5000u;
-                av_usleep((unsigned)d);
-                continue;
-            }
-            if (now > deadline_us + 3u * frame_period_us) {
-                pthread_mutex_lock(&g_fmu);
-                g_frames[idx].state = SLOT_FREE;
-                pthread_cond_signal(&g_ffree);
-                pthread_mutex_unlock(&g_fmu);
-#ifdef VMC_DEBUG
-                g_frames_dropped_resync++;
-#endif
-                if (now - g_last_resync_wall > 1000000u) {
-                    g_last_resync_wall = now;
-                    dash_resync(g_anchor_seg);
-                }
-                continue;
-            }
-        }
         pthread_mutex_lock(&g_fmu);
         g_frames[idx].state = SLOT_DECODING;
         pthread_mutex_unlock(&g_fmu);
@@ -613,25 +815,30 @@ static void *decode_worker(void *arg) {
             u64 decode_us = t_decoded - t_assemble;
 #ifdef VMC_DRM_FOUND
             if (g_use_drm) {
+                /* Acquire the DRM buffer for this frame now, then kick the
+                 * conversion. The previous frame's conversion is already in
+                 * flight; wait for it and copy its BGRA stage into the DRM
+                 * buffer that was reserved for it. */
                 int buf_idx = -1;
                 void *dumb = vmc_drm_scanout_next_idx(&g_drm, &buf_idx);
                 if (!dumb) {
-                    /* all buffers busy: wait for a flip to free one, and
-                     * record the on-screen latency of the buffer reused. */
-                    vmc_drm_scanout_wait_flip(&g_drm, 60);
-                    dumb = vmc_drm_scanout_next_idx(&g_drm, &buf_idx);
+                    /* All DRM buffers are busy (queued for the present worker
+                     * or in flight). Do NOT read DRM events here — the present
+                     * worker is the sole flip/event reader, and two threads
+                     * calling drmHandleEvent/read on the same fd deadlock
+                     * (one read blocks forever on an event the other consumed).
+                     * Just wait for the present worker to flip a buffer and
+                     * free one, then retry. */
+                    int waited = 0;
+                    while (!dumb && g_run_decode && waited < 1000) {
+                        av_usleep(3000);
+                        waited++;
+                        dumb = vmc_drm_scanout_next_idx(&g_drm, &buf_idx);
+                    }
                 }
                 if (!dumb) {
-                    VMC_LOGW("drm: all scanout buffers still busy after wait — dropping frame");
                     slot_release(idx);
-                    continue;
-                }
-                if (g_drm.bufs[buf_idx].last_flip_ts && g_drm_send_ts[buf_idx]
-                    && g_have_offset) {
-                    i32 onscreen = (i32)((u32)g_drm.bufs[buf_idx].last_flip_ts -
-                                         g_drm_send_ts[buf_idx] - g_offset_us);
-                    g_onscreen_sum += (u64)onscreen;
-                    g_onscreen_cnt++;
+                    continue; /* drop frame if no scanout buffer is free */
                 }
                 int stage = g_stage_idx % 3;
                 g_stage_idx++;
@@ -639,23 +846,42 @@ static void *decode_worker(void *arg) {
                 g_conv_async(f.planes[0], f.planes[1], f.width, f.height,
                              f.stride[0], f.stride[1], stage, g_drm.w, g_drm.h,
                              &ev);
+                const u64 t_after_async = vmc_time_now_us();
                 if (g_pending_ev) {
                     g_conv_wait(g_pending_ev);
                     g_conv_free(g_pending_ev);
-                    /* Copy row-by-row: the DRM dumb-buffer pitch is
-                     * hardware-aligned and can exceed width*4, so a flat
-                     * memcpy would skew every row. */
-                    {
-                        const unsigned char *stage =
-                            g_conv_stage(g_prev_stage);
-                        const u32 pitch = g_drm.bufs[buf_idx].pitch;
-                        u8 *dst = (u8 *)dumb;
-                        for (u32 r = 0; r < g_drm.h; r++) {
-                            memcpy(dst, stage + (size_t)r * g_drm.w * 4u,
-                                   (size_t)g_drm.w * 4u);
-                            dst += pitch;
-                        }
+                    const u64 t_after_wait = vmc_time_now_us();
+
+                    /* Copy the converted BGRA stage into the DRM buffer that
+                     * was reserved for the previous frame. If the DRM buffers
+                     * are pinned, use the GPU's DMA engine for the 2D copy;
+                     * otherwise fall back to the slow CPU row-by-row memcpy. */
+                    const unsigned char *stage_src =
+                        g_conv_stage(g_prev_stage);
+                    if (g_pending_buf_idx >= 0 &&
+                        g_pending_buf_idx < VMC_DRM_MAX_BUFS &&
+                        g_drm_dev_ptrs[g_pending_buf_idx] && g_cuda_memcpy2d) {
+                        g_cuda_memcpy2d(g_drm_dev_ptrs[g_pending_buf_idx],
+                                        g_pending_pitch, stage_src,
+                                        (size_t)g_drm.w * 4u,
+                                        (size_t)g_drm.w * 4u, g_drm.h,
+                                        CUDA_MEMCPY_HOST_TO_DEVICE);
+                    } else if (g_drm_pinned && g_cuda_memcpy2d) {
+                        g_cuda_memcpy2d(g_pending_map, g_pending_pitch,
+                                       stage_src, (size_t)g_drm.w * 4u,
+                                       (size_t)g_drm.w * 4u, g_drm.h,
+                                       CUDA_MEMCPY_HOST_TO_HOST);
+                    } else {
+                        copy_stage_to_drm_wc(stage_src, (size_t)g_drm.w * 4u,
+                                               (u8 *)g_pending_map,
+                                               g_pending_pitch,
+                                               g_drm.w, g_drm.h);
                     }
+                    if (g_hud)
+                        draw_overlay((u8 *)g_pending_map, g_drm.w, g_drm.h,
+                                     g_pending_pitch, e2e, decode_us,
+                                     g_one_way_us);
+
                     if (g_have_offset) {
                         const u64 t_handoff = vmc_time_now_us();
                         e2e = (i32)((u32)t_handoff - real_send_ts -
@@ -663,50 +889,35 @@ static void *decode_worker(void *arg) {
                         const u64 handoff_us = t_handoff - t_decoded;
                         latency_record((u64)e2e, decode_us, queue_us,
                                        handoff_us);
-                        g_drm_send_ts[buf_idx] = real_send_ts;
                     }
-                    if (g_hud)
-                        draw_overlay((u8 *)dumb, g_drm.w, g_drm.h,
-                                     g_drm.bufs[buf_idx].pitch, e2e, decode_us,
-                                     g_one_way_us);
-                    bool drm_present = true;
-                    const u64 pdeadline = g_pending_deadline_us;
-                    if (frame_period_us > 0 && pdeadline != 0) {
-                        const u64 pnow = (u64)vmc_time_now_wall_us();
-                        if (pnow > pdeadline + 3u * frame_period_us) {
-                            drm_present = false;
-#ifdef VMC_DEBUG
-                            g_frames_dropped_resync++;
-#endif
-                            if (pnow - g_last_resync_wall > 1000000u) {
-                                g_last_resync_wall = pnow;
-                                dash_resync(g_anchor_seg);
-                            }
-                        } else {
-                            if (pnow < pdeadline)
-                                av_usleep((unsigned)(pdeadline - pnow));
-                            const u64 pnow2 = (u64)vmc_time_now_wall_us();
-                            if (pnow2 > pdeadline + frame_period_us) {
-#ifdef VMC_DEBUG
-                                g_frames_late++;
-#endif
-                            }
+
+                    present_push(g_pending_buf_idx, g_pending_deadline_us);
+                    if (!g_first_video_ready) g_first_video_ready = true;
+                    const u64 t_after_push = vmc_time_now_us();
+                    {
+                        static int ftimer = 0;
+                        static u64 last_log_t = 0;
+                        if (++ftimer >= 10) {
+                            ftimer = 0;
+                            const u64 now_t = t_after_push;
+                            VMC_LOGI("decode timing: total=%lld decode=%lld "
+                                     "async=%lld copy=%lld push=%lld since_last=%lld us",
+                                     (long long)(t_after_push - t_assemble),
+                                     (long long)(t_decoded - t_assemble),
+                                     (long long)(t_after_async - t_decoded),
+                                     (long long)(t_after_wait - t_after_async),
+                                     (long long)(t_after_push - t_after_wait),
+                                     (long long)(last_log_t ? now_t - last_log_t : 0));
+                            last_log_t = now_t;
                         }
-                    }
-                    if (drm_present) {
-                        (void)vmc_drm_scanout_present(&g_drm);
-                        g_presented++;
-                        pres_cnt++;
-                        g_av_armed = true;
-#ifdef VMC_DEBUG
-                        g_last_video_deadline_us = pdeadline;
-#endif
                     }
                 }
                 g_pending_ev = ev;
                 g_prev_stage = stage;
+                g_pending_buf_idx = buf_idx;
+                g_pending_map = dumb;
+                g_pending_pitch = g_drm.bufs[buf_idx].pitch;
                 g_pending_deadline_us = deadline_us;
-                (void)vmc_drm_scanout_drain(&g_drm);
                 slot_release(idx);
                 continue;
             }
@@ -721,9 +932,16 @@ static void *decode_worker(void *arg) {
                 latency_record((u64)e2e, decode_us, queue_us, handoff_us);
             }
             if (frame_period_us > 0 && deadline_us != 0) {
-                const u64 now = (u64)vmc_time_now_wall_us();
-                if (now < deadline_us) av_usleep((unsigned)(deadline_us - now));
-                const u64 now2 = (u64)vmc_time_now_wall_us();
+                /* Hold to the (audio-master) presentation clock before
+                 * presenting. Iterates so a stalled audio clock (dash_pres_clock
+                 * reverts to wall) can never hold video more than a moment. */
+                for (int i = 0; i < 600; i++) {
+                    const u64 c = dash_pres_clock();
+                    if (c >= deadline_us) break;
+                    av_usleep(3000);
+                    if (!g_run_decode) break;
+                }
+                const u64 now2 = dash_pres_clock();
                 if (now2 > deadline_us + frame_period_us) {
 #ifdef VMC_DEBUG
                     g_frames_late++;
@@ -736,12 +954,11 @@ static void *decode_worker(void *arg) {
             }
             const u64 t_before_present = vmc_time_now_us();
             (void)vmc_display_present(cx->disp, &f);
+            if (!g_first_video_ready) g_first_video_ready = true;
             g_presented++;
             pres_cnt++;
             g_av_armed = true;
-#ifdef VMC_DEBUG
-            g_last_video_deadline_us = deadline_us;
-#endif
+            g_last_video_deadline_us = deadline_us - g_playout_latency_us;
             (void)t_before_present;
         } else {
             g_decode_fails++;
@@ -754,9 +971,15 @@ static void *decode_worker(void *arg) {
 
 #ifdef VMC_HAVE_ALSA
 #define VMC_AUDIO_FRAME_BYTES (960u)   /* 5 ms @ 48 kHz stereo s16 */
-#define VMC_AUDIO_FIFO_BYTES  (2097152u) /* 2 MiB (~10.9 s), power of two */
-#define VMC_AUDIO_PREFILL_TARGET (1000000u)
-#define VMC_AUDIO_LOW_WATER      (400000u)
+#define VMC_AUDIO_FIFO_BYTES  (8388608u) /* 8 MiB (~43.7 s), power of two */
+#define VMC_AUDIO_PREFILL_US     (VMC_AUDIO_PREFETCH_US) /* 5 s startup buffer */
+#define VMC_AUDIO_PREFILL_TARGET \
+    ((VMC_AUDIO_PREFILL_US * (u64)VMC_AUDIO_CHANNELS * 2u * \
+      (u64)VMC_AUDIO_SAMPLE_RATE) / 1000000u)
+#define VMC_AUDIO_LOW_WATER_US   (1000000u)  /* 1 s panic threshold */
+#define VMC_AUDIO_LOW_WATER      \
+    ((VMC_AUDIO_LOW_WATER_US * (u64)VMC_AUDIO_CHANNELS * 2u * \
+      (u64)VMC_AUDIO_SAMPLE_RATE) / 1000000u)
 
 static u8 g_audio_storage[VMC_AUDIO_FIFO_BYTES];
 static vmc_ringbuf g_audio_rb;
@@ -767,59 +990,20 @@ static vmc_audio_pipeline g_audio_pipe;
 static pthread_t g_audio_tid;
 static bool g_audio_started = false;
 #ifdef VMC_HAVE_FFMPEG
-/* Adaptive rate compensation: a SwrContext that stretches/compresses the
- * decoded 48 kHz audio by a servo-adjusted delta so the delivered sample rate
- * matches the ALSA/HDMI sink clock exactly. Without it, AAC segment
- * quantization (~46.875 frames/s, or an HDMI clock offset) makes delivered
- * audio run ~0.2% short of realtime, slowly draining the FIFO into XRUNs /
- * silence gaps. swr_set_compensation adds `delta` output frames per
- * VMC_AUDIO_SAMPLE_RATE input frames (positive = stretch = read fewer input
- * frames per sink second = FIFO fills). */
-static SwrContext *g_rate_swr = NULL;
+/* Adaptive rate compensation: the audio worker stretches/compresses the
+ * decoded 48 kHz audio by a servo-adjusted delta (sample duplication, see the
+ * render path) so the delivered sample rate matches the ALSA/HDMI sink clock
+ * exactly. Without it, AAC segment quantization and HDMI clock offset make
+ * delivered audio run short of realtime, draining the FIFO. */
 static int g_rate_delta = 0;
 static u64 g_rate_check_us = 0;
 #endif
 
-#ifdef VMC_HAVE_FFMPEG
-/* (Re)create the rate-conversion SwrContext with output rate 48 kHz + delta.
- * An explicit output rate is used instead of swr_set_compensation because the
- * compensation path on an equal-rate S16->S16 resampler does not apply the
- * full requested ratio on this FFmpeg. Positive delta = output rate higher =
- * stretch = fewer input frames read per sink second = FIFO fills. */
-static void audio_rate_swr_recreate(int delta) {
-    if (g_rate_swr) {
-        swr_free(&g_rate_swr);
-        g_rate_swr = NULL;
-    }
-    const int out_rate = (int)VMC_AUDIO_SAMPLE_RATE + delta;
-#if LIBSWRESAMPLE_VERSION_MAJOR >= 4
-    AVChannelLayout ch = AV_CHANNEL_LAYOUT_STEREO;
-    g_rate_swr = swr_alloc();
-    if (g_rate_swr &&
-        (swr_alloc_set_opts2(&g_rate_swr, &ch, AV_SAMPLE_FMT_S16, out_rate,
-                             &ch, AV_SAMPLE_FMT_S16, VMC_AUDIO_SAMPLE_RATE,
-                             0, NULL) < 0 ||
-         swr_init(g_rate_swr) < 0)) {
-        swr_free(&g_rate_swr);
-    }
-#else
-    g_rate_swr = swr_alloc_set_opts(
-        NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, out_rate,
-        AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, VMC_AUDIO_SAMPLE_RATE, 0,
-        NULL);
-    if (g_rate_swr && swr_init(g_rate_swr) < 0) swr_free(&g_rate_swr);
-#endif
-}
-#endif /* VMC_HAVE_FFMPEG */
-
 static void *audio_worker(void *arg) {
     (void)arg;
     i16 pcm[VMC_AUDIO_FRAME_BYTES / 2u];
-    while (g_run_audio && !g_av_armed) {
-        vmc_sleep_ms(2);
-    }
-    /* Pre-buffer audio before starting playback so the reader's per-segment
-     * bursts never underrun the ALSA sink. */
+    /* Pre-buffer a small amount of audio before starting playback so the
+     * reader's per-segment bursts never underrun the ALSA sink. */
     {
         const sz_t prefill = VMC_AUDIO_PREFILL_TARGET;
         pthread_mutex_lock(&g_audio_mu);
@@ -830,13 +1014,28 @@ static void *audio_worker(void *arg) {
         pthread_mutex_unlock(&g_audio_mu);
     }
 #ifdef VMC_HAVE_FFMPEG
-    if (g_rate_swr == NULL) audio_rate_swr_recreate(0);
+    g_rate_delta = 0;
     g_rate_check_us = 0;
 #endif
 #ifdef VMC_DEBUG
     bool low_water = false;
 #endif
     while (g_run_audio) {
+        /* A silent sink (ALSA device unavailable) must not consume the FIFO
+         * or advance the audio-master clock at non-realtime speed — that would
+         * race audio_pos far ahead of wall time and break the video lock.
+         * Idle instead so the video path falls back to wall pacing. */
+        if (!vmc_alsa_sink_playing(&g_audio_pipe.sink)) {
+            vmc_sleep_ms(20);
+            continue;
+        }
+        /* Wait for the first decoded video frame to be ready before starting
+         * audio playback, so A/V begin together. Once audio has started we
+         * never block here again. */
+        if (g_audio_start_wall_us == 0 && !g_first_video_ready) {
+            av_usleep(1000);
+            continue;
+        }
         pthread_mutex_lock(&g_audio_mu);
         const sz_t avail = vmc_ringbuf_used(&g_audio_rb);
         sz_t n = 0;
@@ -854,30 +1053,46 @@ static void *audio_worker(void *arg) {
             memset(pcm, 0, sizeof(pcm));
             n = sizeof(pcm);
         }
-#ifdef VMC_DEBUG
         const sz_t data_n = (avail >= sizeof(pcm)) ? sizeof(pcm) : avail;
-#endif
         pthread_mutex_unlock(&g_audio_mu);
         {
             const sz_t frames = n / 2u / VMC_AUDIO_CHANNELS;
-#ifdef VMC_HAVE_FFMPEG
-            if (g_rate_swr) {
-                static i16 outbuf[VMC_AUDIO_FRAME_BYTES / 2u + 64u];
-                const u8 *inp = (const u8 *)pcm;
-                u8 *outp = (u8 *)outbuf;
-                int out_cnt = swr_get_out_samples(g_rate_swr, (int)frames);
-                if (out_cnt > (int)(VMC_AUDIO_FRAME_BYTES / 2u + 64u))
-                    out_cnt = (int)(VMC_AUDIO_FRAME_BYTES / 2u + 64u);
-                const int got = swr_convert(g_rate_swr, &outp, out_cnt,
-                                            &inp, (int)frames);
-                if (got > 0)
-                    (void)vmc_audio_pipeline_render(&g_audio_pipe, outbuf,
-                                                    (sz_t)got);
-            } else
-#endif
-            {
-                (void)vmc_audio_pipeline_render(&g_audio_pipe, pcm, frames);
+            static i16 outbuf[VMC_AUDIO_FRAME_BYTES / 2u + 128u];
+            static i32 dup_frac = 0;
+            sz_t out_n = frames;
+            if (g_rate_delta != 0) {
+                /* Manual zero-order-hold stretch: output exactly
+                 * frames*(48000+delta)/48000 frames by duplicating samples,
+                 * with a fractional accumulator for an exact long-run rate.
+                 * (swr_convert on this FFmpeg buffers its stretched output
+                 * internally and never flushes it here, so its compensation
+                 * was ~0 in effect; duplication is guaranteed by count.) */
+                out_n = frames +
+                        (sz_t)((i64)frames * g_rate_delta /
+                               (i64)VMC_AUDIO_SAMPLE_RATE);
+                dup_frac += (i32)((i64)frames * g_rate_delta %
+                                  (i64)VMC_AUDIO_SAMPLE_RATE);
+                if (dup_frac >= (i32)VMC_AUDIO_SAMPLE_RATE) {
+                    out_n++;
+                    dup_frac -= (i32)VMC_AUDIO_SAMPLE_RATE;
+                }
+                if (out_n > sizeof(outbuf) / 2u)
+                    out_n = sizeof(outbuf) / 2u;
+                for (sz_t i = 0; i < out_n; i++) {
+                    const sz_t src =
+                        (sz_t)((i64)i * (i64)frames / (i64)out_n);
+                    outbuf[i * 2u] = pcm[src * 2u];
+                    outbuf[i * 2u + 1u] = pcm[src * 2u + 1u];
+                }
+            } else {
+                memcpy(outbuf, pcm, frames * 2u * 2u);
             }
+#ifdef VMC_DEBUG
+            g_rate_out += out_n;
+            g_rate_in += frames;
+#endif
+            (void)vmc_audio_pipeline_render(&g_audio_pipe, outbuf, out_n);
+        }
 #ifdef VMC_HAVE_FFMPEG
             /* Starved: pace this path so a silent/non-blocking sink does not
              * spin at 100 % CPU while we wait for the next audio segment. */
@@ -886,38 +1101,73 @@ static void *audio_worker(void *arg) {
              * draining, stretch the audio slightly (more output frames per
              * input) so delivered rate matches the sink clock exactly; if it
              * overflows, relax. Keeps the FIFO inside the 0.4-1.2 MB band. */
-            if (g_rate_swr) {
+            {
                 const u64 now_mono = vmc_time_now_us();
                 if (g_rate_check_us == 0) g_rate_check_us = now_mono;
                 if (now_mono - g_rate_check_us >= 2000000u) {
                     g_rate_check_us = now_mono;
-                    int nd = g_rate_delta;
-                    if (avail < 250000u) nd += 64;
-                    else if (avail < 400000u) nd += 24;
-                    else if (avail > 1200000u) nd -= 64;
-                    if (nd > 1440) nd = 1440;   /* ±3 % of 48 kHz */
-                    if (nd < -1440) nd = -1440;
-                    if (nd != g_rate_delta) {
-                        g_rate_delta = nd;
-                        audio_rate_swr_recreate(nd);
-                    }
+                    /* Disabled: adaptive pitch compensation was duplicating/dropping
+                     * samples to chase a FIFO level, which made the audio clock
+                     * drift away from the video timeline. With a large live
+                     * buffer, the small DASH/AAC boundary loss is absorbed as
+                     * occasional silence rather than a continuous A/V drift. */
+                    g_rate_delta = 0;
                 }
             }
 #endif
+        /* Audio-master clock: drive the video presenter from the actual ALSA
+         * playback position, not the amount of data consumed from the FIFO.
+         * The ALSA position is the wall time of the sample currently being
+         * heard, so it is immune to the DASH encoder running faster than real
+         * time and closes long-run A/V drift. */
+        u64 alsa_pos_us = 0;
+        static u64 last_alsa_pos_us = 0;
+        if (vmc_alsa_sink_position_us(&g_audio_pipe.sink, &alsa_pos_us)) {
+            g_audio_pos_us = alsa_pos_us;
+            g_audio_active = true;
+            if (alsa_pos_us != last_alsa_pos_us) {
+                g_audio_last_advance_wall = (u64)vmc_time_now_wall_us();
+                last_alsa_pos_us = alsa_pos_us;
+            }
+        } else {
+            /* Fallback for a sink that lost its position (e.g. after a fatal
+             * ALSA error). Estimate from the bytes fed to the sink. */
+            if (data_n > 0) {
+                if (g_audio_start_wall_us == 0) {
+                    g_audio_start_wall_us = (u64)vmc_time_now_wall_us();
+                    g_audio_delay_us = 0; /* fallback has no sink delay info */
+                    pthread_mutex_lock(&g_anchor_mu);
+                    const int anchor_seg = g_anchor_seg;
+                    pthread_mutex_unlock(&g_anchor_mu);
+                    if (anchor_seg != 0)
+                        dash_resync(anchor_seg, 0, "audio-start");
+                }
+                g_audio_bytes_consumed += data_n;
+                g_audio_active = true;
+                g_audio_last_advance_wall = (u64)vmc_time_now_wall_us();
+            }
+            if (g_audio_start_wall_us != 0) {
+                g_audio_pos_us = g_audio_start_wall_us +
+                    (g_audio_bytes_consumed / 4u) * 1000000u /
+                        VMC_AUDIO_SAMPLE_RATE;
+            }
+        }
+        if (g_audio_active && g_audio_start_wall_us == 0) {
+            g_audio_start_wall_us = (u64)vmc_time_now_wall_us();
+            u64 delay = 0;
+            if (vmc_alsa_sink_delay_us(&g_audio_pipe.sink, &delay))
+                g_audio_delay_us = delay;
+            pthread_mutex_lock(&g_anchor_mu);
+            const int anchor_seg = g_anchor_seg;
+            pthread_mutex_unlock(&g_anchor_mu);
+            if (anchor_seg != 0)
+                dash_resync(anchor_seg, 0, "audio-start");
         }
 #ifdef VMC_DEBUG
-        if (data_n > 0) {
-            if (g_audio_bytes_consumed == 0)
-                g_audio_start_wall_us = (u64)vmc_time_now_wall_us();
-            g_audio_bytes_consumed += data_n;
-        }
         g_audio_pad_bytes += (sz_t)(sizeof(pcm) - data_n);
-        if (g_audio_start_wall_us != 0) {
-            const u64 audio_pos_us = g_audio_start_wall_us +
-                (g_audio_bytes_consumed / 4u) * 1000000u /
-                    VMC_AUDIO_SAMPLE_RATE;
+        if (g_audio_pos_us != 0) {
             const i64 off = (i64)g_last_video_deadline_us -
-                            (i64)audio_pos_us;
+                            (i64)g_audio_pos_us;
             if (g_av_offset_ewma_us == 0)
                 g_av_offset_ewma_us = off;
             else
@@ -935,12 +1185,6 @@ static void *audio_worker(void *arg) {
         }
 #endif
     }
-#ifdef VMC_HAVE_FFMPEG
-    if (g_rate_swr) {
-        swr_free(&g_rate_swr);
-        g_rate_swr = NULL;
-    }
-#endif
     return NULL;
 }
 #endif /* VMC_HAVE_ALSA */
@@ -976,6 +1220,9 @@ typedef struct {
     AVFrame *aframe;
     i16 *apcm;
     int apcm_cap;
+    i64 audio_pts;  /* monotonic pts counter for the AAC decoder */
+    i64 video_first_pts; /* first video pts in current segment (for frame index) */
+    int video_au_k;      /* per-segment fallback video frame counter */
 } dash_session;
 
 static int dash_session_setup(AVFormatContext *fmt, dash_session *s) {
@@ -1139,6 +1386,8 @@ static int dash_init_setup_one(const u8 *init, size_t init_len, int want_audio,
                 if (fr.num > 0 && fr.den > 0 && g_stream_fps <= 0) {
                     g_stream_fps =
                         (int)((fr.num + (int64_t)fr.den / 2) / fr.den);
+                    VMC_LOGI("dash: demuxer frame rate %d/%d -> %d fps",
+                             fr.num, fr.den, g_stream_fps);
                 }
                 const AVBitStreamFilter *bsf =
                     av_bsf_get_by_name("h264_mp4toannexb");
@@ -1231,6 +1480,8 @@ static int dash_session_setup_from_init(const u8 *init, size_t init_len,
     memset(s, 0, sizeof(*s));
     s->vs = -1;
     s->as = -1;
+    s->video_first_pts = AV_NOPTS_VALUE;
+    s->video_au_k = 0;
     if (dash_init_setup_one(init, init_len, 0, s) != 0) return -1;
     if (init_a && init_a_len > 0) {
         (void)dash_init_setup_one(init_a, init_a_len, 1, s);
@@ -1693,6 +1944,9 @@ typedef struct {
     int start_number;
     int64_t avail_start_us;
     int64_t seg_duration_us;
+    int64_t publish_time_us;
+    int64_t timeshift_depth_us;
+    int window_segments; /* live edge offset from start_number at publishTime */
     int frame_rate;   /* from AdaptationSet frameRate="24/1" (0 if unknown) */
 } dash_manifest;
 
@@ -1712,6 +1966,27 @@ static int64_t parse_iso8601(const char *s) {
     const time_t epoch = timegm(&t);
     if (epoch < 0) return -1;
     return (int64_t)epoch * 1000000LL + (int64_t)((se - (int)se) * 1e6);
+}
+
+static int64_t parse_duration_us(const char *s) {
+    int64_t us = 0;
+    const char *p = s;
+    if (*p == 'P' || *p == 'p') p++;
+    if (*p == 'T' || *p == 't') p++;
+    while (*p) {
+        char *end = NULL;
+        double d = strtod(p, &end);
+        if (end == p) break;
+        p = end;
+        switch (*p) {
+            case 'H': case 'h': us += (int64_t)(d * 3600000000.0); break;
+            case 'M': case 'm': us += (int64_t)(d *   60000000.0); break;
+            case 'S': case 's': us += (int64_t)(d *    1000000.0); break;
+            default: break;
+        }
+        if (*p) p++;
+    }
+    return us;
 }
 
 static int dash_load_manifest(const char *mpd_url, dash_manifest *m) {
@@ -1734,6 +2009,32 @@ static int dash_load_manifest(const char *mpd_url, dash_manifest *m) {
         memcpy(ast, at + strlen("availabilityStartTime=\""), l);
         m->avail_start_us = parse_iso8601(ast);
     } else {
+    }
+    /* publishTime: when the MPD was published; the live simulator advances
+     * the live edge from this point, not from availabilityStartTime. */
+    const char *pt = strstr(s, "publishTime=\"");
+    if (pt) {
+        const char *pe = strchr(pt + strlen("publishTime=\""), '"');
+        char pbuf[64] = {0};
+        if (pe) {
+            size_t l = (size_t)(pe - (pt + strlen("publishTime=\"")));
+            if (l > sizeof(pbuf) - 1) l = sizeof(pbuf) - 1;
+            memcpy(pbuf, pt + strlen("publishTime=\""), l);
+            m->publish_time_us = parse_iso8601(pbuf);
+        }
+    }
+    /* timeShiftBufferDepth: how far behind the live edge segments are kept.
+     * The live edge at publishTime is start_number + window_segments. */
+    const char *td = strstr(s, "timeShiftBufferDepth=\"");
+    if (td) {
+        const char *te = strchr(td + strlen("timeShiftBufferDepth=\""), '"');
+        char tbuf[64] = {0};
+        if (te) {
+            size_t l = (size_t)(te - (td + strlen("timeShiftBufferDepth=\"")));
+            if (l > sizeof(tbuf) - 1) l = sizeof(tbuf) - 1;
+            memcpy(tbuf, td + strlen("timeShiftBufferDepth=\""), l);
+            m->timeshift_depth_us = parse_duration_us(tbuf);
+        }
     }
     /* startNumber */
     const char *sn = strstr(s, "startNumber=\"");
@@ -1771,6 +2072,15 @@ static int dash_load_manifest(const char *mpd_url, dash_manifest *m) {
         memcpy(m->base, mpd_url, (size_t)(b - mpd_url) + bl);
         m->base[(size_t)(b - mpd_url) + bl] = 0;
     }
+    if (m->publish_time_us <= 0)
+        m->publish_time_us = m->avail_start_us;
+    if (m->timeshift_depth_us <= 0)
+        m->timeshift_depth_us = 10000000; /* 10 s default if MPD omits it */
+    m->window_segments = (int)((m->timeshift_depth_us +
+                                (u64)m->seg_duration_us - 1u) /
+                               (u64)m->seg_duration_us);
+    if (m->window_segments < 1) m->window_segments = 1;
+
     free(body);
     return (m->avail_start_us > 0 && m->seg_duration_us > 0) ? 0 : -1;
 }
@@ -1801,16 +2111,30 @@ static void dash_audio_write_frame(dash_session *s) {
     }
     av_frame_unref(s->aframe);
 }
+
+/* Push already-resampled S16 PCM (frames*4 bytes) from s->apcm to the FIFO. */
+static void dash_audio_push_pcm(dash_session *s, int frames) {
+    if (frames <= 0) return;
+    pthread_mutex_lock(&g_audio_mu);
+    (void)vmc_ringbuf_write(&g_audio_rb, s->apcm, (sz_t)frames * 2 * 2);
+    pthread_cond_signal(&g_audio_cv);
+    pthread_mutex_unlock(&g_audio_mu);
+#ifdef VMC_DEBUG
+    g_audio_pcm_bytes += (u64)frames * 2u * 2u;
+#endif
+}
 #endif /* VMC_HAVE_ALSA */
 
 static u64 dash_au_deadline(int seg_num, int k) {
+    pthread_mutex_lock(&g_anchor_mu);
     const u64 frame_period_us = (g_stream_fps > 0)
-        ? 1000000u / (u64)g_stream_fps : 1000000u / 30u;
+        ? 1000000u / (u64)g_stream_fps : 1000000u / 24u;
     i64 seg_off = ((i64)seg_num - (i64)g_anchor_seg) *
                   (i64)g_seg_duration_us;
     if (seg_off < 0) seg_off = 0;
     i64 d = (i64)g_anchor_wall_us + seg_off + (i64)k * (i64)frame_period_us +
             (i64)g_playout_latency_us + g_timeline_adj_us;
+    pthread_mutex_unlock(&g_anchor_mu);
     if (d < 0) d = 0;
     return (u64)d;
 }
@@ -1819,6 +2143,13 @@ static void dash_demux_segment(u8 *data, size_t len, dash_session *s,
                                AVPacket *out, int seg_num, int *au_k) {
     AVIOContext *avio = dash_open_mem_io(data, len);
     if (!avio) return;
+    /* Reset per-segment video frame indexing so each segment's deadlines
+     * start from k=0 and advance by the content frame duration. */
+    s->video_first_pts = AV_NOPTS_VALUE;
+    s->video_au_k = 0;
+#ifdef VMC_HAVE_ALSA
+    bool saw_audio = false;
+#endif
     AVFormatContext *fmt = avformat_alloc_context();
     if (!fmt) {
         dash_close_mem_io(&avio);
@@ -1848,24 +2179,52 @@ static void dash_demux_segment(u8 *data, size_t len, dash_session *s,
             fmt->streams[pkt->stream_index]->codecpar->codec_type;
         if (st == AVMEDIA_TYPE_VIDEO && s->bsfc) {
             g_dash_pkts++;
+            AVStream *vst = fmt->streams[pkt->stream_index];
+            /* Map the packet's presentation timestamp to a zero-based frame
+             * index within the segment. This is essential for H.264 streams
+             * where the bitstream filter splits one frame into multiple NAL
+             * units: every NAL for the same frame must share the same
+             * presentation deadline so the video cadence matches the content
+             * frame rate (24 fps) rather than the NAL/packet rate. */
+            int frame_idx = -1;
+            if (g_stream_fps > 0 && pkt->pts != AV_NOPTS_VALUE) {
+                if (s->video_first_pts == AV_NOPTS_VALUE)
+                    s->video_first_pts = pkt->pts;
+                const i64 rel = pkt->pts - s->video_first_pts;
+                if (rel >= 0) {
+                    frame_idx = (int)av_rescale_q(rel, vst->time_base,
+                                                  (AVRational){1, g_stream_fps});
+                }
+            }
+            if (frame_idx < 0) {
+                frame_idx = s->video_au_k;
+                if (au_k) frame_idx = *au_k;
+            }
             if (av_bsf_send_packet(s->bsfc, pkt) == 0) {
                 while (av_bsf_receive_packet(s->bsfc, out) == 0) {
                     if (out->size > 0) {
-                        int k = 0;
-                        if (au_k) k = *au_k;
                         dash_publish_au(out->data, out->size,
-                                        dash_au_deadline(seg_num, k));
-                        if (au_k) (*au_k)++;
+                                        dash_au_deadline(seg_num, frame_idx));
                     }
                     av_packet_unref(out);
                 }
             }
+            s->video_au_k++;
+            if (au_k) (*au_k)++;
             av_packet_unref(pkt);
         } else if (st == AVMEDIA_TYPE_AUDIO && s->as >= 0 && s->actx &&
                    s->swr && s->aframe) {
 #ifdef VMC_DEBUG
             g_audio_pkts++;
 #endif
+            /* Override pts with a monotonic counter. Each segment is demuxed
+             * by a fresh AVFormatContext whose packet pts restart near zero,
+             * which the AAC decoder reads as a discontinuity and drops the
+             * frame it was holding from the previous segment (the ~2%
+             * per-segment audio loss). Monotonic pts makes it decode cleanly. */
+            pkt->pts = s->audio_pts;
+            pkt->dts = s->audio_pts;
+            s->audio_pts += 1024;
             /* Send can return EAGAIN if the decoder's input queue is full
              * (a frame is held for output). Drain first, then retry once so
              * no packet is dropped at a segment boundary. */
@@ -1885,20 +2244,60 @@ static void dash_demux_segment(u8 *data, size_t len, dash_session *s,
                 dash_audio_write_frame(s);
             }
             av_packet_unref(pkt);
+#ifdef VMC_HAVE_ALSA
+            saw_audio = true;
+#endif
         } else {
             av_packet_unref(pkt);
         }
     }
     av_packet_free(&pkt);
+#ifdef VMC_HAVE_ALSA
+    /* Drain the AAC->48k resampler so the samples it buffered for the last
+     * frame(s) of this segment are flushed to the FIFO. Without this, ~2% of
+     * decoded audio is never delivered (buffered tail dropped on the next
+     * segment), which starves the sink and forces pitch-compensation drift. */
+    if (saw_audio && s->swr && s->apcm) {
+        int drain = swr_get_out_samples(s->swr, 0);
+        if (drain > 0) {
+            if ((sz_t)drain * 4u > s->apcm_cap) {
+                i16 *nb = (i16 *)realloc(s->apcm, (sz_t)drain * 4u);
+                if (nb) {
+                    s->apcm = nb;
+                    s->apcm_cap = (sz_t)drain * 4u;
+                }
+            }
+            const int got = swr_convert(s->swr, (u8 **)&s->apcm, drain,
+                                        NULL, 0);
+            dash_audio_push_pcm(s, got);
+        }
+    }
+#endif
     fmt->pb = NULL;
     avformat_close_input(&fmt);
     dash_close_mem_io(&avio);
 }
 
-static void dash_resync(int next_seg) {
+static void dash_resync(int next_seg, int live_edge, const char *reason) {
     const u64 old_wall = g_anchor_wall_us;
     const int old_seg = g_anchor_seg;
-    g_anchor_wall_us = (u64)vmc_time_now_wall_us();
+    (void)live_edge;
+    pthread_mutex_lock(&g_anchor_mu);
+    const u64 wall_now = (u64)vmc_time_now_wall_us();
+    u64 anchor_us;
+    if (g_audio_start_wall_us != 0) {
+        /* Audio playback has actually started; anchor the video timeline so
+         * the first video frame is presented (with playout latency) when the
+         * first audio content is heard. The ALSA delay tells us how long
+         * after the first write that first sample reaches the DAC. */
+        const u64 delay = g_audio_delay_us ? g_audio_delay_us : VMC_AUDIO_PREFILL_US;
+        anchor_us = g_audio_start_wall_us + delay - g_playout_latency_us;
+    } else {
+        /* Audio has not started yet (still pre-filling). Use a provisional
+         * anchor far enough in the future to cover the audio startup buffer. */
+        anchor_us = wall_now + VMC_AUDIO_PREFILL_US - g_playout_latency_us;
+    }
+    g_anchor_wall_us = anchor_us;
     g_anchor_seg = next_seg;
     g_timeline_adj_us = 0;
     g_seg_interval_ewma = 0;
@@ -1906,9 +2305,77 @@ static void dash_resync(int next_seg) {
 #ifdef VMC_DEBUG
     g_resync_count++;
 #endif
-    VMC_LOGW("dash: resync anchor seg %d -> %d (wall %llu -> %llu us)",
-             old_seg, next_seg, (unsigned long long)old_wall,
-             (unsigned long long)g_anchor_wall_us);
+    pthread_mutex_unlock(&g_anchor_mu);
+
+    /* If the anchor segment did not change, shift any already-scheduled
+     * frame deadlines by the same delta so the first queued frame still hits
+     * the new audio-start wall time. */
+    if (old_wall != 0 && old_seg == next_seg) {
+        const i64 delta = (i64)g_anchor_wall_us - (i64)old_wall;
+        if (delta != 0) {
+            pthread_mutex_lock(&g_fmu);
+            for (int i = 0; i < VMC_FRAME_SLOTS; i++) {
+                if (g_frames[i].state != SLOT_FREE) {
+                    i64 d = (i64)g_frames[i].deadline_us + delta;
+                    if (d < 0) d = 0;
+                    g_frames[i].deadline_us = (u64)d;
+                }
+            }
+            pthread_mutex_unlock(&g_fmu);
+            pthread_mutex_lock(&g_present_qmu);
+            for (int i = 0; i < VMC_PRESENT_QUEUE_SIZE; i++) {
+                if (g_present_queue[i].deadline_us != 0) {
+                    i64 d = (i64)g_present_queue[i].deadline_us + delta;
+                    if (d < 0) d = 0;
+                    g_present_queue[i].deadline_us = (u64)d;
+                }
+            }
+            pthread_mutex_unlock(&g_present_qmu);
+        }
+    }
+
+    VMC_LOGW("dash: resync (%s) anchor seg %d -> %d (wall %llu -> %llu us, audio_start %llu us)",
+             reason, old_seg, next_seg, (unsigned long long)old_wall,
+             (unsigned long long)g_anchor_wall_us,
+             (unsigned long long)g_audio_start_wall_us);
+}
+
+/* Adjust live-buffer targets based on measured segment-fetch latency.
+ * The buffer starts at the steady target for fast startup, and can expand up
+ * to the maximum when the network (or the on-the-fly DASH server) is slow.
+ * The reader fills the whole window [live_edge-buffer, live_edge-1] each loop
+ * (backfilling when the buffer grows), so a change here takes effect
+ * immediately and is self-consistent with the fetch loops. */
+static void dash_update_live_buffer(u64 fetch_us, int seg_duration_us) {
+    if (g_seg_fetch_ewma_us == 0) g_seg_fetch_ewma_us = fetch_us;
+    else g_seg_fetch_ewma_us = (15 * g_seg_fetch_ewma_us + fetch_us) / 16;
+
+    const u64 target = VMC_VIDEO_TARGET_US;
+    u64 desired = target;
+
+    /* Add safety margin when the server consistently takes a long time to
+     * produce a segment. */
+    if (g_seg_fetch_ewma_us > (u64)seg_duration_us / 2) desired += 1000000u;
+    if (g_seg_fetch_ewma_us > (u64)seg_duration_us)     desired += 2000000u;
+    if (g_seg_fetch_ewma_us > (u64)seg_duration_us * 2) desired += 3000000u;
+    if (g_seg_fetch_ewma_us > (u64)seg_duration_us * 4) desired += 5000000u;
+
+    if (desired > VMC_VIDEO_MAX_US) desired = VMC_VIDEO_MAX_US;
+    if (desired < VMC_VIDEO_PREFETCH_US) desired = VMC_VIDEO_PREFETCH_US;
+
+    /* Shrink back toward the target when the network is fast and stable.
+     * A shrink only raises the window bottom (drops old segments); playback
+     * continues from the newest already-fetched content. */
+    if (g_seg_fetch_ewma_us < (u64)seg_duration_us / 4 &&
+        g_video_live_buffer_us > target) {
+        if (g_video_live_buffer_us > target + 1000000u)
+            desired = g_video_live_buffer_us - 1000000u;
+        else
+            desired = target;
+    }
+
+    g_video_live_buffer_us = desired;
+    g_audio_live_buffer_us = desired;
 }
 
 static void *dash_reader_direct(void *arg) {
@@ -1947,35 +2414,120 @@ static void *dash_reader_direct(void *arg) {
             continue;
         }
 
-        int last_vnum = -1;
-        int last_anum = -1;
-        while (g_run) {
-            const int64_t now = (int64_t)vmc_time_now_wall_us();
-            /* Stay a few segments behind the live edge so the segment has
-             * finished writing on the server before we request it. Segment
-             * files use absolute numbering anchored to availabilityStartTime
-             * (segment 1 = avail_start), so the live edge must be computed as
-             * 1 + elapsed — NOT m.start_number + elapsed: the MPD window
-             * rolls startNumber forward once the oldest segments expire, which
-             * would point past the real edge. */
-            const int live_edge = 1 +
-                (int)((now - m.avail_start_us) / m.seg_duration_us);
-            int num = live_edge - 2;
-            if (num < m.start_number) num = m.start_number;
-            bool did_work = false;
+        /* Reset per-stream state for a fresh DASH session. Drop the anchor so
+         * the first segment of this session re-anchors the timeline (a reader
+         * restart or server restart must not extrapolate deadlines from the
+         * previous session's anchor). Start the buffer at the steady target so
+         * the first reader loop fills the full live window in one burst (a
+         * grow-from-prefetch transition would re-anchor the timeline mid-startup
+         * and visibly jump the picture back). */
+        g_anchor_wall_us = 0;
+        g_anchor_seg = 0;
+        g_prefetch_done = 0;
+        g_seg_fetch_ewma_us = 0;
+        g_video_live_buffer_us = VMC_VIDEO_TARGET_US;
+        g_audio_live_buffer_us = VMC_AUDIO_TARGET_US;
 
-            /* Deliver audio one segment ahead of video so the FIFO always holds
-             * the next segment's audio (a full 1 s of margin against the
-             * per-segment bursts). Audio segment num+1 is already complete on
-             * the server, so the fetch is instant. On the first cycle also
-             * deliver the current segment so A/V playback starts aligned. */
+            int last_vnum = -1;
+            int last_anum = -1;
+            while (g_run) {
+                const u64 loop_start = vmc_time_now_wall_us();
+                const u64 t0 = loop_start;
+
+                /* Reload the MPD every loop to keep the live edge current.
+                 * The DASH simulator updates startNumber and publishTime each
+                 * second; if we use a stale MPD we chase segments that have not
+                 * been generated yet. */
+                dash_manifest fresh_m;
+                if (dash_load_manifest(url, &fresh_m) == 0) {
+                    m = fresh_m;
+                } else {
+                    VMC_LOGW("dash: periodic manifest reload failed, using stale MPD");
+                }
+
+                const int64_t now = (int64_t)vmc_time_now_wall_us();
+                /* Live edge = newest complete segment. Segment N spans the
+                 * wall interval [avail + (N-1)*dur, avail + N*dur) and is
+                 * complete when now >= avail + N*dur. The edge MUST be anchored
+                 * to availabilityStartTime (absolute segment numbering), NOT to
+                 * startNumber + timeShiftBufferDepth: before the window is full
+                 * the manifest advertises a 100-segment window while only a
+                 * handful of segments exist, and that math would target
+                 * segments ~100 ahead of reality (every fetch 404s). The
+                 * absolute anchor stays correct even after the window rolls
+                 * startNumber forward. */
+                const int64_t elapsed = now - m.avail_start_us;
+                int live_edge = (int)(elapsed > 0
+                    ? elapsed / m.seg_duration_us : 0);
+                if (live_edge < m.start_number) live_edge = m.start_number;
+
+                /* Stay g_video_live_buffer_us / g_audio_live_buffer_us behind the
+                 * live edge. The buffer starts at the steady target for fast
+                 * startup, and can expand to the maximum when the DASH server /
+                 * network is slow. Video and audio fetch the SAME segment window
+                 * (both start at live_edge - buffer) so the delivered A/V content
+                 * stays aligned; the reader fills forward one segment per loop
+                 * and the wall-clock anchor paces playback. */
+                const int video_buffer_segments =
+                    (int)((g_video_live_buffer_us + (u64)m.seg_duration_us - 1u) /
+                          (u64)m.seg_duration_us);
+                const int audio_buffer_segments =
+                    (int)((g_audio_live_buffer_us + (u64)m.seg_duration_us - 1u) /
+                          (u64)m.seg_duration_us);
+                int video_target = live_edge - 1 - video_buffer_segments;
+                if (video_target < m.start_number) video_target = m.start_number;
+                int audio_target = live_edge - 1;
+                if (audio_target < (int)m.start_number)
+                    audio_target = (int)m.start_number;
+                int audio_oldest = live_edge - 1 - audio_buffer_segments;
+                if (audio_oldest < (int)m.start_number)
+                    audio_oldest = (int)m.start_number;
+                int num = video_target; /* for the sleep calculation */
+                bool did_work = false;
+
+            /* Fetch audio segments to fill the same window. The first loop
+             * bursts the whole window into the FIFO (that is the audio prefill);
+             * after that, one new segment per reader loop keeps it topped up.
+             * Never fetch a segment older than one already delivered — inserting
+             * old PCM after newer would replay audio out of order.
+             *
+             * The server's rolling window deletes old segments and rolls
+             * startNumber forward. If we have fallen behind the window (e.g.
+             * during a long stall), the segment we want is gone and retrying it
+             * 404s forever (the server holds the connection ~15 s first). Jump
+             * to the current window start and flush the stale FIFO so the audio
+             * content realigns with video instead of replaying minutes-old
+             * audio (or silence). */
             if (init_a && init_a_len > 0) {
-                /* Fetch the next audio segment not yet delivered. Target
-                 * last_anum+1 (seeded from num) so a failed fetch is retried
-                 * on the next cycle instead of being skipped forever as num
-                 * advances — a skipped audio segment is a permanent 1 s hole. */
-                const int at = (last_anum < 0) ? num : (last_anum + 1);
-                if (at <= num + 1) {
+                int at = (last_anum < 0) ? audio_oldest : (last_anum + 1);
+                if (at < (int)m.start_number) {
+                    if (last_anum >= 0) {
+                        pthread_mutex_lock(&g_audio_mu);
+                        vmc_ringbuf_reset(&g_audio_rb);
+                        pthread_cond_signal(&g_audio_cv);
+                        pthread_mutex_unlock(&g_audio_mu);
+#ifdef VMC_DEBUG
+                        g_audio_pcm_bytes = 0;
+#endif
+                        VMC_LOGW("dash: audio fell behind server window "
+                                 "(seg %d < start %d); flushing FIFO and "
+                                 "jumping ahead",
+                                 at, m.start_number);
+                    }
+                    last_anum = (int)m.start_number - 1;
+                    at = last_anum + 1;
+                    /* Skip the deleted content entirely and start from the
+                     * current buffered window (ahead of the deleted tail), so
+                     * the catch-up burst stays bounded to the window size. */
+                    if (at < audio_oldest) {
+                        last_anum = audio_oldest - 1;
+                        at = audio_oldest;
+                    }
+                    if (at > audio_target) at = audio_target;
+                }
+                if (at > audio_target) at = audio_target;
+                while (g_run && at <= audio_target) {
+                    if (last_anum >= 0 && at <= last_anum) break;
                     snprintf(seg_url, sizeof(seg_url),
                              "%s/chunk-stream1-%05d.m4s", m.base, at);
                     u8 *seg = NULL;
@@ -2001,133 +2553,151 @@ static void *dash_reader_direct(void *arg) {
                         g_audio_fetch_fail++;
 #endif
                         free(seg);
+                        break;
                     }
+                    at++;
+                    if (g_prefetch_done >= 3) break;
                 }
             }
+            const u64 t1_audio = vmc_time_now_wall_us();
+            u64 t2_vdemux = t1_audio;
+            u64 t3_vpost = t1_audio;
 
             if (m.frame_rate > 0 && m.frame_rate != g_stream_fps) {
                 g_stream_fps = m.frame_rate;
-                if (g_anchor_wall_us != 0) dash_resync(num);
-            }
-            {
-                const int targets[2] = { num, num + 1 };
-                for (int ti = 0; ti < 2; ti++) {
-                    const int vn = targets[ti];
-                    if (vn <= last_vnum) continue;
-                    snprintf(seg_url, sizeof(seg_url),
-                             "%s/chunk-stream0-%05d.m4s", m.base, vn);
-                    u8 *seg = NULL;
-                    size_t seg_len = 0;
-#ifdef VMC_DEBUG
-                    const u64 t_fetch0 = vmc_time_now_us();
-#endif
-                    if (http_get(seg_url, &seg, &seg_len, 30000) == 0 &&
-                        seg_len > 0) {
-#ifdef VMC_DEBUG
-                        g_seg_fetch_ok++;
-                        g_seg_fetch_us_sum += vmc_time_now_us() - t_fetch0;
-                        if (vmc_time_now_us() - t_fetch0 > g_seg_fetch_us_max)
-                            g_seg_fetch_us_max = vmc_time_now_us() - t_fetch0;
-#endif
-                        u8 *whole = NULL;
-                        size_t wlen = 0;
-                        bool own_whole = false;
-                        if (init_v && init_v_len > 0) {
-                            whole = (u8 *)malloc(init_v_len + seg_len);
-                            if (whole) {
-                                memcpy(whole, init_v, init_v_len);
-                                memcpy(whole + init_v_len, seg, seg_len);
-                                wlen = init_v_len + seg_len;
-                                own_whole = true;
-                            }
-                        } else {
-                            whole = seg;
-                            wlen = seg_len;
-                        }
-                        if (whole) {
-                            if (g_anchor_wall_us == 0 ||
-                                (vn > g_anchor_seg ? vn - g_anchor_seg > 4
-                                                   : g_anchor_seg - vn > 4)) {
-                                dash_resync(vn);
-                            } else if (vn > g_anchor_seg) {
-                                /* Slide the anchor forward by the nominal
-                                 * elapsed duration so the deadline timeline
-                                 * stays continuous across normal segment
-                                 * progression (a hard re-anchor every few
-                                 * segments would break the cadence). */
-                                g_anchor_wall_us +=
-                                    (u64)(vn - g_anchor_seg) *
-                                    g_seg_duration_us;
-                                g_anchor_seg = vn;
-                            }
-                            int au_k = 0;
-                            dash_demux_segment(whole, wlen, &s, out, vn,
-                                               &au_k);
-                            /* Arrival-cadence drift estimator. Keyed on every
-                             * successful video publish (NOT on vn == num: the
-                             * prefetch makes num always already-fetched). */
-                            if (g_stream_fps > 0) {
-                                const u64 now_wall =
-                                    (u64)vmc_time_now_wall_us();
-                                if (g_last_seg_arrival_wall != 0) {
-                                    const i64 interval =
-                                        (i64)(now_wall -
-                                              g_last_seg_arrival_wall);
-                                    if (interval > 50000) {
-                                        if (g_seg_interval_ewma == 0) {
-                                            g_seg_interval_ewma = interval;
-                                        } else {
-                                            g_seg_interval_ewma =
-                                                (15 * g_seg_interval_ewma +
-                                                 interval) /
-                                                16;
-                                        }
-                                        const i64 rate_err =
-                                            g_seg_interval_ewma -
-                                            (i64)g_seg_duration_us;
-                                        const i64 max_adj =
-                                            2 * (i64)(1000000u /
-                                                      (u64)g_stream_fps);
-                                        i64 adj =
-                                            g_timeline_adj_us + rate_err;
-                                        if (adj > max_adj) adj = max_adj;
-                                        else if (adj < -max_adj)
-                                            adj = -max_adj;
-                                        g_timeline_adj_us = adj;
-                                    }
-                                }
-                                g_last_seg_arrival_wall = now_wall;
-                            }
-                        }
-                        if (own_whole) free(whole);
-                        free(seg);
-                        last_vnum = vn;
-                        did_work = true;
-                    } else {
-#ifdef VMC_DEBUG
-                        g_seg_fetch_fail++;
-                        if (vn == num) g_seg_miss++;
-#endif
-                        free(seg);
-                    }
-                }
+                VMC_LOGI("dash: manifest frame rate set to %d fps",
+                         g_stream_fps);
             }
 
-            if (num == last_vnum &&
-                (init_a_len == 0 || num == last_anum)) {
-                av_usleep(50000);
-                continue;
+            /* Fetch video segments to fill the buffered window
+             * [video_target, live_edge-1], oldest first. The window bottom
+             * (video_target) is where playback is anchored; the window top
+             * (live_edge-1) is the newest complete segment. The first loop
+             * bursts the whole window so the pre-fetched backlog equals the
+             * live buffer (that is the resilience the buffer provides); after
+             * that, one new segment per second (the edge advance) keeps it
+             * full. */
+            int video_fetched = 0;
+            int vfetch_hi = live_edge - 1;
+            if (vfetch_hi < video_target) vfetch_hi = video_target;
+            int vn = (last_vnum < 0) ? video_target : (last_vnum + 1);
+            /* Same rolling-window guard as audio: if we fell behind and the
+             * next segment was deleted by the server (startNumber rolled past
+             * it), retrying it 404s forever. Jump to the current window start;
+             * the discontinuity re-anchors the timeline (resync "jump"). */
+            if (vn < (int)m.start_number) {
+                last_vnum = (int)m.start_number - 1;
+                vn = (int)m.start_number;
             }
+            while (g_run && vn <= vfetch_hi) {
+                snprintf(seg_url, sizeof(seg_url),
+                         "%s/chunk-stream0-%05d.m4s", m.base, vn);
+                u8 *seg = NULL;
+                size_t seg_len = 0;
+                const u64 t_fetch0 = vmc_time_now_us();
+                if (http_get(seg_url, &seg, &seg_len, 30000) == 0 &&
+                    seg_len > 0) {
+#ifdef VMC_DEBUG
+                    g_seg_fetch_ok++;
+                    g_seg_fetch_us_sum += vmc_time_now_us() - t_fetch0;
+                    if (vmc_time_now_us() - t_fetch0 > g_seg_fetch_us_max)
+                        g_seg_fetch_us_max = vmc_time_now_us() - t_fetch0;
+#endif
+                    dash_update_live_buffer(vmc_time_now_us() - t_fetch0,
+                                            (int)m.seg_duration_us);
+                    u8 *whole = NULL;
+                    size_t wlen = 0;
+                    bool own_whole = false;
+                    if (init_v && init_v_len > 0) {
+                        whole = (u8 *)malloc(init_v_len + seg_len);
+                        if (whole) {
+                            memcpy(whole, init_v, init_v_len);
+                            memcpy(whole + init_v_len, seg, seg_len);
+                            wlen = init_v_len + seg_len;
+                            own_whole = true;
+                        }
+                    } else {
+                        whole = seg;
+                        wlen = seg_len;
+                    }
+                    if (whole) {
+                        /* Keep a fixed anchor on the real-time playback clock.
+                         * Re-anchor only on a real discontinuity (non-consecutive
+                         * segment number: a skipped/stalled segment, a frame-rate
+                         * change, or a server restart that reset the timeline);
+                         * normal +1 progression is handled by dash_au_deadline. */
+                        if (g_anchor_wall_us == 0 ||
+                            (last_vnum >= 0 && vn != last_vnum + 1)) {
+                            dash_resync(vn, live_edge, "jump");
+                        }
+                        int au_k = 0;
+                        dash_demux_segment(whole, wlen, &s, out, vn,
+                                            &au_k);
+                        t2_vdemux = vmc_time_now_wall_us();
+                        if (g_stream_fps > 0) {
+                            const u64 now_wall =
+                                (u64)vmc_time_now_wall_us();
+                            if (g_last_seg_arrival_wall != 0) {
+                                const i64 interval =
+                                    (i64)(now_wall -
+                                          g_last_seg_arrival_wall);
+                                if (interval > 50000) {
+                                    if (g_seg_interval_ewma == 0)
+                                        g_seg_interval_ewma = interval;
+                                    else
+                                        g_seg_interval_ewma =
+                                            (15 * g_seg_interval_ewma +
+                                             interval) / 16;
+                                }
+                            }
+                            g_last_seg_arrival_wall = now_wall;
+                        }
+                    }
+                    if (own_whole) free(whole);
+                    free(seg);
+                    last_vnum = vn;
+                    did_work = true;
+                    video_fetched++;
+                    vn++;
+                } else {
+#ifdef VMC_DEBUG
+                    g_seg_fetch_fail++;
+                    if (vn == num) g_seg_miss++;
+#endif
+                    free(seg);
+                    break;
+                }
+            }
+            if (video_fetched > 0 && g_prefetch_done < 3)
+                g_prefetch_done++;
+
+            t3_vpost = vmc_time_now_wall_us();
+
             if (did_work) {
-                /* Sleep until the start of the NEXT segment, not the current
-                 * one (whose start is already in the past). Without this the
-                 * loop falls through to the coarse 100 ms poll below, making
-                 * each cycle ~50-100 ms longer than one segment duration and
-                 * starving the audio FIFO by a few percent over time. */
+                /* Sleep until the start of the NEXT live-edge segment so the
+                 * reader wakes exactly when a new segment becomes complete and
+                 * paces at one segment per second instead of spinning on the
+                 * (already-past) fetch target. */
                 const int64_t next = m.avail_start_us +
-                                     (int64_t)(num + 1) * m.seg_duration_us;
+                                     (int64_t)(live_edge + 1) *
+                                         m.seg_duration_us;
                 const int64_t wait = next - (int64_t)vmc_time_now_wall_us();
                 if (wait > 0) av_usleep((unsigned)wait);
+                VMC_LOGI("reader loop: wait=%lld us dur=%lld us "
+                         "audio=%lld vfetch=%lld vdemux=%lld vpost=%lld sleep=%lld us",
+                         (long long)wait,
+                         (long long)(vmc_time_now_wall_us() - loop_start),
+                         (long long)(t1_audio - t0),
+                         (long long)(t2_vdemux - t1_audio),
+                         (long long)(t3_vpost - t2_vdemux),
+                         (long long)(0),
+                         (long long)(vmc_time_now_wall_us() - t3_vpost));
+            } else if (num == last_vnum &&
+                       (init_a_len == 0 || num == last_anum)) {
+                /* Caught up to the target and the next segment is not yet
+                 * available; poll briefly rather than spinning. */
+                av_usleep(50000);
+                continue;
             } else {
                 av_usleep(100000);
             }
@@ -2168,6 +2738,7 @@ static int run_dash(const char *url, vmc_log_level log_level) {
     vmc_ffmpeg_decoder dec;
     vmc_decode_ctx dctx;
     pthread_t decode_tid;
+    pthread_t present_tid;
     bool have_decoder = false;
     bool use_drm = false;
 #ifdef VMC_DRM_FOUND
@@ -2180,12 +2751,54 @@ static int run_dash(const char *url, vmc_log_level log_level) {
             *(void **)(&g_conv_stage) = dlsym(g_cuda_lib, "conv_stage_ptr");
             *(void **)(&g_conv_wait)  = dlsym(g_cuda_lib, "conv_wait_event");
             *(void **)(&g_conv_free)  = dlsym(g_cuda_lib, "conv_free_event");
+            *(void **)(&g_cuda_import_fd) = dlsym(g_cuda_lib, "cuda_import_fd");
+            g_cuda_rt_lib = dlopen("libcudart.so.12", RTLD_LAZY | RTLD_GLOBAL);
+            if (!g_cuda_rt_lib) g_cuda_rt_lib = dlopen("libcudart.so", RTLD_LAZY | RTLD_GLOBAL);
+            void *cuda_rt = g_cuda_rt_lib ? g_cuda_rt_lib : RTLD_DEFAULT;
+            *(void **)(&g_cuda_host_register) = dlsym(cuda_rt, "cudaHostRegister");
+            *(void **)(&g_cuda_host_unregister) = dlsym(cuda_rt, "cudaHostUnregister");
+            *(void **)(&g_cuda_memcpy2d) = dlsym(cuda_rt, "cudaMemcpy2D");
             if (!(g_conv_async && g_conv_stage && g_conv_wait && g_conv_free)) {
                 VMC_LOGW("Design B: dlsym failed");
             } else {
-                if (vmc_drm_scanout_init(&g_drm, NULL, 3) == VMC_OK) {
+                if (vmc_drm_scanout_init(&g_drm, NULL, 5) == VMC_OK) {
                     use_drm = true;
                     g_use_drm = true;
+                    if (g_cuda_host_register && g_cuda_memcpy2d) {
+                        g_drm_pinned = true;
+                        for (int i = 0; i < g_drm.nbufs; i++) {
+                            int reg_err = g_cuda_host_register(g_drm.bufs[i].map,
+                                                     g_drm.bufs[i].size,
+                                                     CUDA_HOST_REGISTER_IO_MEMORY);
+                            if (reg_err != 0) {
+                                VMC_LOGW("cudaHostRegister failed for DRM buf %d: err=%d", i, reg_err);
+                                g_drm_pinned = false;
+                                break;
+                            }
+                        }
+                        if (g_drm_pinned)
+                            VMC_LOGI("DRM buffers pinned for GPU DMA copy");
+                    }
+                    if (g_cuda_import_fd && g_cuda_memcpy2d) {
+                        bool all_imported = true;
+                        for (int i = 0; i < g_drm.nbufs; i++) {
+                            g_drm_dev_ptrs[i] = NULL;
+                            if (g_drm.bufs[i].prime_fd >= 0) {
+                                int imp_err = g_cuda_import_fd(g_drm.bufs[i].prime_fd,
+                                                               g_drm.bufs[i].size,
+                                                               &g_drm_dev_ptrs[i]);
+                                if (imp_err != 0) {
+                                    VMC_LOGW("cuda_import_fd failed for DRM buf %d: err=%d", i, imp_err);
+                                    g_drm_dev_ptrs[i] = NULL;
+                                    all_imported = false;
+                                }
+                            } else {
+                                all_imported = false;
+                            }
+                        }
+                        if (all_imported)
+                            VMC_LOGI("DRM buffers imported into CUDA; using GPU H2D copy");
+                    }
                     VMC_LOGI("Design B (GPU scanout) ENABLED");
                 }
             }
@@ -2206,9 +2819,28 @@ static int run_dash(const char *url, vmc_log_level log_level) {
         dctx.disp = &fbdisp.base;
         (void)pthread_create(&decode_tid, NULL, decode_worker, &dctx);
         VMC_LOGI("decode worker thread started (drm=%d)", use_drm ? 1 : 0);
+        if (use_drm) {
+            (void)pthread_create(&present_tid, NULL, present_worker, NULL);
+            VMC_LOGI("present worker thread started");
+        }
     }
 
 #ifdef VMC_HAVE_ALSA
+    g_audio_start_wall_us = 0;
+    g_audio_delay_us = 0;
+    g_first_video_ready = false;
+    g_audio_bytes_consumed = 0;
+    g_audio_active = false;
+    g_anchor_wall_us = 0;
+    g_anchor_seg = 0;
+    g_timeline_adj_us = 0;
+    g_seg_interval_ewma = 0;
+    g_last_seg_arrival_wall = 0;
+    g_audio_pos_us = 0;
+    g_last_video_deadline_us = 0;
+#ifdef VMC_DEBUG
+    g_av_offset_ewma_us = 0;
+#endif
     if (vmc_ringbuf_init(&g_audio_rb, g_audio_storage,
                          sizeof(g_audio_storage)) == VMC_OK) {
         vmc_audio_pipeline_init(&g_audio_pipe);
@@ -2262,7 +2894,7 @@ static int run_dash(const char *url, vmc_log_level log_level) {
                      "max=%llu us | early=%llu late=%llu drop=%llu "
                      "resync=%llu | audio low=%llu xrun(r/f)=%llu/%llu "
                      "afetch(ok/fail)=%llu/%llu pcm=%llu pad=%llu B "
-                     "apkt=%llu afrm=%llu | "
+                     "apkt=%llu afrm=%llu rout=%llu rin=%llu | "
                      "av-offset=%lld us | interval=%lld rate-adj=%lld us "
                      "adelta=%d",
                      (unsigned long long)g_seg_fetch_ok,
@@ -2286,6 +2918,8 @@ static int run_dash(const char *url, vmc_log_level log_level) {
                      (unsigned long long)g_audio_pad_bytes,
                      (unsigned long long)g_audio_pkts,
                      (unsigned long long)g_audio_frames,
+                     (unsigned long long)g_rate_out,
+                     (unsigned long long)g_rate_in,
                      (long long)g_av_offset_ewma_us,
                      (long long)g_seg_interval_ewma,
                      (long long)g_timeline_adj_us,
@@ -2303,7 +2937,7 @@ static int run_dash(const char *url, vmc_log_level log_level) {
                 pthread_join(dash_tid, NULL);
                 (void)pthread_create(&dash_tid, NULL, dash_reader_fn,
                                      (void *)url);
-                dash_resync(0);
+                dash_resync(0, 0, "shutdown");
                 last_pkts_time = now_ms;
             }
             last_stats_ms = now_ms;
@@ -2319,13 +2953,26 @@ static int run_dash(const char *url, vmc_log_level log_level) {
         pthread_mutex_lock(&g_fmu);
         pthread_cond_broadcast(&g_fready);
         pthread_mutex_unlock(&g_fmu);
+        if (use_drm) {
+            pthread_mutex_lock(&g_present_qmu);
+            pthread_cond_broadcast(&g_present_qready);
+            pthread_cond_broadcast(&g_present_qspace);
+            pthread_mutex_unlock(&g_present_qmu);
+            pthread_join(present_tid, NULL);
+        }
         pthread_join(decode_tid, NULL);
         vmc_decoder_close(&dec.base);
     }
 #ifdef VMC_DRM_FOUND
     if (g_use_drm) {
+        if (g_drm_pinned && g_cuda_host_unregister) {
+            for (int i = 0; i < g_drm.nbufs; i++)
+                g_cuda_host_unregister(g_drm.bufs[i].map);
+            g_drm_pinned = false;
+        }
         vmc_drm_scanout_close(&g_drm);
         if (g_cuda_lib) dlclose(g_cuda_lib);
+        if (g_cuda_rt_lib) dlclose(g_cuda_rt_lib);
     }
 #endif
 #ifdef VMC_HAVE_ALSA
@@ -2467,6 +3114,7 @@ int main(int argc, char **argv) {
     vmc_frag_assembler frag;
     vmc_decode_ctx dctx;
     pthread_t decode_tid;
+    pthread_t present_tid;
     bool have_decoder = false;
     bool use_drm = false;
 #ifdef VMC_DRM_FOUND
@@ -2483,15 +3131,57 @@ int main(int argc, char **argv) {
             *(void **)(&g_conv_stage) = dlsym(g_cuda_lib, "conv_stage_ptr");
             *(void **)(&g_conv_wait)  = dlsym(g_cuda_lib, "conv_wait_event");
             *(void **)(&g_conv_free)  = dlsym(g_cuda_lib, "conv_free_event");
+            *(void **)(&g_cuda_import_fd) = dlsym(g_cuda_lib, "cuda_import_fd");
+            g_cuda_rt_lib = dlopen("libcudart.so.12", RTLD_LAZY | RTLD_GLOBAL);
+            if (!g_cuda_rt_lib) g_cuda_rt_lib = dlopen("libcudart.so", RTLD_LAZY | RTLD_GLOBAL);
+            void *cuda_rt = g_cuda_rt_lib ? g_cuda_rt_lib : RTLD_DEFAULT;
+            *(void **)(&g_cuda_host_register) = dlsym(cuda_rt, "cudaHostRegister");
+            *(void **)(&g_cuda_host_unregister) = dlsym(cuda_rt, "cudaHostUnregister");
+            *(void **)(&g_cuda_memcpy2d) = dlsym(cuda_rt, "cudaMemcpy2D");
             if (!(g_conv_async && g_conv_stage && g_conv_wait && g_conv_free)) {
                 VMC_LOGW("Design B: dlsym failed");
             } else {
-                vmc_status drst = vmc_drm_scanout_init(&g_drm, NULL, 3);
+                vmc_status drst = vmc_drm_scanout_init(&g_drm, NULL, 5);
                 if (drst != VMC_OK) {
                     VMC_LOGW("Design B: scanout init failed (%d)", (int)drst);
                 } else {
                     use_drm = true;
                     g_use_drm = true;
+                    if (g_cuda_host_register && g_cuda_memcpy2d) {
+                        g_drm_pinned = true;
+                        for (int i = 0; i < g_drm.nbufs; i++) {
+                            int reg_err = g_cuda_host_register(g_drm.bufs[i].map,
+                                                     g_drm.bufs[i].size,
+                                                     CUDA_HOST_REGISTER_IO_MEMORY);
+                            if (reg_err != 0) {
+                                VMC_LOGW("cudaHostRegister failed for DRM buf %d: err=%d", i, reg_err);
+                                g_drm_pinned = false;
+                                break;
+                            }
+                        }
+                        if (g_drm_pinned)
+                            VMC_LOGI("DRM buffers pinned for GPU DMA copy");
+                    }
+                    if (g_cuda_import_fd && g_cuda_memcpy2d) {
+                        bool all_imported = true;
+                        for (int i = 0; i < g_drm.nbufs; i++) {
+                            g_drm_dev_ptrs[i] = NULL;
+                            if (g_drm.bufs[i].prime_fd >= 0) {
+                                int imp_err = g_cuda_import_fd(g_drm.bufs[i].prime_fd,
+                                                               g_drm.bufs[i].size,
+                                                               &g_drm_dev_ptrs[i]);
+                                if (imp_err != 0) {
+                                    VMC_LOGW("cuda_import_fd failed for DRM buf %d: err=%d", i, imp_err);
+                                    g_drm_dev_ptrs[i] = NULL;
+                                    all_imported = false;
+                                }
+                            } else {
+                                all_imported = false;
+                            }
+                        }
+                        if (all_imported)
+                            VMC_LOGI("DRM buffers imported into CUDA; using GPU H2D copy");
+                    }
                     VMC_LOGI("Design B (GPU scanout) ENABLED");
                 }
             }
@@ -2514,6 +3204,11 @@ int main(int argc, char **argv) {
     }
     if (!have_decoder && use_drm) {
         /* decoder failed in cuda mode — fall back to the fb0 path. */
+        if (g_drm_pinned && g_cuda_host_unregister) {
+            for (int i = 0; i < g_drm.nbufs; i++)
+                g_cuda_host_unregister(g_drm.bufs[i].map);
+            g_drm_pinned = false;
+        }
         vmc_drm_scanout_close(&g_drm);
         g_use_drm = false;
         use_drm = false;
@@ -2534,6 +3229,10 @@ int main(int argc, char **argv) {
         dctx.disp = &fbdisp.base;
         (void)pthread_create(&decode_tid, NULL, decode_worker, &dctx);
         VMC_LOGI("decode worker thread started (drm=%d)", use_drm ? 1 : 0);
+        if (use_drm) {
+            (void)pthread_create(&present_tid, NULL, present_worker, NULL);
+            VMC_LOGI("present worker thread started");
+        }
     }
 #else
     bool have_decoder = false;
@@ -2541,6 +3240,21 @@ int main(int argc, char **argv) {
 
     /* --- 5c. Audio playback (ALSA; degrades to silent) --- */
 #ifdef VMC_HAVE_ALSA
+    g_audio_start_wall_us = 0;
+    g_audio_delay_us = 0;
+    g_first_video_ready = false;
+    g_audio_bytes_consumed = 0;
+    g_audio_active = false;
+    g_anchor_wall_us = 0;
+    g_anchor_seg = 0;
+    g_timeline_adj_us = 0;
+    g_seg_interval_ewma = 0;
+    g_last_seg_arrival_wall = 0;
+    g_audio_pos_us = 0;
+    g_last_video_deadline_us = 0;
+#ifdef VMC_DEBUG
+    g_av_offset_ewma_us = 0;
+#endif
     if (vmc_ringbuf_init(&g_audio_rb, g_audio_storage,
                          sizeof(g_audio_storage)) == VMC_OK) {
         vmc_audio_pipeline_init(&g_audio_pipe);
@@ -2774,14 +3488,27 @@ int main(int argc, char **argv) {
         pthread_mutex_lock(&g_fmu);
         pthread_cond_broadcast(&g_fready);
         pthread_mutex_unlock(&g_fmu);
+        if (use_drm) {
+            pthread_mutex_lock(&g_present_qmu);
+            pthread_cond_broadcast(&g_present_qready);
+            pthread_cond_broadcast(&g_present_qspace);
+            pthread_mutex_unlock(&g_present_qmu);
+            pthread_join(present_tid, NULL);
+        }
         pthread_join(decode_tid, NULL);
         vmc_decoder_close(&dec.base);
     }
 #endif
 #ifdef VMC_DRM_FOUND
     if (g_use_drm) {
+        if (g_drm_pinned && g_cuda_host_unregister) {
+            for (int i = 0; i < g_drm.nbufs; i++)
+                g_cuda_host_unregister(g_drm.bufs[i].map);
+            g_drm_pinned = false;
+        }
         vmc_drm_scanout_close(&g_drm);
         if (g_cuda_lib) dlclose(g_cuda_lib);
+        if (g_cuda_rt_lib) dlclose(g_cuda_rt_lib);
     }
 #endif
 #ifdef VMC_HAVE_ALSA

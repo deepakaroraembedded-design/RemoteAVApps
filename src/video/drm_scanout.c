@@ -26,14 +26,33 @@ static void flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
     /* Clear the buffer that was ACTUALLY flipped (recorded when the flip was
      * submitted), not last_presented — that field advances to the next write
      * target before this event arrives, which would corrupt the busy flags. */
+    const u64 ts = (u64)tv_sec * 1000000u + (u64)tv_usec;
     if (s->flip_pending >= 0) {
-        vmc_drm_buffer *b = &s->bufs[s->flip_pending];
-        b->busy = false;
-        b->last_flip_ts = (u64)tv_sec * 1000000u + (u64)tv_usec;
+        /* The buffer that WAS on-screen is now off-screen and can be reused.
+         * The pending flip target becomes the new on-screen buffer. */
+        VMC_LOGI("drm flip event: pending=%d on_screen=%d busy=%d,%d,%d,%d,%d",
+                 s->flip_pending, s->on_screen,
+                 s->bufs[0].busy, s->bufs[1].busy, s->bufs[2].busy,
+                 s->bufs[3].busy, s->bufs[4].busy);
+        if (s->on_screen >= 0) {
+            vmc_drm_buffer *old_b = &s->bufs[s->on_screen];
+            old_b->busy = false;
+            old_b->last_flip_ts = ts;
+        }
+        s->on_screen = s->flip_pending;
         s->flip_pending = -1;
     }
     s->flips_done++;
-    s->last_flip_ts_us = (u64)tv_sec * 1000000u + (u64)tv_usec;
+    {
+        static u64 last_flip_us = 0;
+        if (last_flip_us != 0) {
+            VMC_LOGI("drm flip: interval=%llu us flips_done=%llu",
+                     (unsigned long long)(ts - last_flip_us),
+                     (unsigned long long)s->flips_done);
+        }
+        last_flip_us = ts;
+    }
+    s->last_flip_ts_us = ts;
 }
 
 static u32 create_dumb(int fd, u32 w, u32 h, u32 *pitch, u64 *size) {
@@ -106,8 +125,11 @@ vmc_status vmc_drm_scanout_init(vmc_drm_scanout *s, const char *dev, int nbufs) 
     s->w = mode.hdisplay;
     s->h = mode.vdisplay;
     s->flip_pending = -1;
-    VMC_LOGI("drm: conn=%u crtc=%u %ux%u@%u", s->conn, s->crtc, s->w, s->h,
-             mode.vrefresh);
+    s->on_screen = 0;
+    s->vrefresh = mode.vrefresh;
+    s->vblank_period_us = (mode.vrefresh > 0) ? 1000000u / mode.vrefresh : 16667u;
+    VMC_LOGI("drm: conn=%u crtc=%u %ux%u@%u vblank=%uus", s->conn, s->crtc, s->w, s->h,
+             mode.vrefresh, s->vblank_period_us);
 
     for (int i = 0; i < nbufs; i++) {
         u64 size;
@@ -128,8 +150,16 @@ vmc_status vmc_drm_scanout_init(vmc_drm_scanout *s, const char *dev, int nbufs) 
             close(s->fd); s->fd = -1;
             return VMC_ERR_IO;
         }
-        VMC_LOGI("drm: buf %d handle=%u fb=%u pitch=%u size=%zu", i, handle,
-                 s->bufs[i].fb, s->bufs[i].pitch, s->bufs[i].size);
+        s->bufs[i].prime_fd = -1;
+        if (drmPrimeHandleToFD(s->fd, handle, DRM_CLOEXEC | DRM_RDWR,
+                               &s->bufs[i].prime_fd) < 0) {
+            VMC_LOGW("drm: prime export failed for buf %d: %s", i,
+                     strerror(errno));
+            s->bufs[i].prime_fd = -1;
+        }
+        VMC_LOGI("drm: buf %d handle=%u fb=%u pitch=%u size=%zu prime_fd=%d", i, handle,
+                 s->bufs[i].fb, s->bufs[i].pitch, s->bufs[i].size,
+                 s->bufs[i].prime_fd);
     }
 
     /* Initial CRTC set with buffer 0 (black). */
@@ -139,7 +169,7 @@ vmc_status vmc_drm_scanout_init(vmc_drm_scanout *s, const char *dev, int nbufs) 
         close(s->fd); s->fd = -1;
         return VMC_ERR_IO;
     }
-    s->bufs[0].busy = true;   /* now scanning out buffer 0 */
+    s->on_screen = 0;         /* now scanning out buffer 0 */
     s->crtc_set = true;
     s->next = 1;
     VMC_LOGI("drm: scanout ready (%d buffers)", nbufs);
@@ -155,29 +185,36 @@ void *vmc_drm_scanout_next(vmc_drm_scanout *s) {
 void *vmc_drm_scanout_next_idx(vmc_drm_scanout *s, int *out_idx) {
     for (int i = 0; i < s->nbufs; i++) {
         int idx = (s->next + i) % s->nbufs;
-        if (!s->bufs[idx].busy) {
+        if (!s->bufs[idx].busy && idx != s->on_screen &&
+            idx != s->flip_pending) {
             s->next = (idx + 1) % s->nbufs;
             s->last_presented = (u32)idx;
+            s->bufs[idx].busy = true; /* held until flip-complete event */
             if (out_idx) *out_idx = idx;
             return s->bufs[idx].map;
+        }
+    }
+    {
+        static int nbusy_warn = 0;
+        if ((nbusy_warn++ % 10) == 0) {
+            VMC_LOGW("drm next_idx: all buffers busy (on_screen=%d pending=%d busy=%d,%d,%d,%d,%d)",
+                     s->on_screen, s->flip_pending,
+                     s->bufs[0].busy, s->bufs[1].busy, s->bufs[2].busy,
+                     s->bufs[3].busy, s->bufs[4].busy);
         }
     }
     return NULL;   /* all buffers busy (in flight / on screen) */
 }
 
-vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s) {
-    int idx = (int)s->last_presented;
-    if (s->bufs[idx].busy) {
-        static int busy_warn = 0;
-        if ((busy_warn++ % 100) == 0)
-            VMC_LOGW("drm: scanout buffer %d still busy (flip event missing)",
-                     idx);
-        return VMC_ERR_AGAIN;
+vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s, int idx) {
+    if (idx < 0) idx = (int)s->last_presented;
+    if (idx < 0 || idx >= s->nbufs) {
+        VMC_LOGW("drm: invalid scanout buffer index %d", idx);
+        return VMC_ERR_INVALID_ARG;
     }
-    /* DRM allows only one page flip per CRTC. If the previous flip is still
-     * pending (we presented faster than a vblank), wait for its completion
-     * event and retry instead of failing — this also paces presentation to
-     * the display refresh. */
+    /* The buffer was marked busy by next_idx; the flip event will free it.
+     * DRM allows only one page flip per CRTC. If the previous flip is still
+     * pending, wait for its completion and retry. */
     for (int tries = 0; tries < 5; tries++) {
         if (drmModePageFlip(s->fd, s->crtc, s->bufs[idx].fb,
                             DRM_MODE_PAGE_FLIP_EVENT, s) == 0) {
@@ -225,6 +262,12 @@ void vmc_drm_scanout_close(vmc_drm_scanout *s) {
         for (int i = 0; i < s->nbufs; i++) {
             if (s->bufs[i].map) munmap(s->bufs[i].map, s->bufs[i].size);
             if (s->bufs[i].fb) drmModeRmFB(s->fd, s->bufs[i].fb);
+            if (s->bufs[i].prime_fd >= 0) close(s->bufs[i].prime_fd);
+            if (s->bufs[i].handle) {
+                struct drm_mode_destroy_dumb dd = {0};
+                dd.handle = s->bufs[i].handle;
+                (void)drmIoctl(s->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+            }
         }
         close(s->fd);
         s->fd = -1;
