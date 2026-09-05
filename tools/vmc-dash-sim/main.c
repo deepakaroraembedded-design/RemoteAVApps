@@ -17,6 +17,9 @@
 #include <unistd.h>
 #include <dirent.h>
 
+#include "vmc/core/platform.h"
+#include "vmc/core/telemetry.h"
+
 int g_log_level = 2;
 
 #define DLOG_TRC(...)                                                         \
@@ -63,10 +66,109 @@ static uint64_t g_encoder_restarts;
 static volatile sig_atomic_t g_run = 1;
 static pid_t g_ffmpeg_pid = -1;
 static char g_outdir[256];
+static int  g_play_once = 0;      /* --play-once: play the clip once, not in a loop */
+static int  g_eos_signalled = 0;  /* EOS emitted; watchdog stands down */
 
 static void on_sig(int sig) {
     (void)sig;
     g_run = 0;
+}
+
+/* --- telemetry identity + helpers ------------------------------------ */
+static void srv_tlm_init(void) {
+    char host[128] = "unknown";
+    if (gethostname(host, sizeof(host)) != 0)
+        snprintf(host, sizeof(host), "unknown");
+    (void)vmc_tlm_init("server", host,
+#ifdef VMC_DEBUG
+                       "debug",
+#else
+                       "release",
+#endif
+                       VMC_GIT_SHA);
+}
+
+/* availabilityStartTime (ISO8601) -> epoch microseconds, or 0 if absent. */
+static int64_t parse_avail_start_us(const char *mpd_path) {
+    FILE *f = fopen(mpd_path, "r");
+    if (!f) return 0;
+    char buf[16384];
+    size_t r = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (r == 0) return 0;
+    buf[r] = 0;
+    const char *at = strstr(buf, "availabilityStartTime=\"");
+    if (!at) return 0;
+    at += strlen("availabilityStartTime=\"");
+    const char *ae = strchr(at, '"');
+    if (!ae) return 0;
+    char tbuf[64];
+    size_t l = (size_t)(ae - at);
+    if (l >= sizeof(tbuf)) l = sizeof(tbuf) - 1;
+    memcpy(tbuf, at, l);
+    tbuf[l] = 0;
+    int y, mo, d, h, mi;
+    double se = 0.0;
+    if (sscanf(tbuf, "%d-%d-%dT%d:%d:%lf", &y, &mo, &d, &h, &mi, &se) != 6)
+        return 0;
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    t.tm_year = y - 1900;
+    t.tm_mon = mo - 1;
+    t.tm_mday = d;
+    t.tm_hour = h;
+    t.tm_min = mi;
+    t.tm_sec = (int)se;
+    const time_t epoch = timegm(&t);
+    if (epoch < 0) return 0;
+    return (int64_t)epoch * 1000000LL + (int64_t)((se - (int)se) * 1e6);
+}
+
+static int read_start_number(const char *mpd_path) {
+    FILE *f = fopen(mpd_path, "r");
+    if (!f) return 0;
+    char buf[16384];
+    size_t r = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (r == 0) return 0;
+    buf[r] = 0;
+    const char *sn = strstr(buf, "startNumber=\"");
+    if (!sn) return 0;
+    return atoi(sn + strlen("startNumber=\""));
+}
+
+/* At play-once EOS the manifest is rewritten type="static" so the client can
+ * stop chasing the live edge and drain deterministically. */
+static void patch_mpd_static(const char *mpd_path) {
+    FILE *f = fopen(mpd_path, "r");
+    if (!f) return;
+    char buf[65536];
+    size_t r = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (r == 0) return;
+    buf[r] = 0;
+    if (strstr(buf, "type=\"static\"")) return;
+    char *out = (char *)malloc(r * 2 + 64);
+    if (!out) return;
+    const char *p = buf;
+    char *o = out;
+    while (*p) {
+        if (strncmp(p, "type=\"dynamic\"", 14) == 0) {
+            memcpy(o, "type=\"static\"", 13);
+            o += 13;
+            p += 14;
+        } else {
+            *o++ = *p++;
+        }
+    }
+    *o = 0;
+    FILE *wf = fopen(mpd_path, "w");
+    if (wf) {
+        fputs(out, wf);
+        fclose(wf);
+    }
+    free(out);
+    DLOG_INF("play-once EOS: manifest marked type=\"static\"\n");
 }
 
 static int make_listen_sock(uint16_t port) {
@@ -140,8 +242,12 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
              * drifts and eventually hangs after hours. */
             if (mi.fps > 0) {
                 fps = mi.fps;   /* GOP / keyframe cadence from the real rate */
+                /* loop=0 loops forever (live simulator); --play-once uses
+                 * loop=1 (play the file exactly once, then exit cleanly). */
+                const int loop = g_play_once ? 1 : 0;
                 snprintf(vfilter, sizeof(vfilter),
-                         "movie=%s:loop=0,setpts=N/(%d*TB)", input, mi.fps);
+                         "movie=%s:loop=%d,setpts=N/(%d*TB)", input, loop,
+                         mi.fps);
                 argv[n++] = "-re";
                 argv[n++] = "-f";
                 argv[n++] = "lavfi";
@@ -150,7 +256,7 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
                 lavfi_setup = true;
                 if (mi.sample_rate > 0 && mi.duration_s > 0) {
                     snprintf(afilter, sizeof(afilter),
-                             "amovie=%s:loop=0,asetpts=N/%d/TB", input,
+                             "amovie=%s:loop=%d,asetpts=N/%d/TB", input, loop,
                              mi.sample_rate);
                     argv[n++] = "-re";
                     argv[n++] = "-f";
@@ -476,6 +582,19 @@ static void *conn_handler(void *arg) {
                             (uint64_t)(hw_end.tv_nsec - hw_start.tv_nsec) / 1000u;
 #endif
                         if (g_run && !file_exists(fp) && !file_exists(tp)) {
+#ifdef VMC_DEBUG
+                            const uint64_t held_us =
+                                (uint64_t)(hw_end.tv_sec - hw_start.tv_sec) *
+                                    1000000u +
+                                (uint64_t)(hw_end.tv_nsec - hw_start.tv_nsec) /
+                                    1000u;
+#else
+                            const uint64_t held_us = 0;
+#endif
+                            if (vmc_tlm_enabled())
+                                vmc_tlm_emit("srv", "\"kind\":\"hold_404\","
+                                             "\"seg\":%d,\"held_us\":%llu",
+                                             req_num, (unsigned long long)held_us);
                             http_headers(fd, 404, "text/plain", -1, false);
 #ifdef VMC_DEBUG
                             g_req_404++;
@@ -523,6 +642,9 @@ static void ffmpeg_respawn(const char *input, int width, int height, int fps,
 #ifdef VMC_DEBUG
     g_encoder_restarts++;
 #endif
+    if (vmc_tlm_enabled())
+        vmc_tlm_emit("srv", "\"kind\":\"encoder_restart\","
+                     "\"reason\":\"watchdog_stall\"");
     if (g_ffmpeg_pid > 0) {
         kill(g_ffmpeg_pid, SIGTERM);
         waitpid(g_ffmpeg_pid, NULL, 0);
@@ -560,6 +682,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) input = argv[++i];
         else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) fps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--play-once") == 0) g_play_once = 1;
         else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
             int lvl = atoi(argv[++i]);
             if (lvl < 0) lvl = 0;
@@ -571,6 +694,7 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
+    srv_tlm_init();
 
     snprintf(g_outdir, sizeof(g_outdir), "%s/%ld", OUT_DIR, (long)getpid());
     mkdir(OUT_DIR, 0755);
@@ -631,13 +755,31 @@ int main(int argc, char **argv) {
             }
         }
         /* Watchdog: the encoder drifts/hangs after a while; restart it if it
-         * exits or stops producing segments. */
+         * exits or stops producing segments. Under --play-once a clean exit at
+         * end-of-input is EOS, not a hang: signal it, mark the manifest static,
+         * and stand down (a restart here would corrupt the measurement). */
         if (g_ffmpeg_pid > 0) {
             int st = 0;
             if (waitpid(g_ffmpeg_pid, &st, WNOHANG) == g_ffmpeg_pid) {
-                DLOG_INF("encoder exited; restarting\n");
-                ffmpeg_respawn(input, width, height, fps, g_outdir);
-            } else {
+                const bool clean_end = g_play_once &&
+                    WIFEXITED(st) && WEXITSTATUS(st) == 0;
+                if (clean_end && !g_eos_signalled) {
+                    DLOG_INF("play-once: encoder reached end of input (EOS)\n");
+                    char mp[512];
+                    snprintf(mp, sizeof(mp), "%s/live.mpd", g_outdir);
+                    patch_mpd_static(mp);
+                    if (vmc_tlm_enabled())
+                        vmc_tlm_emit("srv", "\"kind\":\"eos\","
+                                     "\"reason\":\"end_of_input\","
+                                     "\"last_seg\":%d",
+                                     newest_seg(g_outdir, 0));
+                    g_eos_signalled = 1;
+                    g_ffmpeg_pid = -1;
+                } else {
+                    DLOG_INF("encoder exited; restarting\n");
+                    ffmpeg_respawn(input, width, height, fps, g_outdir);
+                }
+            } else if (!g_eos_signalled) {
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
                 const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u +
@@ -652,6 +794,56 @@ int main(int argc, char **argv) {
                              (unsigned long long)(now_ms - last));
                     ffmpeg_respawn(input, width, height, fps, g_outdir);
                 }
+            }
+        }
+        /* Server-side telemetry: manifest updates (the latency clock anchor)
+         * and segment publishes. ~2 Hz, negligible volume. */
+        if (vmc_tlm_enabled() && g_run) {
+            char mp[512];
+            snprintf(mp, sizeof(mp), "%s/live.mpd", g_outdir);
+            if (file_exists(mp)) {
+                static int64_t last_avail = 0;
+                const int64_t avail = parse_avail_start_us(mp);
+                if (avail > 0) last_avail = avail;
+                const int sn = read_start_number(mp);
+                static int last_sn = -1;
+                if (sn != last_sn || last_sn == -1) {
+                    vmc_tlm_emit("srv", "\"kind\":\"mpd_update\","
+                                 "\"start_number\":%d,\"avail_start_us\":%lld",
+                                 sn, (long long)last_avail);
+                    last_sn = sn;
+                }
+            }
+            static int last_seg0 = -1, last_seg1 = -1;
+            const int ns0 = newest_seg(g_outdir, 0);
+            if (ns0 > last_seg0) {
+                for (int seg = last_seg0 + 1; seg <= ns0; seg++) {
+                    char sp[512];
+                    snprintf(sp, sizeof(sp), "%s/chunk-stream0-%05d.m4s",
+                             g_outdir, seg);
+                    struct stat sst;
+                    const long bytes = (stat(sp, &sst) == 0) ? (long)sst.st_size : 0L;
+                    vmc_tlm_emit("srv", "\"kind\":\"segment_publish\","
+                                 "\"seg\":%d,\"stream\":\"video\","
+                                 "\"bytes\":%ld,\"encode_us\":0",
+                                 seg, bytes);
+                }
+                last_seg0 = ns0;
+            }
+            const int ns1 = newest_seg(g_outdir, 1);
+            if (ns1 > last_seg1) {
+                for (int seg = last_seg1 + 1; seg <= ns1; seg++) {
+                    char sp[512];
+                    snprintf(sp, sizeof(sp), "%s/chunk-stream1-%05d.m4s",
+                             g_outdir, seg);
+                    struct stat sst;
+                    const long bytes = (stat(sp, &sst) == 0) ? (long)sst.st_size : 0L;
+                    vmc_tlm_emit("srv", "\"kind\":\"segment_publish\","
+                                 "\"seg\":%d,\"stream\":\"audio\","
+                                 "\"bytes\":%ld,\"encode_us\":0",
+                                 seg, bytes);
+                }
+                last_seg1 = ns1;
             }
         }
 #ifdef VMC_DEBUG
@@ -691,5 +883,6 @@ int main(int argc, char **argv) {
         waitpid(g_ffmpeg_pid, NULL, 0);
     }
     close(lsock);
+    vmc_tlm_shutdown();
     return 0;
 }

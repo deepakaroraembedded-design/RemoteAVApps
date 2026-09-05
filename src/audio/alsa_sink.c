@@ -6,6 +6,7 @@
 #include "vmc/audio/alsa_sink.h"
 #include "vmc/core/error.h"
 #include "vmc/core/logger.h"
+#include "vmc/core/telemetry.h"
 
 typedef struct {
     snd_pcm_t *pcm;
@@ -47,6 +48,10 @@ static vmc_status alsa_play(void *ctx, const i16 *pcm, sz_t frames) {
     if (!a->pcm) return VMC_OK;
     snd_pcm_sframes_t r = snd_pcm_writei(a->pcm, pcm, (snd_pcm_sframes_t)frames);
     if (r < 0) {
+        if (vmc_tlm_enabled())
+            vmc_tlm_emit("buf", "\"which\":\"audio_fifo\","
+                         "\"event\":\"underflow\",\"level\":0,"
+                         "\"cap\":8388608,\"count\":1");
         r = snd_pcm_recover(a->pcm, (int)r, 1);
         if (r < 0) {
 #ifdef VMC_DEBUG
@@ -146,5 +151,13 @@ bool vmc_alsa_sink_delay_us(const vmc_audio_sink *sink, u64 *delay_us) {
     if (snd_pcm_delay(a->pcm, &delay) != 0) return false;
     if (delay < 0) delay = 0;
     *delay_us = (u64)delay * 1000000ull / (u64)VMC_AUDIO_SAMPLE_RATE;
+    return true;
+}
+
+bool vmc_alsa_sink_frames_played(const vmc_audio_sink *sink, u64 *frames) {
+    if (!sink || !sink->ctx || !frames) return false;
+    const alsa_ctx *a = (const alsa_ctx *)sink->ctx;
+    if (!a->pcm) return false;
+    *frames = a->frames_played;
     return true;
 }

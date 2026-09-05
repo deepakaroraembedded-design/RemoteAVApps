@@ -32,6 +32,10 @@ bool vmc_alsa_sink_position_us(const vmc_audio_sink *sink, u64 *pos_us);
  * silent or the delay cannot be queried. */
 bool vmc_alsa_sink_delay_us(const vmc_audio_sink *sink, u64 *delay_us);
 
+/* Cumulative frames written to the PCM device since open (for telemetry
+ * hw_pos_frames). Returns false on a silent sink. */
+bool vmc_alsa_sink_frames_played(const vmc_audio_sink *sink, u64 *frames);
+
 #ifdef VMC_DEBUG
 /* XRUN counters (recoverable vs fatal), VMC_DEBUG builds only. */
 void vmc_alsa_sink_stats(const vmc_audio_sink *sink, u64 *recover, u64 *fatal);

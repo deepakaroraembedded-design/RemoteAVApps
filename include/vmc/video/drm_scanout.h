@@ -28,6 +28,7 @@ typedef struct vmc_drm_buffer {
     int     prime_fd; /* dma-buf prime fd for CUDA import, -1 if unavailable */
     bool    busy;     /* flipped and not yet flip-completed */
     u64     last_flip_ts; /* monotonic us when this buffer was scanned out */
+    u64     submit_wall_us; /* wall-clock us when the flip was submitted */
 } vmc_drm_buffer;
 
 typedef struct vmc_drm_scanout {
@@ -42,6 +43,8 @@ typedef struct vmc_drm_scanout {
     int            flip_pending;   /* buffer idx submitted to drmModePageFlip
                                       (or -1 if none pending) */
     int            on_screen;      /* buffer idx currently scanned out */
+    int            last_completed; /* buffer idx whose flip just completed
+                                      (-1 if none since last drain) */
     u64            last_flip_ts_us; /* monotonic us when last flip completed */
     u32            flips_done;   /* total flip-complete events */
     u32            vrefresh;     /* reported refresh rate (Hz) */

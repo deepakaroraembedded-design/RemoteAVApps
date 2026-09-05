@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <string.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -30,28 +31,16 @@ static void flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
     if (s->flip_pending >= 0) {
         /* The buffer that WAS on-screen is now off-screen and can be reused.
          * The pending flip target becomes the new on-screen buffer. */
-        VMC_LOGI("drm flip event: pending=%d on_screen=%d busy=%d,%d,%d,%d,%d",
-                 s->flip_pending, s->on_screen,
-                 s->bufs[0].busy, s->bufs[1].busy, s->bufs[2].busy,
-                 s->bufs[3].busy, s->bufs[4].busy);
         if (s->on_screen >= 0) {
             vmc_drm_buffer *old_b = &s->bufs[s->on_screen];
             old_b->busy = false;
             old_b->last_flip_ts = ts;
         }
         s->on_screen = s->flip_pending;
+        s->last_completed = s->flip_pending;
         s->flip_pending = -1;
     }
     s->flips_done++;
-    {
-        static u64 last_flip_us = 0;
-        if (last_flip_us != 0) {
-            VMC_LOGI("drm flip: interval=%llu us flips_done=%llu",
-                     (unsigned long long)(ts - last_flip_us),
-                     (unsigned long long)s->flips_done);
-        }
-        last_flip_us = ts;
-    }
     s->last_flip_ts_us = ts;
 }
 
@@ -220,6 +209,10 @@ vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s, int idx) {
                             DRM_MODE_PAGE_FLIP_EVENT, s) == 0) {
             s->bufs[idx].busy = true;
             s->flip_pending = idx;   /* record which buffer this event belongs to */
+            struct timespec wt;
+            clock_gettime(CLOCK_REALTIME, &wt);
+            s->bufs[idx].submit_wall_us =
+                (u64)wt.tv_sec * 1000000u + (u64)(wt.tv_nsec / 1000);
             return VMC_OK;
         }
         if (errno == EBUSY) {

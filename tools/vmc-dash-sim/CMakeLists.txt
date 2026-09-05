@@ -5,4 +5,4 @@ target_compile_definitions(vmc-dash-sim PRIVATE _DEFAULT_SOURCE=1 _POSIX_C_SOURC
 if(VMC_DEBUG)
     target_compile_definitions(vmc-dash-sim PRIVATE VMC_DEBUG=1)
 endif()
-target_link_libraries(vmc-dash-sim PRIVATE Threads::Threads)
+target_link_libraries(vmc-dash-sim PRIVATE Threads::Threads vmc_thinclient)

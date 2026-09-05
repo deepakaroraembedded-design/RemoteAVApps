@@ -25,11 +25,13 @@
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <netinet/tcp.h>
 
 #include "vmc/vmc.h"
 #include "vmc/core/logger.h"
 #include "vmc/core/platform.h"
 #include "vmc/core/ringbuf.h"
+#include "vmc/core/telemetry.h"
 #include "vmc/session/mapper.h"
 #include "vmc/session/session.h"
 #include "vmc/transport/jitter_buffer.h"
@@ -160,6 +162,10 @@ static u64  g_presented = 0;
 static volatile bool g_first_video_ready = false;
 static u64  g_onscreen_sum = 0, g_onscreen_cnt = 0;
 
+/* Global zero-based content frame index (telemetry + drop detection). */
+static volatile u32 g_video_frame_count = 0;
+static volatile u32 g_tlm_clock_fallback_emit_s = 0;
+
 /* Video presentation pacing: the DASH reader delivers one 1 s segment per
  * fetch, so without pacing the decode worker presents all frames of a segment
  * back-to-back then idles until the next segment arrives — visible judder.
@@ -271,6 +277,17 @@ static void (*g_conv_free)(void *);
 #define CUDA_MEMCPY_DEVICE_TO_HOST 2
 #define CUDA_MEMCPY_DEVICE_TO_DEVICE 3
 
+/* Per-DRM-buffer metadata filled by the decode worker and consumed by the
+ * present worker when the flip-complete event arrives (vrender emission). */
+typedef struct vmc_vmeta {
+    u32 fidx;
+    int seg;
+    i64 pts_us;
+    u64 deadline_us;
+    u64 decode_us;
+    u64 conv_us;
+} vmc_vmeta;
+
 #if defined(__x86_64__) || defined(__SSE2__)
 #include <emmintrin.h>
 #endif
@@ -324,7 +341,33 @@ static int g_stage_idx = 0;
 static int g_pending_buf_idx = -1;
 static void *g_pending_map = NULL;
 static u32 g_pending_pitch = 0;
+static u32 g_pending_fidx = 0;
+static int g_pending_seg = 0;
+static i64 g_pending_pts = 0;
+static u64 g_pending_decode_us = 0;
+static vmc_vmeta g_vmeta[VMC_DRM_MAX_BUFS];
 #endif
+
+/* --- telemetry helpers -------------------------------------------------
+ * The A/V offset is measured in the CONTENT domain (see docs/AV_TELEMETRY_SPEC):
+ * the audio-master anchor maps content PTS 0 to the wall time audio content
+ * starts, so the audio content position at any wall instant is
+ *   wall - anchor_wall - playout_latency - timeline_adj
+ * and the per-frame offset is  video_content_pts - audio_content_at(vblank). */
+static i64 tlm_audio_content_at_wall(u64 wall_us) {
+    const u64 anchor = __atomic_load_n(&g_anchor_wall_us, __ATOMIC_RELAXED);
+    if (anchor == 0) return -1;
+    i64 c = (i64)wall_us - (i64)anchor -
+            (i64)g_playout_latency_us -
+            __atomic_load_n(&g_timeline_adj_us, __ATOMIC_RELAXED);
+    return c < 0 ? 0 : c;
+}
+
+static i64 tlm_audio_content_us(void) {
+    const u64 apos = __atomic_load_n(&g_audio_pos_us, __ATOMIC_RELAXED);
+    if (apos == 0) return -1;
+    return tlm_audio_content_at_wall(apos);
+}
 
 static void latency_update_rtt(vmc_session_ctx *sc, u32 sim_echo_ts) {
     const u64 c1 = sc->last_ka_send_us;
@@ -402,6 +445,9 @@ typedef struct vmc_frame_slot {
     u32 send_ts;
     u64 pub_us;
     u64 deadline_us;
+    u32 fidx;      /* global zero-based content frame index */
+    i64 pts_us;    /* content PTS of this frame (content timeline, us) */
+    int seg;       /* CMAF segment number the frame came from */
     int state;
 } vmc_frame_slot;
 
@@ -434,12 +480,16 @@ static int slot_take_write(void) {
     }
 }
 
-static void slot_publish(int idx, sz_t len, u32 send_ts, u64 deadline_us) {
+static void slot_publish(int idx, sz_t len, u32 send_ts, u64 deadline_us,
+                         u32 fidx, i64 pts_us, int seg) {
     pthread_mutex_lock(&g_fmu);
     g_frames[idx].len = len;
     g_frames[idx].send_ts = send_ts;
     g_frames[idx].pub_us = vmc_time_now_us();
     g_frames[idx].deadline_us = deadline_us;
+    g_frames[idx].fidx = fidx;
+    g_frames[idx].pts_us = pts_us;
+    g_frames[idx].seg = seg;
     g_frames[idx].state = SLOT_READY;
     pthread_cond_signal(&g_fready);
     pthread_mutex_unlock(&g_fmu);
@@ -481,6 +531,18 @@ static u64 dash_pres_clock(void) {
         if (g_audio_pos_us <= wall + 200000u)
             return g_audio_pos_us;
     }
+    /* Audio clock unavailable/stalled: fall back to wall time. Report the
+     * fallback once per second so the harness can see the clock degraded. */
+    if (vmc_tlm_enabled()) {
+        const u64 now_s = vmc_time_now_us() / 1000000u;
+        if (now_s != g_tlm_clock_fallback_emit_s) {
+            g_tlm_clock_fallback_emit_s = (u32)now_s;
+            vmc_tlm_emit("sync", "\"kind\":\"clock_fallback\","
+                         "\"detail\":\"audio_clock_unavailable\","
+                         "\"us\":%llu",
+                         (unsigned long long)vmc_time_now_us());
+        }
+    }
     return (u64)vmc_time_now_wall_us();
 }
 
@@ -513,8 +575,72 @@ static bool present_pop(present_entry *e) {
     return true;
 }
 
+static void tlm_vrender_emit(int buf_idx, u64 vblank_us, u64 submit_us,
+                             u64 deadline_us, u32 fidx, int seg, i64 pts_us,
+                             u64 decode_us, u64 conv_us, int repeat,
+                             u64 audio_pos_us) {
+#ifdef VMC_DEBUG
+    {
+        const char *skew = getenv("VMC_DEBUG_AV_SKEW_MS");
+        const char *drift = getenv("VMC_DEBUG_AV_DRIFT_PPM");
+        const char *pdelay = getenv("VMC_DEBUG_PRESENT_DELAY_MS");
+        if (skew) {
+            const i64 add = (i64)atol(skew) * 1000;
+            audio_pos_us = (u64)((i64)audio_pos_us + add);
+        }
+        if (drift) {
+            const double ppm = atof(drift);
+            const u64 now = vmc_time_wall_us();
+            const u64 start = __atomic_load_n(&g_audio_start_wall_us,
+                                              __ATOMIC_RELAXED);
+            if (start) {
+                const double secs = (double)(now - start) / 1e6;
+                audio_pos_us = (u64)((double)audio_pos_us +
+                                     (double)audio_pos_us * ppm * secs / 1e6);
+            }
+        }
+        if (pdelay) {
+            pts_us -= (i64)atol(pdelay) * 1000;
+            if (pts_us < 0) pts_us = 0;
+        }
+    }
+#endif
+    if (!vmc_tlm_enabled()) return;
+    if (audio_pos_us == (u64)-1) {
+        vmc_tlm_emit("vrender",
+                     "\"frame_idx\":%u,\"seg\":%d,\"pts_us\":%lld,"
+                     "\"deadline_us\":%llu,\"submit_us\":%llu,"
+                     "\"vblank_us\":%llu,\"buf_idx\":%d,\"audio_pos_us\":null,"
+                     "\"late_us\":%lld,\"decode_us\":%llu,\"conv_us\":%llu,"
+                     "\"repeat\":%d",
+                     fidx, seg, (long long)pts_us,
+                     (unsigned long long)deadline_us,
+                     (unsigned long long)submit_us,
+                     (unsigned long long)vblank_us, buf_idx,
+                     (long long)(vmc_time_wall_us() - deadline_us),
+                     (unsigned long long)decode_us,
+                     (unsigned long long)conv_us, repeat);
+    } else {
+        vmc_tlm_emit("vrender",
+                     "\"frame_idx\":%u,\"seg\":%d,\"pts_us\":%lld,"
+                     "\"deadline_us\":%llu,\"submit_us\":%llu,"
+                     "\"vblank_us\":%llu,\"buf_idx\":%d,\"audio_pos_us\":%lld,"
+                     "\"late_us\":%lld,\"decode_us\":%llu,\"conv_us\":%llu,"
+                     "\"repeat\":%d",
+                     fidx, seg, (long long)pts_us,
+                     (unsigned long long)deadline_us,
+                     (unsigned long long)submit_us,
+                     (unsigned long long)vblank_us, buf_idx,
+                     (long long)audio_pos_us,
+                     (long long)(vmc_time_wall_us() - deadline_us),
+                     (unsigned long long)decode_us,
+                     (unsigned long long)conv_us, repeat);
+    }
+}
+
 static void *present_worker(void *arg) {
     (void)arg;
+    static int g_last_presented_buf = -1;
     while (g_run) {
         /* Wait a short while for audio playback to start so the first frame
          * is anchored to the audio clock, but never gate video permanently on
@@ -551,9 +677,7 @@ static void *present_worker(void *arg) {
             }
         }
         /* The decode worker already copied the frame into a DRM dumb buffer.
-         * Wait for the audio-master deadline, then submit the page flip; the
-         * kernel queues it for the next vblank, so a 24 fps stream on a 60 Hz
-         * panel naturally cadences as 2-3 vblank intervals. */
+         * Wait for the audio-master deadline, then submit the page flip. */
         (void)vmc_drm_scanout_drain(&g_drm);
         for (int tries = 0; g_run && tries < 50; tries++) {
             vmc_status st = vmc_drm_scanout_present(&g_drm, e.buf_idx);
@@ -562,8 +686,46 @@ static void *present_worker(void *arg) {
                 if (vmc_drm_scanout_wait_flip(&g_drm, 20) < 0) break;
                 continue;
             }
+            if (vmc_tlm_enabled())
+                vmc_tlm_emit("sync", "\"kind\":\"flip_error\","
+                             "\"detail\":\"page_flip_failed\","
+                             "\"us\":%llu,\"frame_idx\":%u",
+                             (unsigned long long)vmc_time_now_us(),
+                             g_vmeta[e.buf_idx].fidx);
             VMC_LOGW("present: PageFlip failed for buf %d", e.buf_idx);
             break;
+        }
+        /* Drain again so any flip that completed while we were waiting is
+         * picked up and reported as a vrender with its real vblank time. */
+        if (vmc_drm_scanout_drain(&g_drm) > 0 && g_drm.last_completed >= 0) {
+            const int cb = g_drm.last_completed;
+            const u64 vblank_us = g_drm.last_flip_ts_us;
+            g_drm.last_completed = -1;
+            if (cb < VMC_DRM_MAX_BUFS && cb >= 0) {
+                const vmc_vmeta *m = &g_vmeta[cb];
+                const int repeat = (cb == g_last_presented_buf) ? 1 : 0;
+                g_last_presented_buf = cb;
+                const i64 apos = tlm_audio_content_us();
+                const u64 wall_now = vmc_time_wall_us();
+                tlm_vrender_emit(cb, vblank_us, g_drm.bufs[cb].submit_wall_us,
+                                 m->deadline_us, m->fidx, m->seg, m->pts_us,
+                                 m->decode_us, m->conv_us, repeat,
+                                 (u64)apos);
+                if (apos >= 0) {
+                    const i64 late = (i64)wall_now - (i64)m->deadline_us;
+                    if (late > (i64)(frame_period_us * 3u / 2u) &&
+                        vmc_tlm_enabled())
+                        vmc_tlm_emit("sync", "\"kind\":\"vsync_miss\","
+                                     "\"detail\":\"deadline_exceeded\","
+                                     "\"us\":%lld,\"frame_idx\":%u",
+                                     (long long)late, m->fidx);
+                }
+                if (repeat && vmc_tlm_enabled())
+                    vmc_tlm_emit("sync", "\"kind\":\"vsync_dup\","
+                                 "\"detail\":\"same_buffer_rescan\","
+                                 "\"us\":%llu,\"frame_idx\":%u",
+                                 (unsigned long long)vblank_us, m->fidx);
+            }
         }
         g_presented++;
         g_av_armed = true;
@@ -663,20 +825,39 @@ static void *decode_worker(void *arg) {
                     }
                 }
                 if (!dumb) {
+                    if (vmc_tlm_enabled())
+                        vmc_tlm_emit("buf", "\"which\":\"drm_pool\","
+                                     "\"event\":\"exhausted\","
+                                     "\"level\":%d,\"cap\":%d,\"count\":1",
+                                     (int)g_drm.nbufs,
+                                     (int)g_drm.nbufs);
                     slot_release(idx);
                     continue; /* drop frame if no scanout buffer is free */
                 }
                 int stage = g_stage_idx % 3;
                 g_stage_idx++;
                 void *ev = NULL;
-                g_conv_async(f.planes[0], f.planes[1], f.width, f.height,
-                             f.stride[0], f.stride[1], stage, g_drm.w, g_drm.h,
-                             &ev);
+                const int conv_rc = g_conv_async(
+                    f.planes[0], f.planes[1], f.width, f.height,
+                    f.stride[0], f.stride[1], stage, g_drm.w, g_drm.h, &ev);
+                if (conv_rc != 0 && vmc_tlm_enabled())
+                    vmc_tlm_emit("sync", "\"kind\":\"async_cuda\","
+                                 "\"detail\":\"conv_async_failed\","
+                                 "\"us\":%llu,\"frame_idx\":%u",
+                                 (unsigned long long)vmc_time_now_us(),
+                                 g_frames[idx].fidx);
                 const u64 t_after_async = vmc_time_now_us();
                 if (g_pending_ev) {
-                    g_conv_wait(g_pending_ev);
+                    const int wait_rc = g_conv_wait(g_pending_ev);
+                    if (wait_rc != 0 && vmc_tlm_enabled())
+                        vmc_tlm_emit("sync", "\"kind\":\"async_copy\","
+                                     "\"detail\":\"conv_wait_failed\","
+                                     "\"us\":%llu,\"frame_idx\":%u",
+                                     (unsigned long long)vmc_time_now_us(),
+                                     g_frames[idx].fidx);
                     g_conv_free(g_pending_ev);
                     const u64 t_after_wait = vmc_time_now_us();
+                    const u64 conv_us = t_after_wait - t_after_async;
 
                     /* Copy the converted BGRA stage into the DRM buffer that
                      * was reserved for the previous frame. If the DRM buffers
@@ -713,6 +894,21 @@ static void *decode_worker(void *arg) {
                                        handoff_us);
                     }
 
+                    /* Attach the previous frame's content identity to the DRM
+                     * buffer we are about to hand to the present worker; the
+                     * flip-complete handler emits the vrender from this. */
+                    if (g_pending_buf_idx >= 0 &&
+                        g_pending_buf_idx < VMC_DRM_MAX_BUFS) {
+                        g_vmeta[g_pending_buf_idx].fidx = g_pending_fidx;
+                        g_vmeta[g_pending_buf_idx].seg = g_pending_seg;
+                        g_vmeta[g_pending_buf_idx].pts_us = g_pending_pts;
+                        g_vmeta[g_pending_buf_idx].deadline_us =
+                            g_pending_deadline_us;
+                        g_vmeta[g_pending_buf_idx].decode_us =
+                            g_pending_decode_us;
+                        g_vmeta[g_pending_buf_idx].conv_us = conv_us;
+                    }
+
                     present_push(g_pending_buf_idx, g_pending_deadline_us);
                     if (!g_first_video_ready) g_first_video_ready = true;
                     const u64 t_after_push = vmc_time_now_us();
@@ -740,6 +936,10 @@ static void *decode_worker(void *arg) {
                 g_pending_map = dumb;
                 g_pending_pitch = g_drm.bufs[buf_idx].pitch;
                 g_pending_deadline_us = deadline_us;
+                g_pending_fidx = g_frames[idx].fidx;
+                g_pending_seg = g_frames[idx].seg;
+                g_pending_pts = g_frames[idx].pts_us;
+                g_pending_decode_us = decode_us;
                 slot_release(idx);
                 continue;
             }
@@ -778,6 +978,14 @@ static void *decode_worker(void *arg) {
             pres_cnt++;
             g_av_armed = true;
             g_last_video_deadline_us = deadline_us - g_playout_latency_us;
+            if (vmc_tlm_enabled()) {
+                const u64 vblank = vmc_time_now_us();
+                const i64 apos = tlm_audio_content_us();
+                tlm_vrender_emit(-1, vblank, 0, deadline_us,
+                                 g_frames[idx].fidx, g_frames[idx].seg,
+                                 g_frames[idx].pts_us, decode_us, 0, 0,
+                                 (u64)apos);
+            }
             (void)t_before_present;
         } else {
             g_decode_fails++;
@@ -911,6 +1119,41 @@ static void *audio_worker(void *arg) {
             g_rate_in += frames;
 #endif
             (void)vmc_audio_pipeline_render(&g_audio_pipe, outbuf, out_n);
+            if (vmc_tlm_enabled()) {
+                u64 delay_us = 0;
+                u64 hw_frames = 0;
+                (void)vmc_alsa_sink_delay_us(&g_audio_pipe.sink, &delay_us);
+                (void)vmc_alsa_sink_frames_played(&g_audio_pipe.sink,
+                                                  &hw_frames);
+                const u64 mono_ts = vmc_time_now_us();
+                const u64 render_us = mono_ts + delay_us;
+                const u64 wall_now = vmc_time_wall_us();
+                const i64 apos = tlm_audio_content_at_wall(wall_now + delay_us);
+                const sz_t pad_bytes = sizeof(pcm) - data_n;
+                vmc_tlm_emit("arender",
+                             "\"pcm_frames\":%zu,\"hw_pos_frames\":%llu,"
+                             "\"trigger_us\":%llu,\"delay_frames\":%llu,"
+                             "\"render_us\":%llu,\"content_pts_us\":%lld,"
+                             "\"fifo_level_bytes\":%zu,\"adelta_ppm\":0,"
+                             "\"pad_samples\":%zu",
+                             out_n,
+                             (unsigned long long)hw_frames,
+                             (unsigned long long)__atomic_load_n(
+                                 &g_audio_start_wall_us, __ATOMIC_RELAXED),
+                             (unsigned long long)
+                                 (delay_us * VMC_AUDIO_SAMPLE_RATE /
+                                  1000000u),
+                             (unsigned long long)render_us,
+                             (long long)apos,
+                             avail,
+                             pad_bytes / 4u);
+                if (data_n < sizeof(pcm)) {
+                    vmc_tlm_emit("buf", "\"which\":\"audio_fifo\","
+                                 "\"event\":\"underflow\","
+                                 "\"level\":%zu,\"cap\":%u,\"count\":1",
+                                 avail, VMC_AUDIO_FIFO_BYTES);
+                }
+            }
         }
 #ifdef VMC_HAVE_FFMPEG
             /* Starved: pace this path so a silent/non-blocking sink does not
@@ -1011,13 +1254,16 @@ static void *audio_worker(void *arg) {
 #ifdef VMC_HAVE_FFMPEG
 /* Publish one Annex-B access unit to the decode pipeline. The reader may
  * burst a whole segment's AUs here; the decode worker paces presentation to
- * the content frame rate, so the burst is absorbed by the frame slots. */
-static void dash_publish_au(const u8 *data, int size, u64 deadline_us) {
+ * the content frame rate, so the burst is absorbed by the frame slots.
+ * fidx/pts/seg describe the FRAME this AU belongs to (all NALs of one frame
+ * share the same content identity for the telemetry drop/A-V accounting). */
+static void dash_publish_au(const u8 *data, int size, u64 deadline_us,
+                            u32 fidx, i64 pts_us, int seg) {
     g_dash_pub++;
     const int idx = slot_take_write();
     if ((sz_t)size <= sizeof(g_frames[idx].buf)) {
         memcpy(g_frames[idx].buf, data, (sz_t)size);
-        slot_publish(idx, (sz_t)size, 0, deadline_us);
+        slot_publish(idx, (sz_t)size, 0, deadline_us, fidx, pts_us, seg);
     } else {
         pthread_mutex_lock(&g_fmu);
         g_frames[idx].state = SLOT_FREE;
@@ -1042,6 +1288,7 @@ typedef struct {
     i64 audio_pts;  /* monotonic pts counter for the AAC decoder */
     i64 video_first_pts; /* first video pts in current segment (for frame index) */
     int video_au_k;      /* per-segment fallback video frame counter */
+    int last_frame_idx;  /* per-segment index of the last published frame */
 } dash_session;
 
 static int dash_session_setup(AVFormatContext *fmt, dash_session *s) {
@@ -1381,6 +1628,11 @@ static void *dash_reader(void *arg) {
             last_pkt = vmc_time_now_us();
             if (pkt->stream_index == s.vs) {
                 g_dash_pkts++;
+                const u32 fidx = __atomic_fetch_add(&g_video_frame_count, 1,
+                                                    __ATOMIC_RELAXED);
+                const u64 fp = (g_stream_fps > 0)
+                    ? 1000000u / (u64)g_stream_fps : 16667u;
+                const i64 pts_us = (i64)fidx * (i64)fp;
                 if (s.bsfc) {
                     if (av_bsf_send_packet(s.bsfc, pkt) == 0) {
                         while (av_bsf_receive_packet(s.bsfc, out) == 0) {
@@ -1388,7 +1640,8 @@ static void *dash_reader(void *arg) {
                                 dash_publish_au(
                                     out->data, out->size,
                                     (u64)vmc_time_now_wall_us() +
-                                        g_playout_latency_us);
+                                        g_playout_latency_us,
+                                    fidx, pts_us, 0);
                             av_packet_unref(out);
                         }
                     }
@@ -1397,7 +1650,8 @@ static void *dash_reader(void *arg) {
                     if (pkt->size > 0)
                         dash_publish_au(pkt->data, pkt->size,
                                         (u64)vmc_time_now_wall_us() +
-                                            g_playout_latency_us);
+                                            g_playout_latency_us,
+                                        fidx, pts_us, 0);
                     av_packet_unref(pkt);
                 }
             } else if (pkt->stream_index == s.as && s.actx && s.swr &&
@@ -1445,14 +1699,34 @@ static void *dash_reader(void *arg) {
  * timing): fetch each segment over HTTP with a hard socket timeout and
  * demux it in memory. --- */
 
+/* HTTP fetch result envelope: status (200/404/0=fail) plus timing so the
+ * caller can emit the `net` telemetry event. */
+typedef struct {
+    int   status;
+    u64   ttfb_us;
+    u64   total_us;
+    u64   bytes;
+    u64   rtt_us;  /* TCP_INFO tcpi_rtt (us) */
+} http_fetch_stats;
+
+static void http_stats_init(http_fetch_stats *st) {
+    memset(st, 0, sizeof(*st));
+}
+
 /* Robust HTTP fetcher for DASH segments/manifest. Uses a non-blocking socket
  * with a deadline that resets on every forward-progress event (send/recv), so
  * slow progressive segment transfers complete instead of being truncated by a
  * fixed per-recv timeout. Supports both Content-Length and chunked bodies. */
 static int http_get(const char *url, u8 **body, size_t *bodylen,
-                    int timeout_ms) {
+                    int timeout_ms, int *out_status,
+                    http_fetch_stats *out_stats) {
     *body = NULL;
     *bodylen = 0;
+    http_fetch_stats stats;
+    http_stats_init(&stats);
+    if (out_status) *out_status = 0;
+
+    const u64 t_start = vmc_time_now_us();
 
     /* Parse URL: scheme://host[:port]/path */
     const char *p = strstr(url, "://");
@@ -1603,6 +1877,7 @@ static int http_get(const char *url, u8 **body, size_t *bodylen,
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
             break;
         }
+        if (stats.ttfb_us == 0) stats.ttfb_us = vmc_time_now_us() - t_start;
         if (raw_len + (size_t)n > raw_cap) {
             size_t new_cap = raw_cap ? raw_cap * 2 : 262144;
             while (new_cap < raw_len + (size_t)n) new_cap *= 2;
@@ -1619,17 +1894,34 @@ static int http_get(const char *url, u8 **body, size_t *bodylen,
         raw_len += (size_t)n;
         deadline = vmc_time_now_us() + (u64)timeout_ms * 1000u;
     }
+    /* TCP_INFO RTT: the only probe-free network latency signal. */
+    {
+        struct tcp_info ti;
+        socklen_t ti_len = sizeof(ti);
+        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &ti_len) == 0)
+            stats.rtt_us = ti.tcpi_rtt;
+    }
     close(fd);
+    stats.total_us = vmc_time_now_us() - t_start;
 
     if (!raw || raw_len < 12) {
         free(raw);
+        if (out_stats) *out_stats = stats;
         return -1;
     }
 
-    /* Require HTTP 200. */
-    if (memcmp(raw, "HTTP/1.1 200", 12) != 0 &&
-        memcmp(raw, "HTTP/1.0 200", 12) != 0) {
+    /* Parse the actual HTTP status code (200/404/...). */
+    int status = 0;
+    if (raw_len >= 12 &&
+        (memcmp(raw, "HTTP/1.1 ", 9) == 0 || memcmp(raw, "HTTP/1.0 ", 9) == 0)) {
+        status = atoi((const char *)raw + 9);
+    }
+    if (out_status) *out_status = status;
+
+    /* Require HTTP 200 for a successful body. */
+    if (status != 200) {
         free(raw);
+        if (out_stats) *out_stats = stats;
         return -1;
     }
 
@@ -1677,6 +1969,7 @@ static int http_get(const char *url, u8 **body, size_t *bodylen,
             buf = (u8 *)malloc(body_len);
             if (!buf) {
                 free(raw);
+                if (out_stats) *out_stats = stats;
                 return -1;
             }
             memcpy(buf, raw + hdr_end, body_len);
@@ -1685,6 +1978,8 @@ static int http_get(const char *url, u8 **body, size_t *bodylen,
         free(raw);
         *body = buf;
         *bodylen = len;
+        stats.bytes = len;
+        if (out_stats) *out_stats = stats;
         return 0;
     }
 
@@ -1755,7 +2050,25 @@ static int http_get(const char *url, u8 **body, size_t *bodylen,
     free(raw);
     *body = buf;
     *bodylen = len;
+    stats.bytes = len;
+    if (out_stats) *out_stats = stats;
     return 0;
+}
+
+/* Emit a `net` telemetry event for one HTTP fetch. */
+static void dash_tlm_net(const char *kind, int seg, const char *url,
+                         int status, const http_fetch_stats *st) {
+    if (!vmc_tlm_enabled()) return;
+    const char *base = strrchr(url, '/');
+    vmc_tlm_emit("net",
+                 "\"kind\":\"%s\",\"seg\":%d,\"url\":\"%s\",\"status\":%d,"
+                 "\"ttfb_us\":%llu,\"total_us\":%llu,\"bytes\":%llu,"
+                 "\"retries\":0,\"rtt_us\":%llu,\"stall_us\":0",
+                 kind, seg, base ? base + 1 : url, status,
+                 (unsigned long long)(st ? st->ttfb_us : 0),
+                 (unsigned long long)(st ? st->total_us : 0),
+                 (unsigned long long)(st ? st->bytes : 0),
+                 (unsigned long long)(st ? st->rtt_us : 0));
 }
 
 typedef struct {
@@ -1765,6 +2078,8 @@ typedef struct {
     int64_t seg_duration_us;
     int64_t publish_time_us;
     int64_t timeshift_depth_us;
+    int64_t duration_us;   /* mediaPresentationDuration (0 if live/unknown) */
+    bool static_mpd;       /* type="static" — the stream has ended */
     int window_segments; /* live edge offset from start_number at publishTime */
     int frame_rate;   /* from AdaptationSet frameRate="24/1" (0 if unknown) */
 } dash_manifest;
@@ -1812,11 +2127,26 @@ static int dash_load_manifest(const char *mpd_url, dash_manifest *m) {
     memset(m, 0, sizeof(*m));
     u8 *body = NULL;
     size_t blen = 0;
-    if (http_get(mpd_url, &body, &blen, 5000) != 0) {
+    int status = 0;
+    if (http_get(mpd_url, &body, &blen, 5000, &status, NULL) != 0) {
         return -1;
     }
     if (!body) return -1;
     const char *s = (const char *)body;
+    /* type="static" => the play-once encoder has ended; no new segments. */
+    if (strstr(s, "type=\"static\"") != NULL) m->static_mpd = true;
+    /* mediaPresentationDuration="PT21M0.034S" (static MPDs only). */
+    const char *md = strstr(s, "mediaPresentationDuration=\"");
+    if (md) {
+        const char *me = strchr(md + strlen("mediaPresentationDuration=\""), '"');
+        char mdbuf[64] = {0};
+        if (me) {
+            size_t l = (size_t)(me - (md + strlen("mediaPresentationDuration=\"")));
+            if (l > sizeof(mdbuf) - 1) l = sizeof(mdbuf) - 1;
+            memcpy(mdbuf, md + strlen("mediaPresentationDuration=\""), l);
+            m->duration_us = parse_duration_us(mdbuf);
+        }
+    }
     /* availabilityStartTime */
     const char *at = strstr(s, "availabilityStartTime=\"");
     if (!at) { free(body); return -1; }
@@ -1921,7 +2251,14 @@ static void dash_audio_write_frame(dash_session *s) {
                                 s->aframe->nb_samples);
     if (got > 0) {
         pthread_mutex_lock(&g_audio_mu);
-        (void)vmc_ringbuf_write(&g_audio_rb, s->apcm, (sz_t)got * 2 * 2);
+        const sz_t wr = vmc_ringbuf_write(&g_audio_rb, s->apcm,
+                                          (sz_t)got * 2 * 2);
+        if (wr < (sz_t)got * 2 * 2 && vmc_tlm_enabled())
+            vmc_tlm_emit("buf", "\"which\":\"audio_fifo\","
+                         "\"event\":\"overflow\",\"level\":%zu,"
+                         "\"cap\":%u,\"count\":1",
+                         vmc_ringbuf_used(&g_audio_rb),
+                         VMC_AUDIO_FIFO_BYTES);
         pthread_cond_signal(&g_audio_cv);
         pthread_mutex_unlock(&g_audio_mu);
 #ifdef VMC_DEBUG
@@ -1935,7 +2272,13 @@ static void dash_audio_write_frame(dash_session *s) {
 static void dash_audio_push_pcm(dash_session *s, int frames) {
     if (frames <= 0) return;
     pthread_mutex_lock(&g_audio_mu);
-    (void)vmc_ringbuf_write(&g_audio_rb, s->apcm, (sz_t)frames * 2 * 2);
+    const sz_t wr = vmc_ringbuf_write(&g_audio_rb, s->apcm,
+                                      (sz_t)frames * 2 * 2);
+    if (wr < (sz_t)frames * 2 * 2 && vmc_tlm_enabled())
+        vmc_tlm_emit("buf", "\"which\":\"audio_fifo\","
+                     "\"event\":\"overflow\",\"level\":%zu,"
+                     "\"cap\":%u,\"count\":1",
+                     vmc_ringbuf_used(&g_audio_rb), VMC_AUDIO_FIFO_BYTES);
     pthread_cond_signal(&g_audio_cv);
     pthread_mutex_unlock(&g_audio_mu);
 #ifdef VMC_DEBUG
@@ -1966,6 +2309,7 @@ static void dash_demux_segment(u8 *data, size_t len, dash_session *s,
      * start from k=0 and advance by the content frame duration. */
     s->video_first_pts = AV_NOPTS_VALUE;
     s->video_au_k = 0;
+    s->last_frame_idx = -1;
 #ifdef VMC_HAVE_ALSA
     bool saw_audio = false;
 #endif
@@ -2019,11 +2363,26 @@ static void dash_demux_segment(u8 *data, size_t len, dash_session *s,
                 frame_idx = s->video_au_k;
                 if (au_k) frame_idx = *au_k;
             }
+            /* New content frame: assign a global monotonic frame index and the
+             * content PTS (segment offset + within-segment index). Every NAL of
+             * this frame reuses the same identity for the telemetry accounting. */
+            u32 fidx = 0;
+            i64 pts_us = 0;
+            if (frame_idx != s->last_frame_idx || s->last_frame_idx < 0) {
+                fidx = __atomic_fetch_add(&g_video_frame_count, 1,
+                                          __ATOMIC_RELAXED);
+                const u64 fp = (g_stream_fps > 0)
+                    ? 1000000u / (u64)g_stream_fps : 16667u;
+                pts_us = (i64)(seg_num - 1) * (i64)g_seg_duration_us +
+                         (i64)frame_idx * (i64)fp;
+                s->last_frame_idx = frame_idx;
+            }
             if (av_bsf_send_packet(s->bsfc, pkt) == 0) {
                 while (av_bsf_receive_packet(s->bsfc, out) == 0) {
                     if (out->size > 0) {
                         dash_publish_au(out->data, out->size,
-                                        dash_au_deadline(seg_num, frame_idx));
+                                        dash_au_deadline(seg_num, frame_idx),
+                                        fidx, pts_us, seg_num);
                     }
                     av_packet_unref(out);
                 }
@@ -2157,6 +2516,10 @@ static void dash_resync(int next_seg, int live_edge, const char *reason) {
              reason, old_seg, next_seg, (unsigned long long)old_wall,
              (unsigned long long)g_anchor_wall_us,
              (unsigned long long)g_audio_start_wall_us);
+    if (vmc_tlm_enabled())
+        vmc_tlm_emit("sync", "\"kind\":\"resync\",\"detail\":\"%s\","
+                     "\"seg\":%d",
+                     reason, next_seg);
 }
 
 /* Adjust live-buffer targets based on measured segment-fetch latency.
@@ -2220,10 +2583,24 @@ static void *dash_reader_direct(void *arg) {
         free(init_v); init_v = NULL; init_v_len = 0;
         free(init_a); init_a = NULL; init_a_len = 0;
         snprintf(init_url, sizeof(init_url), "%s/init-stream0.m4s", m.base);
-        http_get(init_url, &init_v, &init_v_len, 5000);
+        {
+            int ist = 0;
+            http_fetch_stats is;
+            http_stats_init(&is);
+            (void)http_get(init_url, &init_v, &init_v_len, 5000, &ist, &is);
+            if (vmc_tlm_enabled())
+                dash_tlm_net("video", -1, init_url, ist, &is);
+        }
         snprintf(init_a_url, sizeof(init_a_url), "%s/init-stream1.m4s",
                  m.base);
-        http_get(init_a_url, &init_a, &init_a_len, 5000);
+        {
+            int ist = 0;
+            http_fetch_stats is;
+            http_stats_init(&is);
+            (void)http_get(init_a_url, &init_a, &init_a_len, 5000, &ist, &is);
+            if (vmc_tlm_enabled())
+                dash_tlm_net("audio", -1, init_a_url, ist, &is);
+        }
 
         if (dash_session_setup_from_init(init_v, init_v_len, init_a, init_a_len,
                                 &s) != 0) {
@@ -2260,8 +2637,29 @@ static void *dash_reader_direct(void *arg) {
                 dash_manifest fresh_m;
                 if (dash_load_manifest(url, &fresh_m) == 0) {
                     m = fresh_m;
+                    if (vmc_tlm_enabled())
+                        vmc_tlm_emit("net", "\"kind\":\"mpd\",\"seg\":0,"
+                                     "\"url\":\"/live.mpd\",\"status\":200,"
+                                     "\"ttfb_us\":0,\"total_us\":0,"
+                                     "\"bytes\":0,\"retries\":0,"
+                                     "\"rtt_us\":0,\"stall_us\":0");
                 } else {
                     VMC_LOGW("dash: periodic manifest reload failed, using stale MPD");
+                    if (vmc_tlm_enabled())
+                        vmc_tlm_emit("net", "\"kind\":\"mpd\",\"seg\":0,"
+                                     "\"url\":\"/live.mpd\",\"status\":0,"
+                                     "\"ttfb_us\":0,\"total_us\":0,"
+                                     "\"bytes\":0,\"retries\":0,"
+                                     "\"rtt_us\":0,\"stall_us\":0");
+                }
+
+                /* A static MPD (play-once EOS) has a fixed duration: clamp the
+                 * live edge so we never chase phantom segments past the end of
+                 * the clip. */
+                int64_t total_segments = 0;
+                if (m.static_mpd && m.duration_us > 0 && m.seg_duration_us > 0) {
+                    total_segments = (m.duration_us + m.seg_duration_us - 1) /
+                                     m.seg_duration_us;
                 }
 
                 const int64_t now = (int64_t)vmc_time_now_wall_us();
@@ -2279,6 +2677,8 @@ static void *dash_reader_direct(void *arg) {
                 int live_edge = (int)(elapsed > 0
                     ? elapsed / m.seg_duration_us : 0);
                 if (live_edge < m.start_number) live_edge = m.start_number;
+                if (total_segments > 0 && live_edge > (int)total_segments)
+                    live_edge = (int)total_segments;
 
                 /* Stay g_video_live_buffer_us / g_audio_live_buffer_us behind the
                  * live edge. The buffer starts at the steady target for fast
@@ -2355,8 +2755,13 @@ static void *dash_reader_direct(void *arg) {
                              "%s/chunk-stream1-%05d.m4s", m.base, at);
                     u8 *seg = NULL;
                     size_t seg_len = 0;
-                    if (http_get(seg_url, &seg, &seg_len, 30000) == 0 &&
-                        seg_len > 0) {
+                    int st = 0;
+                    http_fetch_stats fs;
+                    http_stats_init(&fs);
+                    if (http_get(seg_url, &seg, &seg_len, 30000, &st,
+                                 &fs) == 0 && seg_len > 0) {
+                        if (vmc_tlm_enabled())
+                            dash_tlm_net("audio", at, seg_url, 200, &fs);
                         u8 *whole = (u8 *)malloc(init_a_len + seg_len);
                         if (whole) {
                             memcpy(whole, init_a, init_a_len);
@@ -2372,6 +2777,8 @@ static void *dash_reader_direct(void *arg) {
                         }
                         free(seg);
                     } else {
+                        if (vmc_tlm_enabled())
+                            dash_tlm_net("audio", at, seg_url, st, &fs);
 #ifdef VMC_DEBUG
                         g_audio_fetch_fail++;
 #endif
@@ -2451,13 +2858,34 @@ static void *dash_reader_direct(void *arg) {
                 u8 *seg = NULL;
                 size_t seg_len = 0;
                 const u64 t_fetch0 = vmc_time_now_us();
-                if (http_get(seg_url, &seg, &seg_len, 30000) == 0 &&
-                    seg_len > 0) {
+                int st = 0;
+                http_fetch_stats fs;
+                http_stats_init(&fs);
+                if (http_get(seg_url, &seg, &seg_len, 30000, &st,
+                             &fs) == 0 && seg_len > 0) {
+                    if (vmc_tlm_enabled())
+                        dash_tlm_net("video", vn, seg_url, 200, &fs);
 #ifdef VMC_DEBUG
                     g_seg_fetch_ok++;
                     g_seg_fetch_us_sum += vmc_time_now_us() - t_fetch0;
                     if (vmc_time_now_us() - t_fetch0 > g_seg_fetch_us_max)
                         g_seg_fetch_us_max = vmc_time_now_us() - t_fetch0;
+                    /* VMC_DEBUG_LEAK_KB_PER_SEG: simulate a per-segment leak so
+                     * the longrun RSS gate can be exercised on hardware. */
+                    {
+                        const char *leak = getenv("VMC_DEBUG_LEAK_KB_PER_SEG");
+                        if (leak) {
+                            static void *g_leak = NULL;
+                            static size_t g_leak_sz = 0;
+                            const size_t add = (size_t)atol(leak) * 1024u;
+                            void *nb = realloc(g_leak, g_leak_sz + add);
+                            if (nb) {
+                                g_leak = nb;
+                                g_leak_sz += add;
+                                memset((u8 *)g_leak + g_leak_sz - add, 0, add);
+                            }
+                        }
+                    }
 #endif
                     dash_update_live_buffer(vmc_time_now_us() - t_fetch0,
                                             (int)m.seg_duration_us);
@@ -2516,6 +2944,8 @@ static void *dash_reader_direct(void *arg) {
                     video_fetched++;
                     vn++;
                 } else {
+                    if (vmc_tlm_enabled())
+                        dash_tlm_net("video", vn, seg_url, st, &fs);
 #ifdef VMC_DEBUG
                     g_seg_fetch_fail++;
                     if (vn == num) g_seg_miss++;
@@ -2526,6 +2956,24 @@ static void *dash_reader_direct(void *arg) {
             }
             if (video_fetched > 0 && g_prefetch_done < 3)
                 g_prefetch_done++;
+
+            /* Play-once EOS: the static MPD says the clip is over and we have
+             * fetched the final segment. Drain and end the run cleanly instead
+             * of sitting in a retry loop against the (deleted) rolling window. */
+            if (m.static_mpd && total_segments > 0 &&
+                last_vnum >= (int)total_segments - 1) {
+                VMC_LOGI("dash: end of content reached (static MPD, seg %d/%lld)",
+                         last_vnum, (long long)total_segments);
+                if (vmc_tlm_enabled())
+                    vmc_tlm_emit("eos",
+                                 "\"reason\":\"end_of_content\","
+                                 "\"last_frame_idx\":%u,\"last_seg\":%d",
+                                 g_video_frame_count > 0
+                                     ? g_video_frame_count - 1u : 0u,
+                                 last_vnum);
+                g_run = 0;
+                break;
+            }
 
             t3_vpost = vmc_time_now_wall_us();
 
@@ -2572,6 +3020,19 @@ static void *dash_reader_direct(void *arg) {
 static int run_dash(const char *url, vmc_log_level log_level) {
     vmc_log_set_level(log_level);
     VMC_LOGI("VMC DASH client %s starting (%s)", VMC_VERSION, url);
+
+    char hostname[128] = "unknown";
+    if (gethostname(hostname, sizeof(hostname)) != 0)
+        snprintf(hostname, sizeof(hostname), "unknown");
+    (void)vmc_tlm_init("client", hostname,
+#ifdef VMC_DEBUG
+                       "debug",
+#else
+                       "release",
+#endif
+                       VMC_GIT_SHA);
+    if (vmc_tlm_enabled())
+        VMC_LOGI("telemetry: enabled (VMC_TELEMETRY)");
 
     vmc_fb_display fbdisp;
     u8 *frame_rgb = NULL;
@@ -2678,6 +3139,13 @@ static int run_dash(const char *url, vmc_log_level log_level) {
             (void)pthread_create(&present_tid, NULL, present_worker, NULL);
             VMC_LOGI("present worker thread started");
         }
+    } else {
+        /* A measured run needs a decoder; the open path already emitted a
+         * fatal `decoder_unavailable` event when it failed for a reason the
+         * harness must treat as an environment/build fault. Exit distinct. */
+        VMC_LOGE("no usable decoder — aborting (exit 3)");
+        vmc_tlm_shutdown();
+        return 3;
     }
 
 #ifdef VMC_HAVE_ALSA
@@ -2844,6 +3312,7 @@ static int run_dash(const char *url, vmc_log_level log_level) {
         vmc_display_close(&fbdisp.base);
         free(frame_rgb);
     }
+    vmc_tlm_shutdown();
     return 0;
 }
 #endif /* VMC_HAVE_FFMPEG */
@@ -3209,8 +3678,11 @@ int main(int argc, char **argv) {
                             /* Publish the completed frame to the decode
                              * thread, then move the assembler to the next
                              * free slot so receive never blocks. */
-                            slot_publish(g_write_slot, au_len, slot->ts_us,
-                                         0);
+                            const u32 fidx =
+                                __atomic_fetch_add(&g_video_frame_count, 1,
+                                                   __ATOMIC_RELAXED);
+                            slot_publish(g_write_slot, au_len, slot->ts_us, 0,
+                                         fidx, (i64)fidx * 1000, 0);
                             g_write_slot = slot_take_write();
                             frag.buf = g_frames[g_write_slot].buf;
                         }

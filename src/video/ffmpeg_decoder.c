@@ -16,6 +16,7 @@
 
 #include "vmc/core/error.h"
 #include "vmc/core/logger.h"
+#include "vmc/core/telemetry.h"
 #include "vmc/video/fragment.h"
 
 #define DECODER_ALIGNMENT 64u
@@ -57,14 +58,25 @@ static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
         return VMC_ERR_NOSYS;
     }
 
-    /* Try hardware decoders first, then software. */
+    /* Try hardware decoders first, then software. VMC_FORCE_DECODER (debug
+     * builds only) overrides the candidate so the harness can inject a
+     * `decoder_unavailable` fault. */
     const AVCodec *avcodec = NULL;
     const char *used = NULL;
-    for (size_t i = 0; i < sizeof(k_hw_decoders) / sizeof(k_hw_decoders[0]); i++) {
-        avcodec = avcodec_find_decoder_by_name(k_hw_decoders[i]);
+    const char *forced = getenv("VMC_FORCE_DECODER");
+    if (forced && forced[0]) {
+        avcodec = avcodec_find_decoder_by_name(forced);
         if (avcodec) {
-            used = k_hw_decoders[i];
-            break;
+            used = forced;
+        }
+    }
+    if (!avcodec) {
+        for (size_t i = 0; i < sizeof(k_hw_decoders) / sizeof(k_hw_decoders[0]); i++) {
+            avcodec = avcodec_find_decoder_by_name(k_hw_decoders[i]);
+            if (avcodec) {
+                used = k_hw_decoders[i];
+                break;
+            }
         }
     }
 
@@ -74,6 +86,12 @@ static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
     }
     if (!avcodec) {
         VMC_LOGE("ffmpeg: no H.264 decoder available");
+        if (vmc_tlm_enabled())
+            vmc_tlm_emit("dec", "\"kind\":\"decoder_unavailable\","
+                         "\"codec\":\"%s\",\"rc\":-1,"
+                         "\"msg\":\"no h264 decoder\",\"frame_idx\":0,"
+                         "\"seg\":0,\"fatal\":true",
+                         forced ? forced : "h264_cuvid");
         return VMC_ERR_NOSYS;
     }
 
@@ -95,6 +113,11 @@ static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
                                    NULL, 0) != 0) {
             VMC_LOGW("ffmpeg: CUDA hw_device_ctx creation failed, "
                      "cannot use Design-B GPU scanout");
+            if (vmc_tlm_enabled())
+                vmc_tlm_emit("dec", "\"kind\":\"decoder_unavailable\","
+                             "\"codec\":\"h264_cuvid\",\"rc\":-1,"
+                             "\"msg\":\"av_hwdevice_ctx_create failed\","
+                             "\"frame_idx\":0,\"seg\":0,\"fatal\":true");
             avcodec_free_context(&ctx);
             return VMC_ERR_IO;
         }
@@ -113,6 +136,12 @@ static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
         avcodec_free_context(&ctx);
         if (used && used[0] == 'h' && strncmp(used, "h264 (software)", 16) != 0) {
             /* HW decoder failed to open: retry with software. */
+            if (vmc_tlm_enabled())
+                vmc_tlm_emit("dec", "\"kind\":\"decoder_reinit\","
+                             "\"codec\":\"%s\",\"rc\":0,"
+                             "\"msg\":\"hw open failed, falling back to sw\","
+                             "\"frame_idx\":0,\"seg\":0,\"fatal\":false",
+                             used);
             avcodec = avcodec_find_decoder(AV_CODEC_ID_H264);
             used = "h264 (software)";
             ctx = avcodec_alloc_context3(avcodec);
@@ -120,10 +149,21 @@ static vmc_status ffmpeg_open(vmc_video_decoder *d, vmc_video_codec codec,
             if (avcodec_open2(ctx, avcodec, NULL) != 0) {
                 avcodec_free_context(&ctx);
                 VMC_LOGE("ffmpeg: avcodec_open2 failed (hw + sw)");
+                if (vmc_tlm_enabled())
+                    vmc_tlm_emit("dec", "\"kind\":\"decoder_unavailable\","
+                                 "\"codec\":\"h264\",\"rc\":-1,"
+                                 "\"msg\":\"avcodec_open2 failed\","
+                                 "\"frame_idx\":0,\"seg\":0,\"fatal\":true");
                 return VMC_ERR_IO;
             }
         } else {
             VMC_LOGE("ffmpeg: avcodec_open2 failed (%s)", used);
+            if (vmc_tlm_enabled())
+                vmc_tlm_emit("dec", "\"kind\":\"decoder_unavailable\","
+                             "\"codec\":\"%s\",\"rc\":-1,"
+                             "\"msg\":\"avcodec_open2 failed\","
+                             "\"frame_idx\":0,\"seg\":0,\"fatal\":true",
+                             used);
             return VMC_ERR_IO;
         }
     }
@@ -238,6 +278,12 @@ static vmc_status ffmpeg_decode(vmc_video_decoder *d, const u8 *data, sz_t len,
     int rc = avcodec_send_packet(cx->ctx, cx->pkt);
     if (rc < 0) {
         VMC_LOGW("ffmpeg: avcodec_send_packet err %s", av_err2str(rc));
+        if (vmc_tlm_enabled())
+            vmc_tlm_emit("dec", "\"kind\":\"decode_error\","
+                         "\"codec\":\"%s\",\"rc\":%d,\"msg\":\"send_packet\","
+                         "\"frame_idx\":%lld,\"seg\":0,\"fatal\":false",
+                         cx->ctx->codec ? cx->ctx->codec->name : "h264", (int)rc,
+                         (long long)fd->last_send_pts);
         return VMC_ERR_PROTO;
     }
 
@@ -246,9 +292,21 @@ static vmc_status ffmpeg_decode(vmc_video_decoder *d, const u8 *data, sz_t len,
         return VMC_ERR_AGAIN; /* need more data; no frame yet */
     }
     if (rc < 0) {
+        if (vmc_tlm_enabled())
+            vmc_tlm_emit("dec", "\"kind\":\"decode_error\","
+                         "\"codec\":\"%s\",\"rc\":%d,\"msg\":\"receive_frame\","
+                         "\"frame_idx\":%lld,\"seg\":0,\"fatal\":false",
+                         cx->ctx->codec ? cx->ctx->codec->name : "h264", (int)rc,
+                         (long long)fd->last_send_pts);
         return VMC_ERR_PROTO;
     }
     fd->last_frame_pts = cx->frame->pts;
+    if ((cx->frame->flags & AV_FRAME_FLAG_CORRUPT) && vmc_tlm_enabled()) {
+        vmc_tlm_emit("dec", "\"kind\":\"corrupt_frame\","
+                     "\"codec\":\"%s\",\"rc\":0,\"msg\":\"corrupt flag\","
+                     "\"frame_idx\":%lld,\"seg\":0,\"fatal\":false",
+                     cx->ctx->codec ? cx->ctx->codec->name : "h264", (long long)fd->last_frame_pts);
+    }
 
     if (fd->output_cuda) {
         /* Design B: return device NV12 pointers; conversion happens later on
