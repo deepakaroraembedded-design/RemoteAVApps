@@ -1,0 +1,685 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VMC A/V iteration report (21-minute single-stretch run)",
+  "description": "The only artifact that crosses from the automation test agent to the main implementer agent.",
+  "type": "object",
+  "required": [
+    "iteration",
+    "run_id",
+    "commit",
+    "tier",
+    "verdict",
+    "primary_fault",
+    "av_sync",
+    "render",
+    "buffers",
+    "network",
+    "vsync_async",
+    "decoder",
+    "longrun",
+    "buckets",
+    "failed_gates",
+    "artifacts",
+    "notes"
+  ],
+  "properties": {
+    "iteration": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "commit": {
+      "type": "string"
+    },
+    "verdict": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "ERROR"
+      ]
+    },
+    "primary_fault": {
+      "enum": [
+        "none",
+        "environment",
+        "decoder_unavailable",
+        "network",
+        "decoder_errors",
+        "buffers",
+        "vsync_async",
+        "cadence",
+        "longrun",
+        "av_sync",
+        "latency"
+      ],
+      "description": "First red class in causal order, not the loudest one. `longrun` precedes `av_sync`: over 21 minutes a slow drift pushes late buckets past the per-minute A/V gate, so when both are red the drift is the cause."
+    },
+    "window_actual_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "content_fps": {
+      "type": "number"
+    },
+    "av_sync": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "av_offset_mean_ms",
+        "av_offset_p95_ms",
+        "av_offset_min_ms",
+        "av_offset_max_ms",
+        "av_offset_drift_ms_per_min",
+        "samples"
+      ],
+      "properties": {
+        "av_offset_mean_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "av_offset_p95_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "av_offset_min_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "av_offset_max_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "av_offset_drift_ms_per_min": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "samples": {
+          "type": "integer"
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "av_envelope_violations": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
+    },
+    "render": {
+      "type": "object",
+      "required": [
+        "frames_presented",
+        "frames_expected",
+        "frames_dropped",
+        "frames_repeated",
+        "audio_periods_written"
+      ],
+      "properties": {
+        "frames_presented": {
+          "type": "integer"
+        },
+        "frames_expected": {
+          "type": "integer"
+        },
+        "frames_dropped": {
+          "type": "integer"
+        },
+        "frames_repeated": {
+          "type": "integer"
+        },
+        "frame_interval_mean_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "frame_interval_p95_err_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "audio_periods_written": {
+          "type": "integer"
+        },
+        "audio_periods_expected": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "first_vrender_us": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "last_vrender_us": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
+    },
+    "buffers": {
+      "type": "object",
+      "required": [
+        "audio_fifo_underflows",
+        "audio_fifo_overflows",
+        "jitter_buffer_underflows",
+        "jitter_buffer_overflows",
+        "drm_pool_exhausted",
+        "seg_queue_starved"
+      ],
+      "properties": {
+        "audio_fifo_underflows": {
+          "type": "integer"
+        },
+        "audio_fifo_overflows": {
+          "type": "integer"
+        },
+        "audio_pad_samples": {
+          "type": "integer"
+        },
+        "audio_fifo_level_min_pct": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "jitter_buffer_underflows": {
+          "type": "integer"
+        },
+        "jitter_buffer_overflows": {
+          "type": "integer"
+        },
+        "drm_pool_exhausted": {
+          "type": "integer"
+        },
+        "seg_queue_starved": {
+          "type": "integer"
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "required": [
+        "seg_fetch_ok",
+        "seg_fetch_fail",
+        "seg_fetch_miss",
+        "resyncs"
+      ],
+      "properties": {
+        "seg_fetch_ok": {
+          "type": "integer"
+        },
+        "seg_fetch_fail": {
+          "type": "integer"
+        },
+        "seg_fetch_miss": {
+          "type": "integer"
+        },
+        "seg_fetch_mean_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "seg_fetch_p95_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "seg_fetch_max_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "tcp_rtt_p95_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "mpd_reload_fail": {
+          "type": "integer"
+        },
+        "resyncs": {
+          "type": "integer"
+        }
+      }
+    },
+    "vsync_async": {
+      "type": "object",
+      "required": [
+        "vsync_miss",
+        "vsync_dup",
+        "flip_error",
+        "flip_timeout",
+        "drm_event_starve",
+        "async_cuda",
+        "async_copy",
+        "async_stage",
+        "clock_fallback"
+      ],
+      "additionalProperties": {
+        "type": "integer"
+      }
+    },
+    "decoder": {
+      "type": "object",
+      "required": [
+        "decode_errors",
+        "decoder_unavailable",
+        "decoder_reinit",
+        "corrupt_frames",
+        "missing_ref"
+      ],
+      "properties": {
+        "decode_errors": {
+          "type": "integer"
+        },
+        "decoder_unavailable": {
+          "type": "integer"
+        },
+        "decoder_reinit": {
+          "type": "integer"
+        },
+        "corrupt_frames": {
+          "type": "integer"
+        },
+        "missing_ref": {
+          "type": "integer"
+        },
+        "decode_mean_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "decode_p95_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "latency": {
+      "type": "object",
+      "description": "Live-edge lag: wall-clock at vblank minus content realtime (avail_start_us + pts_us). Absolute mean is reported but NOT gated (it tracks the 10-30 s live buffer); p95 ceiling and Theil-Sen growth are the gates.",
+      "properties": {
+        "present_delay_mean_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "present_delay_p95_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "present_delay_samples": {
+          "type": "integer"
+        }
+      }
+    },
+    "failed_gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "gate",
+          "value",
+          "limit",
+          "class"
+        ],
+        "properties": {
+          "gate": {
+            "type": "string"
+          },
+          "value": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limit": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "class": {
+            "enum": [
+              "environment",
+              "decoder_unavailable",
+              "network",
+              "decoder_errors",
+              "buffers",
+              "vsync_async",
+              "cadence",
+              "longrun",
+              "av_sync",
+              "latency"
+            ]
+          },
+          "bucket": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The minute this gate failed in, or null for a run-level gate."
+          }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "client_ndjson": {
+          "type": "string"
+        },
+        "server_ndjson": {
+          "type": "string"
+        },
+        "client_log": {
+          "type": "string"
+        },
+        "server_log": {
+          "type": "string"
+        },
+        "resources": {
+          "type": "string"
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 12
+    },
+    "tier": {
+      "enum": [
+        "smoke",
+        "full"
+      ]
+    },
+    "bucket_s": {
+      "type": "number"
+    },
+    "longrun": {
+      "type": "object",
+      "description": "Run-level analysis that only a long single stretch can produce.",
+      "required": [
+        "buckets_total",
+        "buckets_passed",
+        "buckets_failed",
+        "av_offset_drift_ms_per_min",
+        "eos_reached"
+      ],
+      "properties": {
+        "buckets_total": {
+          "type": "integer"
+        },
+        "buckets_passed": {
+          "type": "integer"
+        },
+        "buckets_failed": {
+          "type": "integer"
+        },
+        "worst_bucket": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "av_offset_drift_ms_per_min": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Theil-Sen slope over per-minute means; robust to a single bad minute."
+        },
+        "av_offset_drift_ls_ms_per_min": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Least-squares slope, reported for comparison. Disagreement with the robust value indicates a transient."
+        },
+        "av_offset_total_excursion_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "av_p95_degrade_ms_per_bucket": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "av_offset_bucket_means_ms": {
+          "type": "array",
+          "items": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "present_delay_bucket_means_ms": {
+          "type": "array",
+          "items": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "present_delay_growth_ms_per_min": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Theil-Sen over per-bucket mean live-edge lag; robust to buffer re-aiming steps, catches monotonic lateness."
+        },
+        "rss_start_mb": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "rss_end_mb": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "rss_growth_mb": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "fd_start": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "fd_end": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "fd_growth": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "disk_start_mb": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "disk_end_mb": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "disk_growth_mb": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "disk_growth_last_buckets_mb": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "eos_reached": {
+          "type": "boolean"
+        },
+        "eos_at_s": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "playback_span_s": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "clip_duration_s": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "buckets": {
+      "type": "array",
+      "description": "One entry per 60 s of playback. Every complete bucket is gated independently; a single failing minute fails the run.",
+      "items": {
+        "type": "object",
+        "required": [
+          "index",
+          "t_start_s",
+          "complete",
+          "verdict",
+          "failed_gates"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "t_start_s": {
+            "type": "number"
+          },
+          "span_s": {
+            "type": "number"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "verdict": {
+            "enum": [
+              "PASS",
+              "FAIL"
+            ]
+          },
+          "av_offset_mean_ms": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "av_offset_p95_ms": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "av_envelope_violation_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "av_samples": {
+            "type": "integer"
+          },
+          "present_delay_mean_ms": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "present_delay_p95_ms": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "present_delay_samples": {
+            "type": "integer"
+          },
+          "frames_presented": {
+            "type": "integer"
+          },
+          "frames_expected": {
+            "type": "integer"
+          },
+          "frames_dropped": {
+            "type": "integer"
+          },
+          "frames_repeated": {
+            "type": "integer"
+          },
+          "failed_gates": {
+            "type": "array"
+          }
+        }
+      }
+    }
+  }
+}

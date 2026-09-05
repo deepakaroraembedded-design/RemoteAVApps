@@ -3,3 +3,9 @@ build-*/
 *.o
 *.a
 *.so
+
+# media test assets (source clips are large and frozen by the av-loop)
+4K/
+
+__pycache__/
+*.pyc
