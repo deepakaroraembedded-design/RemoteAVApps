@@ -130,33 +130,39 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
     argv[n++] = "error";
     if (input) {
         media_info mi;
+        bool lavfi_setup = false;
         if (probe_media(input, &mi) == 0) {
-            /* Loop the file with the lavfi movie/amovie loop=0 option (the
-             * separate 'loop' filter does not survive the end of the file on
-             * FFmpeg 4.x — the encoder exits at the boundary) so -re pacing
-             * has continuous timestamps across loop boundaries — the
-             * -re + -stream_loop combo drifts and eventually hangs after
-             * hours. */
-            snprintf(vfilter, sizeof(vfilter), "movie=%s:loop=0,setpts=N/(%d*TB)",
-                     input, mi.fps);
-            argv[n++] = "-re";
-            argv[n++] = "-f";
-            argv[n++] = "lavfi";
-            argv[n++] = "-i";
-            argv[n++] = vfilter;
-            if (mi.sample_rate > 0 && mi.duration_s > 0) {
-                snprintf(afilter, sizeof(afilter),
-                         "amovie=%s:loop=0,asetpts=N/%d/TB", input,
-                         mi.sample_rate);
+            /* Loop the file seamlessly with the lavfi movie/amovie loop=0
+             * option (the separate 'loop' filter does not survive the end of
+             * the file on FFmpeg 4.x — the encoder exits at the boundary) so
+             * -re pacing has continuous timestamps across loop boundaries and
+             * playback runs without a pause. The -re + -stream_loop combo
+             * drifts and eventually hangs after hours. */
+            if (mi.fps > 0) {
+                fps = mi.fps;   /* GOP / keyframe cadence from the real rate */
+                snprintf(vfilter, sizeof(vfilter),
+                         "movie=%s:loop=0,setpts=N/(%d*TB)", input, mi.fps);
                 argv[n++] = "-re";
                 argv[n++] = "-f";
                 argv[n++] = "lavfi";
                 argv[n++] = "-i";
-                argv[n++] = afilter;
-                has_audio = true;
-                audio_in_idx = 1;
+                argv[n++] = vfilter;
+                lavfi_setup = true;
+                if (mi.sample_rate > 0 && mi.duration_s > 0) {
+                    snprintf(afilter, sizeof(afilter),
+                             "amovie=%s:loop=0,asetpts=N/%d/TB", input,
+                             mi.sample_rate);
+                    argv[n++] = "-re";
+                    argv[n++] = "-f";
+                    argv[n++] = "lavfi";
+                    argv[n++] = "-i";
+                    argv[n++] = afilter;
+                    has_audio = true;
+                    audio_in_idx = 1;
+                }
             }
-        } else {
+        }
+        if (!lavfi_setup) {
             argv[n++] = "-re";
             argv[n++] = "-stream_loop";
             argv[n++] = "-1";
@@ -612,7 +618,10 @@ int main(int argc, char **argv) {
 
     while (g_run) {
         struct pollfd pfd = {.fd = lsock, .events = POLLIN};
-        (void)poll(&pfd, 1, 5000);
+        /* 500 ms poll so the watchdog notices an exited/stalled encoder
+         * quickly — the 5 s clean-session gap in ffmpeg_respawn stays close
+         * to 5 s of real pause instead of being padded by the poll latency. */
+        (void)poll(&pfd, 1, 500);
         if (pfd.revents & POLLIN) {
             int c = accept(lsock, NULL, NULL);
             if (c >= 0) {

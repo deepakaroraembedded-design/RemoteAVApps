@@ -55,8 +55,7 @@ start_server() {
 # ============================================================
 start_client() {
     # VMC_DRM=1 for GPU scanout (Design B); omit for the /dev/fb0 path.
-    # VMC_HUD=1 adds a green on-screen latency overlay.
-    setsid nohup env VMC_DRM=1 VMC_HUD=1 \
+    setsid nohup env VMC_DRM=1 \
         VMC_AUDIO_DEV=hdmi ALSA_CONFIG_PATH=/etc/vmc-audio.conf \
         ./build-debug/vmc-thinclient-app --dash http://192.168.0.126:8080/live.mpd 1 \
         > /tmp/dash_client.log 2>&1 < /dev/null &

@@ -160,9 +160,6 @@ static u64  g_presented = 0;
 static volatile bool g_first_video_ready = false;
 static u64  g_onscreen_sum = 0, g_onscreen_cnt = 0;
 
-/* On-screen latency overlay is off unless VMC_HUD=1. */
-static bool g_hud = false;
-
 /* Video presentation pacing: the DASH reader delivers one 1 s segment per
  * fetch, so without pacing the decode worker presents all frames of a segment
  * back-to-back then idles until the next segment arrives — visible judder.
@@ -391,177 +388,6 @@ static void latency_report(void) {
                                       : 0));
 }
 
-/* --- On-screen latency overlay --------------------------------------
- * Draws the live E2E / decode / network latency into the decoded frame
- * (top-left) using an embedded 5x7 bitmap font at 2x scale. */
-static const u8 k_font[][7] = {
-    /* ' ' */
-    {0, 0, 0, 0, 0, 0, 0},
-    /* '!' */ {0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04},
-    /* '"' */ {0x0A, 0x0A, 0x0A, 0, 0, 0, 0},
-    /* '#' */ {0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0, 0},
-    /* '$' */ {0x0E, 0x15, 0x14, 0x0E, 0x05, 0x15, 0x0E},
-    /* '%' */ {0x19, 0x1A, 0x02, 0x04, 0x0B, 0x13, 0},
-    /* '&' */ {0x0C, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0D},
-    /* '\'' */ {0x04, 0x04, 0x04, 0, 0, 0, 0},
-    /* '(' */ {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02},
-    /* ')' */ {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08},
-    /* '*' */ {0, 0x0A, 0x04, 0x1F, 0x04, 0x0A, 0},
-    /* '+' */ {0, 0x04, 0x04, 0x1F, 0x04, 0x04, 0},
-    /* ',' */ {0, 0, 0, 0, 0x06, 0x04, 0x08},
-    /* '-' */ {0, 0, 0, 0x1F, 0, 0, 0},
-    /* '.' */ {0, 0, 0, 0, 0, 0x04, 0x04},
-    /* '/' */ {0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10},
-    /* '0' */ {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E},
-    /* '1' */ {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},
-    /* '2' */ {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F},
-    /* '3' */ {0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E},
-    /* '4' */ {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02},
-    /* '5' */ {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E},
-    /* '6' */ {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E},
-    /* '7' */ {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
-    /* '8' */ {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E},
-    /* '9' */ {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C},
-    /* ':' */ {0x04, 0x04, 0, 0, 0x04, 0x04, 0},
-    /* ';' */ {0x06, 0x06, 0, 0, 0x06, 0x02, 0x04},
-    /* '<' */ {0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02},
-    /* '=' */ {0, 0, 0x1F, 0, 0x1F, 0, 0},
-    /* '>' */ {0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08},
-    /* '?' */ {0x0E, 0x11, 0x01, 0x02, 0x04, 0, 0x04},
-    /* '@' */ {0x0E, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0F},
-    /* 'A' */ {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
-    /* 'B' */ {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},
-    /* 'C' */ {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E},
-    /* 'D' */ {0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C},
-    /* 'E' */ {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},
-    /* 'F' */ {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10},
-    /* 'G' */ {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F},
-    /* 'H' */ {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
-    /* 'I' */ {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E},
-    /* 'J' */ {0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E},
-    /* 'K' */ {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11},
-    /* 'L' */ {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},
-    /* 'M' */ {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11},
-    /* 'N' */ {0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11},
-    /* 'O' */ {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
-    /* 'P' */ {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
-    /* 'Q' */ {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D},
-    /* 'R' */ {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},
-    /* 'S' */ {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E},
-    /* 'T' */ {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
-    /* 'U' */ {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
-    /* 'V' */ {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04},
-    /* 'W' */ {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A},
-    /* 'X' */ {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11},
-    /* 'Y' */ {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04},
-    /* 'Z' */ {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F},
-    /* '[' */ {0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E},
-    /* '\\' */ {0x10, 0x08, 0x08, 0x04, 0x02, 0x02, 0x01},
-    /* ']' */ {0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E},
-    /* '^' */ {0x04, 0x0A, 0x11, 0, 0, 0, 0},
-    /* '_' */ {0, 0, 0, 0, 0, 0, 0x1F},
-    /* '`' */ {0x08, 0x04, 0x02, 0, 0, 0, 0},
-    /* 'a' */ {0, 0, 0x0E, 0x01, 0x0F, 0x11, 0x0F},
-    /* 'b' */ {0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x1E},
-    /* 'c' */ {0, 0, 0x0E, 0x11, 0x10, 0x11, 0x0E},
-    /* 'd' */ {0x01, 0x01, 0x0F, 0x11, 0x11, 0x11, 0x0F},
-    /* 'e' */ {0, 0, 0x0E, 0x11, 0x1F, 0x10, 0x0E},
-    /* 'f' */ {0x06, 0x09, 0x08, 0x1C, 0x08, 0x08, 0x08},
-    /* 'g' */ {0, 0, 0x0F, 0x11, 0x11, 0x0F, 0x01},
-    /* 'h' */ {0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x11},
-    /* 'i' */ {0x04, 0, 0x0C, 0x04, 0x04, 0x04, 0x0E},
-    /* 'j' */ {0x02, 0, 0x06, 0x02, 0x02, 0x12, 0x0C},
-    /* 'k' */ {0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12},
-    /* 'l' */ {0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E},
-    /* 'm' */ {0, 0, 0x1A, 0x15, 0x15, 0x11, 0x11},
-    /* 'n' */ {0, 0, 0x1E, 0x11, 0x11, 0x11, 0x11},
-    /* 'o' */ {0, 0, 0x0E, 0x11, 0x11, 0x11, 0x0E},
-    /* 'p' */ {0, 0, 0x1E, 0x11, 0x11, 0x1E, 0x10},
-    /* 'q' */ {0, 0, 0x0F, 0x11, 0x11, 0x0F, 0x01},
-    /* 'r' */ {0, 0, 0x16, 0x19, 0x10, 0x10, 0x10},
-    /* 's' */ {0, 0, 0x0F, 0x10, 0x0E, 0x01, 0x1E},
-    /* 't' */ {0x08, 0x08, 0x1C, 0x08, 0x08, 0x09, 0x06},
-    /* 'u' */ {0, 0, 0x11, 0x11, 0x11, 0x13, 0x0D},
-    /* 'v' */ {0, 0, 0x11, 0x11, 0x11, 0x0A, 0x04},
-    /* 'w' */ {0, 0, 0x11, 0x11, 0x15, 0x15, 0x0A},
-    /* 'x' */ {0, 0, 0x11, 0x0A, 0x04, 0x0A, 0x11},
-    /* 'y' */ {0, 0, 0x11, 0x11, 0x0F, 0x01, 0x0E},
-    /* 'z' */ {0, 0, 0x1F, 0x02, 0x04, 0x08, 0x1F},
-    /* '{' */ {0x06, 0x08, 0x08, 0x10, 0x08, 0x08, 0x06},
-    /* '|' */ {0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
-    /* '}' */ {0x0C, 0x02, 0x02, 0x01, 0x02, 0x02, 0x0C},
-    /* '~' */ {0x0D, 0x16, 0, 0, 0, 0, 0},
-};
-
-#define FONT_W 5
-#define FONT_H 7
-
-static void overlay_px(u8 *rgb, u32 w, u32 h, u32 pitch, u32 x, u32 y,
-                       u8 r, u8 g, u8 b) {
-    if (x >= w || y >= h) return;
-    u8 *p = rgb + (sz_t)y * pitch + (sz_t)x * 4u;
-    p[0] = b;
-    p[1] = g;
-    p[2] = r;
-    p[3] = 0;
-}
-
-static void overlay_draw_char(u8 *rgb, u32 w, u32 h, u32 pitch, u32 x, u32 y,
-                              char c, u8 r, u8 g, u8 b) {
-    if (c < 0x20 || c > 0x7E) return;
-    const u8 *glyph = k_font[(size_t)(c - 0x20)];
-    for (int row = 0; row < FONT_H; row++) {
-        for (int col = 0; col < FONT_W; col++) {
-            if (glyph[row] & (0x10u >> col)) {       /* 2x scale */
-                overlay_px(rgb, w, h, pitch, x + col * 2u,
-                           y + (u32)row * 2u, r, g, b);
-                overlay_px(rgb, w, h, pitch, x + col * 2u + 1u,
-                           y + (u32)row * 2u, r, g, b);
-                overlay_px(rgb, w, h, pitch, x + col * 2u,
-                           y + (u32)row * 2u + 1u, r, g, b);
-                overlay_px(rgb, w, h, pitch, x + col * 2u + 1u,
-                           y + (u32)row * 2u + 1u, r, g, b);
-            }
-        }
-    }
-}
-
-static void overlay_draw_text(u8 *rgb, u32 w, u32 h, u32 pitch, u32 x, u32 y,
-                              const char *text, u8 r, u8 g, u8 b) {
-    u32 cx = x;
-    for (const char *p = text; *p; p++) {
-        overlay_draw_char(rgb, w, h, pitch, cx, y, *p, r, g, b);
-        cx += (FONT_W + 1) * 2u;
-    }
-}
-
-/* Semi-transparent dark strip behind the text for readability. */
-static void overlay_box(u8 *rgb, u32 w, u32 h, u32 pitch, u32 x, u32 y,
-                        u32 bw, u32 bh) {
-    for (u32 yy = y; yy < y + bh && yy < h; yy++) {
-        u8 *row = rgb + (sz_t)yy * pitch + (sz_t)x * 4u;
-        u32 n = (x + bw <= w) ? bw : (w - x);
-        for (u32 xx = 0; xx < n; xx++) {
-            row[xx * 4u + 0] = (u8)(row[xx * 4u + 0] / 2u);   /* darken */
-            row[xx * 4u + 1] = (u8)(row[xx * 4u + 1] / 2u);
-            row[xx * 4u + 2] = (u8)(row[xx * 4u + 2] / 2u);
-        }
-    }
-}
-
-static void draw_overlay(u8 *rgb, u32 w, u32 h, u32 pitch, i32 e2e_us,
-                         u64 decode_us, u32 one_way_us) {
-    char line[80];
-    snprintf(line, sizeof(line), "E2E %d.%dms  DEC %llu.%llums  NET %u.%uums",
-             (int)(e2e_us / 1000), (int)((e2e_us % 1000) / 100),
-             (unsigned long long)(decode_us / 1000),
-             (unsigned long long)((decode_us % 1000) / 100),
-             one_way_us / 1000u, (one_way_us % 1000u) / 100u);
-    const u32 text_h = FONT_H * 2u;
-    const u32 text_w = (u32)strlen(line) * (FONT_W + 1) * 2u;
-    overlay_box(rgb, w, h, pitch, 8, 8, text_w, text_h + 6u);
-    overlay_draw_text(rgb, w, h, pitch, 12, 12, line, 0, 255, 0);
-}
 
 /* --- Decode pipeline (producer/consumer) ---------------------------
  * The main loop assembles frames (producer); a decode thread decodes +
@@ -877,10 +703,6 @@ static void *decode_worker(void *arg) {
                                                g_pending_pitch,
                                                g_drm.w, g_drm.h);
                     }
-                    if (g_hud)
-                        draw_overlay((u8 *)g_pending_map, g_drm.w, g_drm.h,
-                                     g_pending_pitch, e2e, decode_us,
-                                     g_one_way_us);
 
                     if (g_have_offset) {
                         const u64 t_handoff = vmc_time_now_us();
@@ -922,9 +744,6 @@ static void *decode_worker(void *arg) {
                 continue;
             }
 #endif
-            if (g_hud)
-                draw_overlay((u8 *)f.planes[0], f.width, f.height,
-                             f.stride[0], e2e, decode_us, g_one_way_us);
             if (g_have_offset) {
                 const u64 t_handoff = vmc_time_now_us();
                 e2e = (i32)((u32)t_handoff - real_send_ts - g_offset_us);
@@ -2487,7 +2306,11 @@ static void *dash_reader_direct(void *arg) {
 
             /* Fetch audio segments to fill the same window. The first loop
              * bursts the whole window into the FIFO (that is the audio prefill);
-             * after that, one new segment per reader loop keeps it topped up.
+             * after that, every reader loop refills the window to the live edge
+             * (audio_target) — no per-loop cap, because the reader loop is
+             * paced by the (slower) video publish path and a one-segment cap
+             * starves the FIFO whenever the loop takes longer than a second
+             * (audible dropouts). The window bound naturally limits the burst.
              * Never fetch a segment older than one already delivered — inserting
              * old PCM after newer would replay audio out of order.
              *
@@ -2556,7 +2379,6 @@ static void *dash_reader_direct(void *arg) {
                         break;
                     }
                     at++;
-                    if (g_prefetch_done >= 3) break;
                 }
             }
             const u64 t1_audio = vmc_time_now_wall_us();
@@ -2588,6 +2410,40 @@ static void *dash_reader_direct(void *arg) {
             if (vn < (int)m.start_number) {
                 last_vnum = (int)m.start_number - 1;
                 vn = (int)m.start_number;
+            }
+            /* Server restart / timeline reset: the dash-sim exits the encoder
+             * at the end of the file and respawns it after a 5 s gap, so the
+             * new session restarts segment numbering at startNumber and the
+             * live edge drops far behind what we had already fetched. If the
+             * edge is behind our high-water mark, drop it and re-anchor on the
+             * fresh session instead of waiting forever for the edge to climb
+             * back to the old position. */
+            if (last_vnum >= 0 && vfetch_hi < last_vnum) {
+                VMC_LOGW("dash: live edge reset (fetched to seg %d, new edge "
+                         "%d); re-anchoring",
+                         last_vnum, vfetch_hi);
+                last_vnum = -1;
+                g_anchor_wall_us = 0;
+                g_anchor_seg = 0;
+                /* The new session's content starts from the beginning again;
+                 * drop the stale audio so we do not replay the old session,
+                 * and zero the audio clock so the audio worker re-anchors it to
+                 * NOW — otherwise the video timeline re-anchors to the old
+                 * audio-start wall time and A/V skews by the whole session
+                 * length. */
+#ifdef VMC_HAVE_ALSA
+                pthread_mutex_lock(&g_audio_mu);
+                vmc_ringbuf_reset(&g_audio_rb);
+                pthread_cond_signal(&g_audio_cv);
+                pthread_mutex_unlock(&g_audio_mu);
+#ifdef VMC_DEBUG
+                g_audio_pcm_bytes = 0;
+#endif
+#endif /* VMC_HAVE_ALSA */
+                g_audio_start_wall_us = 0;
+                g_audio_delay_us = 0;
+                last_anum = -1;
+                vn = (last_vnum < 0) ? video_target : (last_vnum + 1);
             }
             while (g_run && vn <= vfetch_hi) {
                 snprintf(seg_url, sizeof(seg_url),
@@ -2716,7 +2572,6 @@ static void *dash_reader_direct(void *arg) {
 static int run_dash(const char *url, vmc_log_level log_level) {
     vmc_log_set_level(log_level);
     VMC_LOGI("VMC DASH client %s starting (%s)", VMC_VERSION, url);
-    g_hud = getenv("VMC_HUD") && getenv("VMC_HUD")[0] == '1';
 
     vmc_fb_display fbdisp;
     u8 *frame_rgb = NULL;

@@ -124,9 +124,8 @@ path, set `VMC_DRM=1`:
 VMC_DRM=1 ./build/vmc-thinclient-app 192.168.0.126 9999 1
 ```
 
-An optional green on-screen overlay in the top-left shows live E2E / DEC / NET
-latency; it is **off by default** and enabled with `VMC_HUD=1`. Full stats +
-p95 are always logged every 5 s.
+Full stats + p95 are always logged every 5 s (no on-screen overlay; the HUD
+was removed).
 
 **3. As persistent services** (systemd, on the client):
 
@@ -271,11 +270,12 @@ The DASH path is tuned for a stable 24 fps A/V presentation at the live edge:
   that reset the timeline). Because the anchor is kept fixed on the audio-master
   clock, normal +1 progression never re-anchors (the old code re-anchored on
   every catch-up burst, which jumped the picture back ~10 s at a time). The
-  lavfi encoder source uses `movie=file:loop=0,setpts=N/(fps*TB)` to loop
-  indefinitely without restarts, and the dash-sim watchdog guards against
-  unsigned underflow that used to trigger spurious restarts. On a watchdog
-  encoder restart the server pauses 5 s (clean-session gap) so each recorded
-  session is clearly separated.
+  encoder loops the file seamlessly (`movie/amovie=…:loop=0` with continuous
+  `setpts`), so there is no per-loop restart or pause; should the watchdog ever
+  restart a crashed/stalled encoder, the client detects the timeline reset, drops
+  its segment high-water marks, flushes the audio FIFO, and re-anchors both the
+  audio and video clocks to NOW. The dash-sim watchdog guards against unsigned
+  underflow that used to trigger spurious restarts.
 
 All jitter instrumentation is compiled only when the CMake option `VMC_DEBUG`
 is ON, and is preserved in the source under `#ifdef VMC_DEBUG` blocks. A debug
@@ -663,10 +663,10 @@ pixels). The decoder test requires FFmpeg dev headers.
   `hrtimer_nanosleep`; the lavfi `movie/amovie + loop + setpts` pacing was exact
   but the separate `loop=loop=0:size=N` filter exits at the end of the file on
   FFmpeg 4.x, forcing a restart every file length (~60 s for the demo clip).
-  The dash-sim now uses `movie=file:loop=0,setpts=N/(fps*TB)` (and
-  `amovie=…:loop=0`), which loops indefinitely with no restarts, and the
-  encoder watchdog's stall check guards against unsigned underflow so it never
-  spuriously restarts a healthy encoder.
+  The dash-sim therefore uses `movie=file:loop=0,setpts=N/(fps*TB)` (and
+  `amovie=…:loop=0`) to loop the file seamlessly — continuous playback with no
+  per-loop restart or pause. The watchdog's stall check guards against unsigned
+  underflow so it never spuriously restarts a healthy encoder.
 - **Overnight jitter root cause** (debugged): the encoder froze for ~5 h while
   the client limped on a stale segment window at ~12 fps and the audio underran
   (ALSA XRUN). The lavfi loop fix + watchdog guards above prevent the permanent
@@ -724,16 +724,20 @@ pixels). The decoder test requires FFmpeg dev headers.
       dynamic live-buffer (steady/max), per-segment frame indexing,
       audio-master A/V lock, separate DRM present worker, DRM flip fixes,
       single-threaded DRM event handling, manual rate-stretch servo, 8 MiB audio
-      FIFO, `movie=:loop=0` endless encoder loop, watchdog underflow guard,
-      optional `VMC_HUD=1` latency overlay
+      FIFO, watchdog underflow guard, seamless `movie=:loop=0` encoder loop
 - [x] DASH end-to-end fixes: fix live-edge overshoot (was ~100 segments ahead,
       every fetch 404'd), fix DRM present-event deadlock (decode worker no longer
       reads DRM events → flips/presentation froze), fix resync churn (anchor no
       longer jumps on catch-up bursts → A/V skew was −342 s), clamp audio/video
       fetch to the server's rolling `startNumber` (was stuck retrying deleted
-      segments for 15 s per loop → permanent audio silence), 5 s clean-session
-      gap on server encoder restart. Verified end-to-end on `ai2`: `fail=0
-      drop=0 xrun=0 av-offset≈0`, 24 fps DRM presentation + HDMI audio.
+      segments for 15 s per loop → permanent audio silence), audio FIFO kept
+      filled to the live edge each loop (removed the per-loop one-segment cap
+      that starved the FIFO whenever the video-paced reader loop ran longer than
+      a second → audible dropouts), seamless continuous looping (no per-loop
+      pause), restart-safe reader (re-anchors A/V clocks to NOW if the watchdog
+      ever respawns a crashed encoder), remove the on-screen latency overlay
+      (HUD). Verified end-to-end on `ai2`: `fail=0 xrun=0 pad=0 av-offset≈0`,
+      24 fps DRM presentation + HDMI audio, audio FIFO stable, no restart gaps.
 - [x] DRM prime-fd export and CUDA import/pin attempts
 - [x] SSE streaming-store CPU copy fallback for DRM scanout
 - [ ] DASH ABR (multi-representation MPD → the demuxer picks bitrate)
