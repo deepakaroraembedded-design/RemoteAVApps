@@ -8,6 +8,18 @@ project(vmc_thin_client
 
 set(VMC_THINCLIENT_VERSION ${PROJECT_VERSION})
 
+# Short git commit id for the telemetry identity field (no-op if not a repo).
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE VMC_GIT_SHA
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT VMC_GIT_SHA)
+    set(VMC_GIT_SHA "unknown")
+endif()
+
 option(VMC_ENABLE_TESTS "Build unit tests" ON)
 option(VMC_ENABLE_SANITIZERS "Build with ASan/UBSan" OFF)
 option(VMC_DEBUG "DASH jitter instrumentation" OFF)
@@ -35,6 +47,7 @@ set(VMC_CORE_SOURCES
     src/core/logger.c
     src/core/ringbuf.c
     src/core/platform.c
+    src/core/telemetry.c
     src/session/state.c
     src/session/session.c
     src/session/mapper.c
@@ -95,11 +108,14 @@ else()
 endif()
 
 add_library(vmc_thinclient STATIC ${VMC_CORE_SOURCES})
+find_package(Threads REQUIRED)
+target_link_libraries(vmc_thinclient PUBLIC Threads::Threads)
 target_include_directories(vmc_thinclient PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 target_compile_definitions(vmc_thinclient PUBLIC VMC_VERSION="${VMC_THINCLIENT_VERSION}")
+target_compile_definitions(vmc_thinclient PUBLIC VMC_GIT_SHA="${VMC_GIT_SHA}")
 if(VMC_FFMPEG_FOUND)
     target_include_directories(vmc_thinclient PRIVATE ${VMC_FFMPEG_INCLUDE_DIR})
     target_compile_definitions(vmc_thinclient PUBLIC VMC_HAVE_FFMPEG=1)

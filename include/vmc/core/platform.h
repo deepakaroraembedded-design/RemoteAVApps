@@ -19,6 +19,10 @@ vmc_time_us vmc_time_now_us(void);
 /* Monotonic time in milliseconds. */
 u64 vmc_time_now_ms(void);
 
+/* Wall-clock (CLOCK_REALTIME) time in microseconds. Used only where the
+ * monotonic timeline must be aligned to realtime (DASH deadlines, telemetry). */
+u64 vmc_time_wall_us(void);
+
 /* Busy/thread sleep in milliseconds (0 on bare-metal = yield to scheduler). */
 void vmc_sleep_ms(u32 ms);
 

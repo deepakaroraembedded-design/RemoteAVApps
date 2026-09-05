@@ -13,6 +13,12 @@ vmc_time_us vmc_time_now_us(void) {
     return (vmc_time_us)ts.tv_sec * 1000000u + (vmc_time_us)(ts.tv_nsec / 1000);
 }
 
+u64 vmc_time_wall_us(void) {
+    struct timespec ts;
+    (void)clock_gettime(CLOCK_REALTIME, &ts);
+    return (u64)ts.tv_sec * 1000000u + (u64)(ts.tv_nsec / 1000);
+}
+
 u64 vmc_time_now_ms(void) {
     return vmc_time_now_us() / 1000u;
 }
