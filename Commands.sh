@@ -11,7 +11,8 @@
 # ============================================================
 set -u
 
-INPUT=/home/deepak7121/FLUX3/1225am0807/swiftrade_av_60s_20260807_110902.mp4
+# Override with: INPUT=/path/to/file.mp4 ./Commands.sh start_server
+INPUT=${INPUT:-./4K/Earth.mp4}
 
 # ============================================================
 # 0. CLEANUP (run before starting, on each machine)
@@ -66,7 +67,28 @@ start_client() {
 }
 
 # ============================================================
-# 3. STOP (run on each machine when done)
+# 3. STOP — server only (on 192.168.0.126)
+# ============================================================
+stop_server() {
+    pkill -9 -x vmc-dash-sim 2>/dev/null
+    pkill -9 -x ffmpeg 2>/dev/null
+    pkill -9 -f 'h264_nvenc' 2>/dev/null
+    sleep 1
+    ss -tlnp | grep 8080 || echo "port 8080 free"
+}
+
+# ============================================================
+# 4. RESTART CLIENT — kill stale instance, then relaunch
+#    (an old leftover client holds the HDMI PCM; kill before relaunch)
+# ============================================================
+restart_client() {
+    pkill -9 -x vmc-thinclient-app 2>/dev/null
+    sleep 2
+    start_client
+}
+
+# ============================================================
+# 5. STOP (run on each machine when done)
 # ============================================================
 stop() {
     pkill -9 -x vmc-dash-sim 2>/dev/null
@@ -78,7 +100,7 @@ stop() {
 }
 
 # ============================================================
-# 4. HEALTH (on the client)
+# 6. HEALTH (on the client)
 # ============================================================
 health() {
     echo "==> client stats (last 3):"
@@ -90,9 +112,13 @@ health() {
 
 usage() {
     cat <<EOF
-usage: $0 {cleanup|start_server|start_client|stop|health}
-  start_server   on 192.168.0.126
-  start_client   on 192.168.0.145
+usage: $0 {cleanup|start_server|start_client|restart_client|stop_server|stop|health}
+  start_server    on 192.168.0.126  (INPUT env var overrides the default file)
+  stop_server     on 192.168.0.126
+  start_client    on 192.168.0.145
+  restart_client  on 192.168.0.145  (kills stale client, then relaunches)
+  stop            on either machine (all vmc processes)
+  health          on 192.168.0.145
 EOF
 }
 
@@ -100,6 +126,8 @@ case "${1:-}" in
     cleanup)       cleanup ;;
     start_server)  start_server ;;
     start_client)  start_client ;;
+    restart_client) restart_client ;;
+    stop_server)   stop_server ;;
     stop)          stop ;;
     health)        health ;;
     *)             usage ;;
