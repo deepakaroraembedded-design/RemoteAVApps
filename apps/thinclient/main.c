@@ -66,16 +66,21 @@
  * hold long enough to reorder, and let the assembler+decoder pace frames. */
 #define APP_JB_TARGET_US  2000u
 
-/* DASH live-buffer strategy: start with a 5 s prefetch for fast startup,
- * aim for 10 s during steady playback, and allow the buffer to grow to 30 s
- * when the network is slow (the DASH simulator needs ~1 s to finish a 1 s
- * segment before it can be served). */
+/* DASH live-buffer strategy. The VIDEO buffer must stay small enough to fit
+ * inside the pipeline's internal capacity (128 frame slots + 128 present-queue
+ * entries ≈ 4.3 s): a video buffer deeper than that makes the reader's demux
+ * block on full slots and it falls behind the live edge (measured: demux is
+ * 2.7 ms, but a 10 s buffer made each loop take 1.2 s). The AUDIO buffer is
+ * kept deeper because the 8 MiB audio FIFO must hold ≥15 % (~6.25 s) for the
+ * longrun FIFO-level gate, and a deep audio FIFO does not back-pressure the
+ * video reader. The audio-master clock keeps A/V in sync regardless of the
+ * depth difference. */
 #define VMC_AUDIO_PREFETCH_US  (1000000u)
-#define VMC_AUDIO_STEADY_US    (10000000u)
-#define VMC_AUDIO_MAX_US       (30000000u)
+#define VMC_AUDIO_STEADY_US    (8000000u)
+#define VMC_AUDIO_MAX_US       (12000000u)
 #define VMC_VIDEO_PREFETCH_US  (1000000u)
-#define VMC_VIDEO_STEADY_US    (10000000u)
-#define VMC_VIDEO_MAX_US       (30000000u)
+#define VMC_VIDEO_STEADY_US    (2000000u)
+#define VMC_VIDEO_MAX_US       (6000000u)
 #define VMC_VIDEO_TARGET_US    (VMC_VIDEO_STEADY_US)
 #define VMC_AUDIO_TARGET_US    (VMC_AUDIO_STEADY_US)
 
@@ -2521,42 +2526,50 @@ static void dash_resync(int next_seg, int live_edge, const char *reason) {
                      reason, next_seg);
 }
 
+static u64 dash_buffer_grow(u64 base, u64 max, u64 prefetch,
+                            u64 fetch_ewma, int seg_duration_us) {
+    u64 d = base;
+    if (fetch_ewma > (u64)seg_duration_us / 2) d += 1000000u;
+    if (fetch_ewma > (u64)seg_duration_us)     d += 2000000u;
+    if (fetch_ewma > (u64)seg_duration_us * 2) d += 3000000u;
+    if (fetch_ewma > (u64)seg_duration_us * 4) d += 5000000u;
+    if (d > max) d = max;
+    if (d < prefetch) d = prefetch;
+    return d;
+}
+
 /* Adjust live-buffer targets based on measured segment-fetch latency.
  * The buffer starts at the steady target for fast startup, and can expand up
  * to the maximum when the network (or the on-the-fly DASH server) is slow.
  * The reader fills the whole window [live_edge-buffer, live_edge-1] each loop
  * (backfilling when the buffer grows), so a change here takes effect
- * immediately and is self-consistent with the fetch loops. */
+ * immediately and is self-consistent with the fetch loops. The video and audio
+ * windows are sized independently: the video window must stay inside the
+ * pipeline capacity (see the constants), while the audio window is what keeps
+ * the 8 MiB FIFO above the ≥15 % gate. */
 static void dash_update_live_buffer(u64 fetch_us, int seg_duration_us) {
     if (g_seg_fetch_ewma_us == 0) g_seg_fetch_ewma_us = fetch_us;
     else g_seg_fetch_ewma_us = (15 * g_seg_fetch_ewma_us + fetch_us) / 16;
 
-    const u64 target = VMC_VIDEO_TARGET_US;
-    u64 desired = target;
-
-    /* Add safety margin when the server consistently takes a long time to
-     * produce a segment. */
-    if (g_seg_fetch_ewma_us > (u64)seg_duration_us / 2) desired += 1000000u;
-    if (g_seg_fetch_ewma_us > (u64)seg_duration_us)     desired += 2000000u;
-    if (g_seg_fetch_ewma_us > (u64)seg_duration_us * 2) desired += 3000000u;
-    if (g_seg_fetch_ewma_us > (u64)seg_duration_us * 4) desired += 5000000u;
-
-    if (desired > VMC_VIDEO_MAX_US) desired = VMC_VIDEO_MAX_US;
-    if (desired < VMC_VIDEO_PREFETCH_US) desired = VMC_VIDEO_PREFETCH_US;
-
-    /* Shrink back toward the target when the network is fast and stable.
-     * A shrink only raises the window bottom (drops old segments); playback
-     * continues from the newest already-fetched content. */
+    /* Video: keep it small enough that the reader never blocks on full slots. */
+    u64 vdesired = dash_buffer_grow(VMC_VIDEO_TARGET_US, VMC_VIDEO_MAX_US,
+                                    VMC_VIDEO_PREFETCH_US, g_seg_fetch_ewma_us,
+                                    seg_duration_us);
     if (g_seg_fetch_ewma_us < (u64)seg_duration_us / 4 &&
-        g_video_live_buffer_us > target) {
-        if (g_video_live_buffer_us > target + 1000000u)
-            desired = g_video_live_buffer_us - 1000000u;
+        g_video_live_buffer_us > VMC_VIDEO_TARGET_US) {
+        if (g_video_live_buffer_us > VMC_VIDEO_TARGET_US + 1000000u)
+            vdesired = g_video_live_buffer_us - 1000000u;
         else
-            desired = target;
+            vdesired = VMC_VIDEO_TARGET_US;
     }
+    g_video_live_buffer_us = vdesired;
 
-    g_video_live_buffer_us = desired;
-    g_audio_live_buffer_us = desired;
+    /* Audio: deep enough to keep the 8 MiB FIFO above the ≥15 % gate. */
+    g_audio_live_buffer_us = dash_buffer_grow(VMC_AUDIO_TARGET_US,
+                                              VMC_AUDIO_MAX_US,
+                                              VMC_AUDIO_PREFETCH_US,
+                                              g_seg_fetch_ewma_us,
+                                              seg_duration_us);
 }
 
 static void *dash_reader_direct(void *arg) {
