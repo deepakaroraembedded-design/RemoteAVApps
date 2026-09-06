@@ -46,6 +46,18 @@ Discovery: the drift is 2.7% of flips taking 2 vblanks (consecutive 30fps
 phases), each adding a permanent 16.7ms of lateness. Present-queue bounding made
 it worse (decode gated to 58fps); a timeline servo could not converge.
 
+## iter-007  2026-09-06T18:24Z  tier=smoke (fb0 cadence attempt)
+hypothesis: the fb0 bursty cadence (65% of intervals at 2ms, p95 err 56ms)
+         comes from presenting back-to-back when deadlines are in the past;
+         pacing to max(deadline, last_present + frame_period) should smooth it.
+result:    REVERTED. The pacing stalled the decode worker to 4fps: the 
+         frame-period target coupled with the reader/decode feedback starved the
+         reader (4s/segment) and the audio (FIFO 0, XRUNs). The clock-domain
+         variant (audio-clock tracker) did not help. fb0 restored to the
+         iter-006 state (60fps, -3ms/min drift, bursty cadence). The cadence
+         smoothness on fb0 remains an open item; the DRM phase-lock fix (iter-005)
+         remains the significant win.
+
 ## iter-006  2026-09-06T18:09Z  commit 652fa18  tier=smoke (framebuffer cell, VMC_DRM=0)
 CONFIRMATION: the framebuffer path sustains a PERFECT 60.0fps with essentially
 NO drift — av_offset drift -3.09ms/min (DRM path: -211ms/min), frames_presented
