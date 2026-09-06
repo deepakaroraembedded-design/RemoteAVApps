@@ -17,51 +17,42 @@ server-live detection switched from startNumber (never advances with this
 muxer) to publishTime. Relaunch verified clean-slate end-to-end (server live +
 first vrender on the client within 20 s). selftest_synth 22/22 (fast + full).
 
-## iter-001  2026-09-06T14:05Z  commit e4e00b2  tier=smoke
-verdict: FAIL   primary_fault: cadence (worst symptom)   streak: 0
-buckets: 0/3 pass   worst_bucket: 1
-run:     frames_presented=1794/bucket (yield 0.498)  interval_p95_err=16.83ms
-         vsync_miss=1794/bucket  audio_fifo_underflows 4431/9184/3715
-         av_offset_mean -35.8s → -96.1s (growing)  present_delay mean 39→99s
-evidence: vrender submit spacing = 33.4ms exactly (2 vblanks); decode timing
-         "async=33.7ms" is actually the DRM-buffer wait (buffers free only at
-         30/s); reader loop vfetch doubles 2.4s→38s (exponential live-edge loss).
-         Fetch RTT 6ms, fetch total ~200ms, conv_async bench = 6us — network and
-         conversion are NOT the fault. The 30fps presentation is.
-hypothesis: the present worker presents immediately (deadlines 20s+ in the past
-         once the backlog forms), so every flip submission lands while the
-         previous flip is still pending (EBUSY). The EBUSY path calls
-         wait_flip(20) = drain_events(20), which double-polls the DRM fd (a
-         second full 20ms timeout after handling events), locking submission
-         spacing at ~33ms → 30fps flips. The 5-buffer pool then frees at 30/s →
-         decode 30fps → reader backs up exponentially → audio FIFO underflows
-         and A/V offset grows without bound.
-prediction: fixing the present path (never submit while a flip is pending:
-         wait for the completion first; make drain_events single-pass with a
-         shared deadline, no 20ms tail) restores one flip per vblank → frame_yield
-         ≥0.995 and interval_err ≤1.7ms, which unblocks the DRM pool → decode 60fps
-         → reader catches up → audio_fifo_underflows→0, av_offset bounded
-         (|mean|≤10ms), present_delay growth→≤10ms/min.
-## iter-001b  2026-09-06T14:24Z  commit <pending>  tier=smoke
-First fix attempt deadlocked: adding a "wait for the previous flip to complete"
-gate in the present worker made the LAST submitted flip's completion event never
-arrive (present worker stuck in wait_flip, decode starved for buffers, reader
-blocked on slots — full pipeline freeze, 11 vrenders in 185 s). Reverted the
-present-worker gate; kept ONLY the drain_events single-pass fix (removes the
-20 ms double-poll tail from the EBUSY path). Liveness restored (~49 fps during
-the first 35 s with residual drm_pool warnings).
-## iter-001c  2026-09-06T14:39Z  commit <pending>  tier=liveness
-ROOT CAUSE FOUND (units bug): the serialization wait passed vblank_period_us
-(16666 MICROseconds) as a MILLISECOND timeout to wait_flip, so every
-"wait for the previous flip" blocked for 16.6 SECONDS — which masqueraded as a
-deadlock in iter-001b. A raw DRM flip probe on the client proved the driver
-delivers every completion event when flips are serialized (60/60). Fix:
-serialize flips inside vmc_drm_scanout_present (never submit while one is
-pending), wait in vblank-sized ms chunks, force-resync the CRTC only if a flip
-is genuinely stuck >1.5 s, and map events to buffers via a FIFO so a lost
-event cannot desync the busy/on-screen accounting. Liveness: 59 vrenders/s,
-0 force-resyncs, 992 residual drm_pool warnings.
-result:      (filled by the next smoke report)
+## iter-001  2026-09-06T14:40Z  commit 6108d39  tier=smoke (cadence class)
+verdict: FAIL (cadence now PASS)   primary_fault: buffers   streak: 0
+buckets: 0/3 pass   worst_bucket: 0
+run:     frames_presented=3584/bucket (yield 0.9955)  interval_p95_err=0.17ms
+         frames_dropped=0  drm_pool_exhausted=0  vsync_miss=3584 (downstream)
+         av_offset_mean -1213 → -1767ms (growing)  audio_fifo_underflows 2098/bucket
+         audio_fifo_level=0 (pure silence)  present_delay 4.85 → 5.56s (growing)
+evidence: video cadence fixed (was 0.5 yield). Remaining fault is delivery rate:
+         video fetch=184ms but reader loop=1.2s (vfetch=870ms = demux blocking on
+         full frame slots behind the ~5s startup backlog). Reader produces 0.83
+         video + 0.83 audio seg/s vs the 1.0/s the sink needs → audio FIFO drains
+         to 0 → silence → wall-derived audio_pos runs ahead of video → av_offset
+         grows ~280ms/min (all downstream of the audio underflow).
+journey:  First hypothesis (EBUSY→wait_flip double-poll locking flips at 2 vblanks)
+         was correct in spirit but the first two fix attempts were wrong:
+         (a) a "wait for the previous flip" gate deadlocked the DRM pool; (b) the
+         drain_events single-pass fix alone gave only 50fps. ROOT CAUSE was a
+         units bug: the serialization wait passed vblank_period_us (µs) as a ms
+         timeout → every wait blocked 16.6 SECONDS. A raw DRM flip probe on the
+         client proved the driver delivers 60/60 events when flips are
+         serialized. Final fix: serialize flips inside vmc_drm_scanout_present,
+         vblank-sized waits, FIFO event→buffer mapping, CRTC force-resync on
+         genuinely lost events.
+result:    cadence/DRM class CLOSED. Next: reader delivery (buffers class).
 
-
-
+## iter-002  2026-09-06T14:45Z  commit <pending>  tier=smoke
+hypothesis: the reader's delivery rate caps at ~0.83 seg/s because the 10 s
+         live-buffer window burst at startup fills the 256-frame pipeline
+         (128 slots + 128 present queue = ~4.3 s), so each video demux blocks
+         ~870 ms on full slots. That throttles audio to 0.83 seg/s while the
+         sink consumes 1.0/s → FIFO drains to 0 → silence → wall-derived
+         audio_pos runs ahead of video → av_offset grows ~280 ms/min.
+prediction: shrinking the live buffer to a sustainable depth (10 s → 2 s steady,
+         30 s → 6 s max) lets the reader burst a segment without blocking: loop
+         → ~1.0 s, audio delivery = 1.0 seg/s → FIFO stays filled, av_offset
+         bounded, present_delay stable at ~2 s, no growth.
+change:      apps/thinclient/main.c — VMC_VIDEO_STEADY_US/VMC_AUDIO_STEADY_US
+             10 s → 2 s; VMC_VIDEO_MAX_US/VMC_AUDIO_MAX_US 30 s → 6 s.
+result:      (filled by iter-002's smoke report)
