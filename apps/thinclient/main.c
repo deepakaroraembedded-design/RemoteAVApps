@@ -79,7 +79,12 @@
 #define VMC_AUDIO_STEADY_US    (2000000u)
 #define VMC_AUDIO_MAX_US       (3000000u)
 #define VMC_VIDEO_PREFETCH_US  (1000000u)
-#define VMC_VIDEO_STEADY_US    (1000000u)
+/* Video buffer is matched to the audio buffer (2 s): the reader delivers video
+ * content at the same live-edge lag as audio, so the audio-master deadlines
+ * align with the delivered content and the video presents AT its deadline
+ * (av_offset ≈ 0). Unequal buffers made the video present its content after
+ * the audio had already played it (av_offset ≈ −1.3 s). */
+#define VMC_VIDEO_STEADY_US    (2000000u)
 #define VMC_VIDEO_MAX_US       (3000000u)
 #define VMC_VIDEO_TARGET_US    (VMC_VIDEO_STEADY_US)
 #define VMC_AUDIO_TARGET_US    (VMC_AUDIO_STEADY_US)
