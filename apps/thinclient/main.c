@@ -79,8 +79,8 @@
 #define VMC_AUDIO_STEADY_US    (8000000u)
 #define VMC_AUDIO_MAX_US       (12000000u)
 #define VMC_VIDEO_PREFETCH_US  (1000000u)
-#define VMC_VIDEO_STEADY_US    (2000000u)
-#define VMC_VIDEO_MAX_US       (6000000u)
+#define VMC_VIDEO_STEADY_US    (1000000u)
+#define VMC_VIDEO_MAX_US       (3000000u)
 #define VMC_VIDEO_TARGET_US    (VMC_VIDEO_STEADY_US)
 #define VMC_AUDIO_TARGET_US    (VMC_AUDIO_STEADY_US)
 
@@ -440,7 +440,12 @@ static void latency_report(void) {
 /* --- Decode pipeline (producer/consumer) ---------------------------
  * The main loop assembles frames (producer); a decode thread decodes +
  * presents them so receive never blocks on the slow decode/swscale step. */
-#define VMC_FRAME_SLOTS 128
+/* 512 slots × 512 KB (VMC_VIDEO_AU_MAX) = 256 MB static. Sized so the reader
+ * can burst a full 1 s segment (60 frames) plus the ~2 s undecoded backlog
+ * WITHOUT ever blocking on slot_take_write: a 128-slot pool stayed full (the
+ * decode drains slots at exactly 60/s) and the reader's demux stalled ~17 ms
+ * per frame, throttling the whole loop to 1.2 s and starving the audio FIFO. */
+#define VMC_FRAME_SLOTS 512
 
 enum { SLOT_FREE = 0, SLOT_READY = 1, SLOT_DECODING = 2, SLOT_WRITING = 3 };
 
@@ -473,14 +478,32 @@ static volatile bool g_run_decode = true;
 /* Returns an index of a free slot (waits), marks it WRITING. */
 static int slot_take_write(void) {
     pthread_mutex_lock(&g_fmu);
+#ifdef VMC_DEBUG
+    u64 wait_start = vmc_time_now_us();
+    bool blocked = false;
+#endif
     while (1) {
         for (int i = 0; i < VMC_FRAME_SLOTS; i++) {
             if (g_frames[i].state == SLOT_FREE) {
                 g_frames[i].state = SLOT_WRITING;
+#ifdef VMC_DEBUG
+                if (blocked) {
+                    static u64 g_slot_wait_us_sum, g_slot_wait_count;
+                    g_slot_wait_us_sum += vmc_time_now_us() - wait_start;
+                    g_slot_wait_count++;
+                    if ((g_slot_wait_count % 60) == 0)
+                        VMC_LOGI("reader slot wait: avg=%llu us over %llu blocks",
+                                 (unsigned long long)(g_slot_wait_us_sum / g_slot_wait_count),
+                                 (unsigned long long)g_slot_wait_count);
+                }
+#endif
                 pthread_mutex_unlock(&g_fmu);
                 return i;
             }
         }
+#ifdef VMC_DEBUG
+        blocked = true;
+#endif
         pthread_cond_wait(&g_ffree, &g_fmu);
     }
 }
@@ -913,6 +936,19 @@ static void *decode_worker(void *arg) {
                         g_vmeta[g_pending_buf_idx].conv_us = conv_us;
                     }
 
+                    /* Capture this frame's content identity, then release the
+                     * frame slot BEFORE the (potentially blocking) present_push:
+                     * when the present queue is full, the decode worker must
+                     * not hold its slot while blocked, or the free-slot pool
+                     * shrinks to nothing and the reader's demux stalls on
+                     * slot_take_write (measured: 950 ms/segment → 0.83 seg/s,
+                     * starving the audio FIFO). */
+                    g_pending_fidx = g_frames[idx].fidx;
+                    g_pending_seg = g_frames[idx].seg;
+                    g_pending_pts = g_frames[idx].pts_us;
+                    g_pending_decode_us = decode_us;
+                    slot_release(idx);
+
                     present_push(g_pending_buf_idx, g_pending_deadline_us);
                     if (!g_first_video_ready) g_first_video_ready = true;
                     const u64 t_after_push = vmc_time_now_us();
@@ -940,11 +976,6 @@ static void *decode_worker(void *arg) {
                 g_pending_map = dumb;
                 g_pending_pitch = g_drm.bufs[buf_idx].pitch;
                 g_pending_deadline_us = deadline_us;
-                g_pending_fidx = g_frames[idx].fidx;
-                g_pending_seg = g_frames[idx].seg;
-                g_pending_pts = g_frames[idx].pts_us;
-                g_pending_decode_us = decode_us;
-                slot_release(idx);
                 continue;
             }
 #endif

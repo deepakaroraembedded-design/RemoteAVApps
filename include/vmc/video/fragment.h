@@ -24,8 +24,11 @@ VMC_BEGIN_DECLS
 #define VMC_VIDEO_FRAG_CHUNK    1400u
 #define VMC_VIDEO_FRAG_LAST     0x8000u
 #define VMC_VIDEO_FRAG_INDEX_MASK 0x7FFFu
-/* Large enough for a high-bitrate 4K keyframe. */
-#define VMC_VIDEO_AU_MAX        (2u * 1024u * 1024u)
+/* Large enough for a high-bitrate 1080p keyframe (~94 KB measured on the
+ * sourced clip; 512 KB gives 5x headroom). Kept at 512 KB rather than 2 MB so
+ * the DASH frame-slot pool (VMC_FRAME_SLOTS) can be large (512 slots = the
+ * same 256 MB static RSS) without the reader blocking on full slots. */
+#define VMC_VIDEO_AU_MAX        (512u * 1024u)
 
 /* Serialize/parse the 4-byte fragment header. */
 void vmc_video_frag_hdr_pack(u8 *out, u16 frame_id, u16 frag_index);
