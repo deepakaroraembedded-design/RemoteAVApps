@@ -1,0 +1,10 @@
+state: RUNNING
+owner_pid   : 1665954
+trigger_time: 325727.812160626
+tstamp      : 0.000000000
+delay       : 10317
+avail       : 1683
+avail_max   : 13579
+-----
+hw_ptr      : 157706
+appl_ptr    : 168023

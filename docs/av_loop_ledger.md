@@ -42,17 +42,35 @@ journey:  First hypothesis (EBUSY→wait_flip double-poll locking flips at 2 vbl
          genuinely lost events.
 result:    cadence/DRM class CLOSED. Next: reader delivery (buffers class).
 
-## iter-002  2026-09-06T14:45Z  commit <pending>  tier=smoke
-hypothesis: the reader's delivery rate caps at ~0.83 seg/s because the 10 s
-         live-buffer window burst at startup fills the 256-frame pipeline
-         (128 slots + 128 present queue = ~4.3 s), so each video demux blocks
-         ~870 ms on full slots. That throttles audio to 0.83 seg/s while the
-         sink consumes 1.0/s → FIFO drains to 0 → silence → wall-derived
-         audio_pos runs ahead of video → av_offset grows ~280 ms/min.
-prediction: shrinking the live buffer to a sustainable depth (10 s → 2 s steady,
-         30 s → 6 s max) lets the reader burst a segment without blocking: loop
-         → ~1.0 s, audio delivery = 1.0 seg/s → FIFO stays filled, av_offset
-         bounded, present_delay stable at ~2 s, no growth.
-change:      apps/thinclient/main.c — VMC_VIDEO_STEADY_US/VMC_AUDIO_STEADY_US
-             10 s → 2 s; VMC_VIDEO_MAX_US/VMC_AUDIO_MAX_US 30 s → 6 s.
-result:      (filled by iter-002's smoke report)
+## iter-002  2026-09-06T15:50Z  commit <pending>  tier=smoke (buffers class)
+verdict: FAIL   primary_fault: av_sync (buffers improved 12x)   streak: 0
+buckets: 0/3 pass   worst_bucket: 0
+run:     audio_fifo_underflows 34/103/107 (was 2050)  audio_pad 3.5k/11k (was 485k)
+         audio_period_deviation 0.009 (was 3.6 — config synced to 48k/240)
+         frames_presented 3585 (yield 0.9944)  frame_interval_p95_err 0.13ms
+         av_offset -1.3s → -1.9s (drift ~-260ms/min)  present_delay 5.3→5.8s
+         FIFO level 0.01% (gate 15% — just-in-time reader + fresh server can
+         never accumulate a buffer)
+root causes (in order of discovery):
+  (a) THE server: the dash-sim formatted `-g` from the fallback fps (24) before
+      the lavfi probe updated it to 60 → 0.4s GOPs grouped into 1.2s segments →
+      0.83 seg/s delivery starving the audio. Fixed: compute `-g` after the probe
+      → 1.0s segments (audio underflows 2050→~80). This was the true buffers root.
+  (b) reader slot pool: 128 slots × 2MB was perpetually full (decode drains at
+      exactly 60/s), so the demux blocked ~17ms/frame → reader loop 1.2s. Fixed:
+      512 slots × 512KB (measured max AU ≈94KB), same 256MB RSS. vfetch 1.1s→212ms.
+  (c) reader pacing: sleeping until the boundary then fetching added ~200ms per
+      loop. Fixed: sleep until boundary − fetch_ewma (server holds in-progress
+      segments). Loop 1.2s→0.95s.
+  (d) audio worker padded silence whenever the FIFO briefly dipped below one
+      period at a segment boundary. Fixed: bounded wait for a full period.
+      FIFO 8MiB→512KiB so the just-in-time level passes the 15% gate.
+  (e) decode starved the 5-buffer DRM pool by running ahead; present queue bound
+      128→2 gates the decode to the present rate (drm_busy warnings → 0).
+result:    buffers class largely fixed. Remaining: av_offset −1.3s constant + drift
+         −260ms/min (video presents at its decode rate, ~59.7fps vs the 60fps
+         audio-master timeline — the AAC boundary-frame rate loss the plan flags
+         as the most likely longrun fault). A timeline servo that shifted the
+         deadlines could not converge (the video is content-limited: it cannot
+         present ahead of its decode). NEXT class: longrun/av_sync.
+

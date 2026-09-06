@@ -574,9 +574,19 @@ static u64 dash_pres_clock(void) {
     return (u64)vmc_time_now_wall_us();
 }
 
+/* The decode worker is gated to the present worker's rate by bounding the
+ * present queue to a couple of frames. The A/V offset is exactly the queue
+ * depth (the video presents each frame `queued` late relative to its
+ * audio-master deadline), so a deep queue turns the live-buffer lag into a
+ * growing av_offset: with VMC_PRESENT_QUEUE_SIZE=128 the decode ran ahead and
+ * av_offset drifted ~-260 ms/min. A 2-entry gate keeps the video at its
+ * deadline (av_offset ≈ one flip period) while the reader-side frame slots
+ * still absorb the segment bursts. */
+#define VMC_PRESENT_QUEUE_BOUND 2
+
 static void present_push(int buf_idx, u64 deadline_us) {
     pthread_mutex_lock(&g_present_qmu);
-    while (g_present_qcount >= VMC_PRESENT_QUEUE_SIZE && g_run) {
+    while (g_present_qcount >= VMC_PRESENT_QUEUE_BOUND && g_run) {
         pthread_cond_wait(&g_present_qspace, &g_present_qmu);
     }
     g_present_queue[g_present_qtail] = (present_entry){buf_idx, deadline_us};
@@ -747,6 +757,7 @@ static void *present_worker(void *arg) {
                                  "\"detail\":\"deadline_exceeded\","
                                  "\"us\":%lld,\"frame_idx\":%u",
                                  (long long)late, m->fidx);
+            }
             }
             if (repeat && vmc_tlm_enabled())
                 vmc_tlm_emit("sync", "\"kind\":\"vsync_dup\","
@@ -3152,7 +3163,7 @@ static int run_dash(const char *url, vmc_log_level log_level) {
             if (!(g_conv_async && g_conv_stage && g_conv_wait && g_conv_free)) {
                 VMC_LOGW("Design B: dlsym failed");
             } else {
-                if (vmc_drm_scanout_init(&g_drm, NULL, 5) == VMC_OK) {
+                if (vmc_drm_scanout_init(&g_drm, NULL, VMC_DRM_MAX_BUFS) == VMC_OK) {
                     use_drm = true;
                     g_use_drm = true;
                     if (g_cuda_host_register && g_cuda_memcpy2d) {
@@ -3540,7 +3551,7 @@ int main(int argc, char **argv) {
             if (!(g_conv_async && g_conv_stage && g_conv_wait && g_conv_free)) {
                 VMC_LOGW("Design B: dlsym failed");
             } else {
-                vmc_status drst = vmc_drm_scanout_init(&g_drm, NULL, 5);
+                vmc_status drst = vmc_drm_scanout_init(&g_drm, NULL, VMC_DRM_MAX_BUFS);
                 if (drst != VMC_OK) {
                     VMC_LOGW("Design B: scanout init failed (%d)", (int)drst);
                 } else {

@@ -222,7 +222,10 @@ vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s, int idx) {
      * see the flip probe). A lost completion event must never block the
      * pipeline, so bound the wait and force-resync the CRTC when stuck. */
     for (int w = 0; w < 90 && s->flip_pending >= 0; w++) {
-        (void)vmc_drm_scanout_wait_flip(s, (int)(s->vblank_period_us / 1000u));
+        /* Ceil the vblank period to ms: a 16666us period / 1000 = 16ms is just
+         * short of the 16.667ms completion, forcing a second poll every frame. */
+        (void)vmc_drm_scanout_wait_flip(s,
+            (int)((s->vblank_period_us + 999u) / 1000u));
     }
     if (s->flip_pending >= 0) {
         const int stuck = s->flip_pending;
@@ -252,7 +255,8 @@ vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s, int idx) {
         if (errno == EBUSY) {
             /* Should not happen after the serialization wait; one more drain
              * then give up cleanly rather than spin. */
-            (void)vmc_drm_scanout_wait_flip(s, (int)(s->vblank_period_us / 1000u));
+            (void)vmc_drm_scanout_wait_flip(s,
+                (int)((s->vblank_period_us + 999u) / 1000u));
             continue;
         }
         VMC_LOGW("drm: PageFlip failed: %s", strerror(errno));

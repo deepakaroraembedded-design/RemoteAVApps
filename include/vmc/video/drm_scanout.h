@@ -17,7 +17,7 @@
 
 VMC_BEGIN_DECLS
 
-#define VMC_DRM_MAX_BUFS 5
+#define VMC_DRM_MAX_BUFS 8
 #define VMC_DRM_FLIP_HISTORY 16
 
 typedef struct vmc_drm_buffer {
