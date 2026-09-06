@@ -91,3 +91,32 @@ Next: smooth the fb0 cadence without starving the reader/decode (a dedicated
 present pacing thread on the fb0 path, or pacing the reader not the decoder),
 and correct the constant av_offset; then run the fb0 full 21-minute cell.
 
+## iter-008  2026-09-06T20:20Z  commit 307ae8f  tier=smoke (fb0: reader rate + cadence + audio)
+hypothesis: the fb0 drift and 52fps presentation came from (a) the reader
+         delivering at ~1.14s/segment (fetch of the newest was 1 behind the
+         edge, so every delivery paid the fetch overhead on top of the encoder
+         rate) and (b) the decode-worker catch-up presenting at the reader's
+         burst+idle rate instead of pacing to the deadline.
+result:    CONFIRMED. Fixes:
+         - reader fetches up to live_edge+1 (the in-progress segment); the
+           server hold lands the delivery exactly on the boundary → 1.000s
+           intervals (was 1.14s).
+         - audio fall-behind recovery jumps to the manifest startNumber (same
+           as video) instead of the live edge → no more 50-80s A/V split.
+         - fb0 cadence paces present STARTS at max(deadline, last+period)
+           (no catch-up), recording the scheduled target not the wall after
+           the memcpy → 60fps, yield ~1.0 (11161/11160), frames_dropped 2.
+         - audio +2.3% fixed sample duplication compensates the AAC boundary
+           loss → 0 underflows/overflows/pads, FIFO level 26.5%.
+         Measurement (smoke, 3 buckets): yield 99.96%, A/V drift ~0 over the
+         bucket window (offset converging from -79 to -40ms), audio clean.
+         Remaining gates: av_offset_mean -40..-79ms (limit 10), cadence
+         interval p95 err 4.0ms (limit 1.67), audio period deviation 0.0228
+         (limit 0.005, the stretch's longer periods). Not yet green — the
+         offset and cadence jitter need a further iteration.
+
+Next: eliminate the residual av_offset (-60ms converging), reduce the cadence
+jitter below 1.67ms, and reconcile the audio period deviation with the FIFO
+stability (the stretch trades 0 underflows for a 2.3% period deviation).
+
+
