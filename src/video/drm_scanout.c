@@ -221,24 +221,14 @@ vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s, int idx) {
      * submitting the next (the driver is event-reliable under this pattern —
      * see the flip probe). A lost completion event must never block the
      * pipeline, so bound the wait and force-resync the CRTC when stuck. */
-    for (int w = 0; w < 90 && s->flip_pending >= 0; w++) {
-        /* Ceil the vblank period to ms: a 16666us period / 1000 = 16ms is just
-         * short of the 16.667ms completion, forcing a second poll every frame. */
-        (void)vmc_drm_scanout_wait_flip(s,
-            (int)((s->vblank_period_us + 999u) / 1000u));
-    }
-    if (s->flip_pending >= 0) {
-        const int stuck = s->flip_pending;
-        VMC_LOGW("drm: flip %d lost its event; force-resync CRTC", stuck);
-        if (s->on_screen >= 0 && s->mode) {
-            (void)drmModeSetCrtc(s->fd, s->crtc, s->bufs[s->on_screen].fb,
-                                 0, 0, &s->conn, 1,
-                                 (const drmModeModeInfo *)s->mode);
-        }
-        s->bufs[stuck].busy = false;
-        s->flip_pending = -1;
-        s->flip_h_head = s->flip_h_tail = 0;
-    }
+    /* Submit the flip immediately (no serialization wait). The kernel queues
+     * the flip for the next vblank; if a flip is still pending (a submission
+     * landed in the same vblank period), drmModePageFlip returns EBUSY and the
+     * retry below waits for the pending flip with the fast single-event drain.
+     * Serializing submissions to the previous completion let the phase drift
+     * into the driver's flip window and lock the cadence at 2 vblanks per frame
+     * (30 fps) whenever the present worker's post-event work took ~a full
+     * vblank — the source of the A/V drift. */
     for (int tries = 0; tries < 3; tries++) {
         if (drmModePageFlip(s->fd, s->crtc, s->bufs[idx].fb,
                             DRM_MODE_PAGE_FLIP_EVENT, s) == 0) {
@@ -267,10 +257,13 @@ vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s, int idx) {
 
 static int drain_events(vmc_drm_scanout *s, int timeout_ms) {
     /* Single-pass drain with a SHARED deadline: wait up to timeout_ms for the
-     * first event, then keep consuming bursts until the deadline, but never
-     * restart a full timeout after handling an event (the old code blocked
-     * another 20ms in a second poll, which turned the EBUSY path into a
-     * ~33ms-per-frame stall and halved the flip cadence to 30fps). */
+     * first event, then return IMMEDIATELY once at least one event has been
+     * handled. `drmHandleEvent` drains everything queued on the fd in one call,
+     * so a burst is fully consumed. Returning at the event (not after a full
+     * second poll) is what lets the present worker submit the next flip right
+     * after the vblank instead of ~16 ms later, where it lands in the driver's
+     * flip window and the kernel defers it to the next-next vblank — the source
+     * of the 2-vblank flips (2.7% of frames) that drove the A/V drift. */
     int done = 0;
     u64 deadline_ms = vmc_time_now_ms() + (u64)(timeout_ms > 0 ? timeout_ms : 0);
     for (;;) {
@@ -286,7 +279,7 @@ static int drain_events(vmc_drm_scanout *s, int timeout_ms) {
         ev.page_flip_handler = flip_handler;
         (void)drmHandleEvent(s->fd, &ev);
         done++;
-        if (timeout_ms == 0) break;
+        break;
     }
     (void)s;
     return done;

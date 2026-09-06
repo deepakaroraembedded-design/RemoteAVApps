@@ -696,10 +696,13 @@ static void *present_worker(void *arg) {
             }
         }
         if (!g_run) break;
+        const u64 t_pop0 = vmc_time_now_us();
         present_entry e;
         if (!present_pop(&e)) break;
+        const u64 t_pop1 = vmc_time_now_us();
         const u64 frame_period_us = (g_stream_fps > 0)
             ? 1000000u / (u64)g_stream_fps : 1000000u / 24u;
+        const u64 t_dl0 = vmc_time_now_us();
         if (e.deadline_us != 0) {
             for (int i = 0; i < 600; i++) {
                 const u64 c = dash_pres_clock();
@@ -718,6 +721,22 @@ static void *present_worker(void *arg) {
 #endif
             }
         }
+        const u64 t_dl1 = vmc_time_now_us();
+#ifdef VMC_DEBUG
+        {
+            static int ptimer = 0;
+            static u64 p_last = 0;
+            if (++ptimer >= 60) {
+                ptimer = 0;
+                const u64 now_t = vmc_time_now_us();
+                VMC_LOGI("present iter: pop=%lld dl=%lld since_last=%lld us",
+                         (long long)(t_pop1 - t_pop0),
+                         (long long)(t_dl1 - t_dl0),
+                         (long long)(p_last ? now_t - p_last : 0));
+                p_last = now_t;
+            }
+        }
+#endif
         /* The decode worker already copied the frame into a DRM dumb buffer.
          * Wait for the audio-master deadline, then submit the page flip. */
         (void)vmc_drm_scanout_drain(&g_drm);
@@ -761,7 +780,6 @@ static void *present_worker(void *arg) {
                                  "\"detail\":\"deadline_exceeded\","
                                  "\"us\":%lld,\"frame_idx\":%u",
                                  (long long)late, m->fidx);
-            }
             }
             if (repeat && vmc_tlm_enabled())
                 vmc_tlm_emit("sync", "\"kind\":\"vsync_dup\","
