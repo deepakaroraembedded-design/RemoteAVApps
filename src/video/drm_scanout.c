@@ -15,6 +15,7 @@
 
 #include "vmc/core/error.h"
 #include "vmc/core/logger.h"
+#include "vmc/core/platform.h"
 
 #define XRGB8888 0x34325258u
 
@@ -209,10 +210,7 @@ vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s, int idx) {
                             DRM_MODE_PAGE_FLIP_EVENT, s) == 0) {
             s->bufs[idx].busy = true;
             s->flip_pending = idx;   /* record which buffer this event belongs to */
-            struct timespec wt;
-            clock_gettime(CLOCK_REALTIME, &wt);
-            s->bufs[idx].submit_wall_us =
-                (u64)wt.tv_sec * 1000000u + (u64)(wt.tv_nsec / 1000);
+            s->bufs[idx].submit_wall_us = vmc_time_now_us(); /* monotonic */
             return VMC_OK;
         }
         if (errno == EBUSY) {
@@ -226,10 +224,19 @@ vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s, int idx) {
 }
 
 static int drain_events(vmc_drm_scanout *s, int timeout_ms) {
+    /* Single-pass drain with a SHARED deadline: wait up to timeout_ms for the
+     * first event, then keep consuming bursts until the deadline, but never
+     * restart a full timeout after handling an event (the old code blocked
+     * another 20ms in a second poll, which turned the EBUSY path into a
+     * ~33ms-per-frame stall and halved the flip cadence to 30fps). */
     int done = 0;
+    u64 deadline_ms = vmc_time_now_ms() + (u64)(timeout_ms > 0 ? timeout_ms : 0);
     for (;;) {
+        int rem = (int)(deadline_ms - vmc_time_now_ms());
+        if (rem < 0) rem = 0;
+        if (rem > timeout_ms) rem = timeout_ms;
         struct pollfd pfd = { s->fd, POLLIN, 0 };
-        int r = poll(&pfd, 1, timeout_ms);
+        int r = poll(&pfd, 1, rem);
         if (r <= 0) break;
         drmEventContext ev;
         memset(&ev, 0, sizeof(ev));
@@ -237,6 +244,7 @@ static int drain_events(vmc_drm_scanout *s, int timeout_ms) {
         ev.page_flip_handler = flip_handler;
         (void)drmHandleEvent(s->fd, &ev);
         done++;
+        if (timeout_ms == 0) break;
     }
     (void)s;
     return done;
