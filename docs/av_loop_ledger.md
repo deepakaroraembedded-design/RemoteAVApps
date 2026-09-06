@@ -50,6 +50,18 @@ blocked on slots — full pipeline freeze, 11 vrenders in 185 s). Reverted the
 present-worker gate; kept ONLY the drain_events single-pass fix (removes the
 20 ms double-poll tail from the EBUSY path). Liveness restored (~49 fps during
 the first 35 s with residual drm_pool warnings).
+## iter-001c  2026-09-06T14:39Z  commit <pending>  tier=liveness
+ROOT CAUSE FOUND (units bug): the serialization wait passed vblank_period_us
+(16666 MICROseconds) as a MILLISECOND timeout to wait_flip, so every
+"wait for the previous flip" blocked for 16.6 SECONDS — which masqueraded as a
+deadlock in iter-001b. A raw DRM flip probe on the client proved the driver
+delivers every completion event when flips are serialized (60/60). Fix:
+serialize flips inside vmc_drm_scanout_present (never submit while one is
+pending), wait in vblank-sized ms chunks, force-resync the CRTC only if a flip
+is genuinely stuck >1.5 s, and map events to buffers via a FIFO so a lost
+event cannot desync the busy/on-screen accounting. Liveness: 59 vrenders/s,
+0 force-resyncs, 992 residual drm_pool warnings.
 result:      (filled by the next smoke report)
+
 
 

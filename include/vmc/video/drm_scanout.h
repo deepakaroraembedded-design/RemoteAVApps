@@ -18,6 +18,7 @@
 VMC_BEGIN_DECLS
 
 #define VMC_DRM_MAX_BUFS 5
+#define VMC_DRM_FLIP_HISTORY 16
 
 typedef struct vmc_drm_buffer {
     u32     handle;
@@ -30,6 +31,14 @@ typedef struct vmc_drm_buffer {
     u64     last_flip_ts; /* monotonic us when this buffer was scanned out */
     u64     submit_wall_us; /* wall-clock us when the flip was submitted */
 } vmc_drm_buffer;
+
+/* One flip-complete event maps to one record in a FIFO. The single
+ * `flip_pending` field desyncs if two events ever arrive in one drain, so the
+ * handler consumes these records in order instead. */
+typedef struct vmc_drm_flip_rec {
+    int  buf_idx;
+    u64  submit_us;   /* monotonic, for the stuck-flip watchdog */
+} vmc_drm_flip_rec;
 
 typedef struct vmc_drm_scanout {
     int            fd;
@@ -51,6 +60,11 @@ typedef struct vmc_drm_scanout {
     u32            vblank_period_us; /* 1000000 / vrefresh */
     vmc_drm_buffer bufs[VMC_DRM_MAX_BUFS];
     bool           crtc_set;
+    /* Flip history FIFO: producer = present(), consumer = flip handler. */
+    vmc_drm_flip_rec flip_history[VMC_DRM_FLIP_HISTORY];
+    int            flip_h_head;
+    int            flip_h_tail;
+    void          *mode;   /* drmModeModeInfo* for CRTC force-resync */
 } vmc_drm_scanout;
 
 /* Open card (auto-select a connected connector), create nbufs dumb XRGB

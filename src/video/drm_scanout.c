@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/mman.h>
@@ -25,13 +26,25 @@ static void flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
     (void)seq;
     /* tv_sec/tv_usec are CLOCK_MONOTONIC at flip-complete (vsync). */
     vmc_drm_scanout *s = (vmc_drm_scanout *)user;
-    /* Clear the buffer that was ACTUALLY flipped (recorded when the flip was
-     * submitted), not last_presented — that field advances to the next write
-     * target before this event arrives, which would corrupt the busy flags. */
     const u64 ts = (u64)tv_sec * 1000000u + (u64)tv_usec;
-    if (s->flip_pending >= 0) {
-        /* The buffer that WAS on-screen is now off-screen and can be reused.
-         * The pending flip target becomes the new on-screen buffer. */
+    /* One event maps to one FIFO record (the buffer that was actually
+     * submitted). Relying on the single flip_pending field desyncs when two
+     * events ever arrive in one drain: the second event would be dropped, the
+     * buffer left busy forever, and the pipeline would freeze or drop to
+     * 30 fps. Consume the oldest outstanding flip in order. */
+    if (s->flip_h_head != s->flip_h_tail) {
+        const vmc_drm_flip_rec rec = s->flip_history[s->flip_h_tail];
+        s->flip_h_tail = (s->flip_h_tail + 1) % VMC_DRM_FLIP_HISTORY;
+        if (s->on_screen >= 0) {
+            vmc_drm_buffer *old_b = &s->bufs[s->on_screen];
+            old_b->busy = false;
+            old_b->last_flip_ts = ts;
+        }
+        s->on_screen = rec.buf_idx;
+        s->last_completed = rec.buf_idx;
+        s->flip_pending = -1;
+    } else if (s->flip_pending >= 0) {
+        /* Fallback for a stray event without a FIFO record. */
         if (s->on_screen >= 0) {
             vmc_drm_buffer *old_b = &s->bufs[s->on_screen];
             old_b->busy = false;
@@ -118,6 +131,8 @@ vmc_status vmc_drm_scanout_init(vmc_drm_scanout *s, const char *dev, int nbufs) 
     s->on_screen = 0;
     s->vrefresh = mode.vrefresh;
     s->vblank_period_us = (mode.vrefresh > 0) ? 1000000u / mode.vrefresh : 16667u;
+    s->mode = malloc(sizeof(mode));
+    if (s->mode) memcpy(s->mode, &mode, sizeof(mode));
     VMC_LOGI("drm: conn=%u crtc=%u %ux%u@%u vblank=%uus", s->conn, s->crtc, s->w, s->h,
              mode.vrefresh, s->vblank_period_us);
 
@@ -202,19 +217,42 @@ vmc_status vmc_drm_scanout_present(vmc_drm_scanout *s, int idx) {
         VMC_LOGW("drm: invalid scanout buffer index %d", idx);
         return VMC_ERR_INVALID_ARG;
     }
-    /* The buffer was marked busy by next_idx; the flip event will free it.
-     * DRM allows only one page flip per CRTC. If the previous flip is still
-     * pending, wait for its completion and retry. */
-    for (int tries = 0; tries < 5; tries++) {
+    /* Serialize flips: wait for the previous flip to complete before
+     * submitting the next (the driver is event-reliable under this pattern —
+     * see the flip probe). A lost completion event must never block the
+     * pipeline, so bound the wait and force-resync the CRTC when stuck. */
+    for (int w = 0; w < 90 && s->flip_pending >= 0; w++) {
+        (void)vmc_drm_scanout_wait_flip(s, (int)(s->vblank_period_us / 1000u));
+    }
+    if (s->flip_pending >= 0) {
+        const int stuck = s->flip_pending;
+        VMC_LOGW("drm: flip %d lost its event; force-resync CRTC", stuck);
+        if (s->on_screen >= 0 && s->mode) {
+            (void)drmModeSetCrtc(s->fd, s->crtc, s->bufs[s->on_screen].fb,
+                                 0, 0, &s->conn, 1,
+                                 (const drmModeModeInfo *)s->mode);
+        }
+        s->bufs[stuck].busy = false;
+        s->flip_pending = -1;
+        s->flip_h_head = s->flip_h_tail = 0;
+    }
+    for (int tries = 0; tries < 3; tries++) {
         if (drmModePageFlip(s->fd, s->crtc, s->bufs[idx].fb,
                             DRM_MODE_PAGE_FLIP_EVENT, s) == 0) {
             s->bufs[idx].busy = true;
-            s->flip_pending = idx;   /* record which buffer this event belongs to */
-            s->bufs[idx].submit_wall_us = vmc_time_now_us(); /* monotonic */
+            s->flip_pending = idx;
+            s->bufs[idx].submit_wall_us = vmc_time_now_us();
+            if ((s->flip_h_head + 1) % VMC_DRM_FLIP_HISTORY == s->flip_h_tail)
+                s->flip_h_tail = (s->flip_h_tail + 1) % VMC_DRM_FLIP_HISTORY;
+            s->flip_history[s->flip_h_head] = (vmc_drm_flip_rec){
+                .buf_idx = idx, .submit_us = s->bufs[idx].submit_wall_us};
+            s->flip_h_head = (s->flip_h_head + 1) % VMC_DRM_FLIP_HISTORY;
             return VMC_OK;
         }
         if (errno == EBUSY) {
-            (void)vmc_drm_scanout_wait_flip(s, 20);
+            /* Should not happen after the serialization wait; one more drain
+             * then give up cleanly rather than spin. */
+            (void)vmc_drm_scanout_wait_flip(s, (int)(s->vblank_period_us / 1000u));
             continue;
         }
         VMC_LOGW("drm: PageFlip failed: %s", strerror(errno));
@@ -273,4 +311,6 @@ void vmc_drm_scanout_close(vmc_drm_scanout *s) {
         close(s->fd);
         s->fd = -1;
     }
+    free(s->mode);
+    s->mode = NULL;
 }

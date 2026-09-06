@@ -1,0 +1,508 @@
+[dash] I: encoder: /home/deepak7121/REMOTEAPPS/thin-client/4K/swiftrade_av_21min.mp4 (1280x720 @60 fps) -> DASH live
+[dash] I: manifest live.mpd: availabilityStartTime=yes frameRate=yes SegmentTemplate=yes SegmentTimeline=yes
+[dash] I: serving MPD at http://0.0.0.0:8080/live.mpd (/tmp/vmc_dash_out/45033)
+[dash] D: GET /live.mpd
+[dash] I: stats: req=0 mpd=0 seg=0 404=0 full=0 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[dash] D: GET /live.mpd
+[dash] D: GET /live.mpd
+[dash] D: GET /live.mpd
+[dash] D: GET /init-stream0.m4s
+[dash] D: GET /init-stream1.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00001.m4s
+[dash] D: GET /chunk-stream0-00001.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00002.m4s
+[dash] D: GET /chunk-stream0-00002.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00003.m4s
+[dash] D: GET /chunk-stream0-00003.m4s
+[dash] D: GET /live.mpd
+[dash] I: stats: req=17 mpd=9 seg=8 404=0 full=17 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream1-00004.m4s
+[dash] D: GET /chunk-stream0-00004.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00005.m4s
+[dash] D: GET /chunk-stream0-00005.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00006.m4s
+[dash] D: GET /chunk-stream0-00006.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 449535 is out of range for mov/mp4 format
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00007.m4s
+[dash] D: GET /chunk-stream0-00007.m4s
+[dash] I: stats: req=28 mpd=12 seg=16 404=0 full=28 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00008.m4s
+[dash] D: GET /chunk-stream0-00008.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00009.m4s
+[dash] D: GET /chunk-stream1-00010.m4s
+[dash] D: GET /chunk-stream0-00009.m4s
+[dash] D: GET /chunk-stream0-00010.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 719871 is out of range for mov/mp4 format
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00011.m4s
+[dash] D: GET /chunk-stream1-00012.m4s
+[dash] D: GET /chunk-stream0-00011.m4s
+[dash] I: stats: req=40 mpd=15 seg=25 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 764927 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00012.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00013.m4s
+[dash] D: GET /chunk-stream1-00014.m4s
+[dash] D: GET /chunk-stream0-00013.m4s
+[dash] D: GET /chunk-stream0-00014.m4s
+[dash] D: GET /live.mpd
+[dash] I: stats: req=47 mpd=17 seg=30 404=0 full=47 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream1-00015.m4s
+[dash] D: GET /chunk-stream1-00016.m4s
+[dash] D: GET /chunk-stream1-00017.m4s
+[dash] D: GET /chunk-stream0-00015.m4s
+[dash] D: GET /chunk-stream0-00016.m4s
+[dash] D: GET /chunk-stream0-00017.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00018.m4s
+[dash] D: GET /chunk-stream1-00019.m4s
+[dash] D: GET /chunk-stream1-00020.m4s
+[dash] D: GET /chunk-stream0-00018.m4s
+[dash] I: stats: req=58 mpd=18 seg=40 404=0 full=58 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00019.m4s
+[dash] D: GET /chunk-stream0-00020.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00021.m4s
+[dash] D: GET /chunk-stream1-00022.m4s
+[dash] D: GET /chunk-stream1-00023.m4s
+[dash] D: GET /chunk-stream1-00024.m4s
+[dash] D: GET /chunk-stream0-00021.m4s
+[dash] D: GET /chunk-stream0-00022.m4s
+[dash] I: stats: req=67 mpd=19 seg=48 404=0 full=67 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00023.m4s
+[dash] D: GET /chunk-stream0-00024.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00025.m4s
+[dash] D: GET /chunk-stream1-00026.m4s
+[dash] D: GET /chunk-stream1-00027.m4s
+[dash] D: GET /chunk-stream1-00028.m4s
+[dash] D: GET /chunk-stream1-00029.m4s
+[dash] D: GET /chunk-stream0-00025.m4s
+[dash] D: GET /chunk-stream0-00026.m4s
+[dash] I: stats: req=77 mpd=20 seg=57 404=0 full=77 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00027.m4s
+[dash] D: GET /chunk-stream0-00028.m4s
+[dash] D: GET /chunk-stream0-00029.m4s
+[dash] I: stats: req=80 mpd=20 seg=60 404=0 full=80 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00030.m4s
+[dash] D: GET /chunk-stream1-00031.m4s
+[dash] D: GET /chunk-stream1-00032.m4s
+[dash] D: GET /chunk-stream1-00033.m4s
+[dash] D: GET /chunk-stream1-00034.m4s
+[dash] D: GET /chunk-stream1-00035.m4s
+[dash] D: GET /chunk-stream0-00030.m4s
+[dash] D: GET /chunk-stream0-00031.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 2071551 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00032.m4s
+[dash] D: GET /chunk-stream0-00033.m4s
+[dash] I: stats: req=91 mpd=21 seg=70 404=0 full=91 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00034.m4s
+[dash] D: GET /chunk-stream0-00035.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00036.m4s
+[dash] D: GET /chunk-stream1-00037.m4s
+[dash] D: GET /chunk-stream1-00038.m4s
+[dash] D: GET /chunk-stream1-00039.m4s
+[dash] D: GET /chunk-stream1-00040.m4s
+[dash] D: GET /chunk-stream1-00041.m4s
+[dash] D: GET /chunk-stream1-00042.m4s
+[dash] D: GET /chunk-stream0-00036.m4s
+[dash] I: stats: req=102 mpd=22 seg=80 404=0 full=102 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00037.m4s
+[dash] D: GET /chunk-stream0-00038.m4s
+[dash] D: GET /chunk-stream0-00039.m4s
+[dash] D: GET /chunk-stream0-00040.m4s
+[dash] I: stats: req=106 mpd=22 seg=84 404=0 full=106 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00041.m4s
+[dash] D: GET /chunk-stream0-00042.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00043.m4s
+[dash] D: GET /chunk-stream1-00044.m4s
+[dash] D: GET /chunk-stream1-00045.m4s
+[dash] D: GET /chunk-stream1-00046.m4s
+[dash] D: GET /chunk-stream1-00047.m4s
+[dash] D: GET /chunk-stream1-00048.m4s
+[dash] D: GET /chunk-stream1-00049.m4s
+[dash] D: GET /chunk-stream1-00050.m4s
+[dash] D: GET /chunk-stream1-00051.m4s
+[dash] D: GET /chunk-stream0-00043.m4s
+[dash] D: GET /chunk-stream0-00044.m4s
+[dash] I: stats: req=120 mpd=23 seg=97 404=0 full=120 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00045.m4s
+[dash] D: GET /chunk-stream0-00046.m4s
+[dash] D: GET /chunk-stream0-00047.m4s
+[dash] D: GET /live.mpd
+[dash] I: stats: req=124 mpd=24 seg=100 404=0 full=124 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00048.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream0-00049.m4s
+[dash] D: GET /chunk-stream0-00050.m4s
+[dash] D: GET /chunk-stream0-00051.m4s
+[dash] I: stats: req=129 mpd=25 seg=104 404=0 full=129 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00052.m4s
+[dash] D: GET /chunk-stream1-00053.m4s
+[dash] D: GET /chunk-stream1-00054.m4s
+[dash] D: GET /chunk-stream1-00055.m4s
+[dash] D: GET /chunk-stream1-00056.m4s
+[dash] D: GET /chunk-stream1-00057.m4s
+[dash] D: GET /chunk-stream1-00058.m4s
+[dash] D: GET /chunk-stream1-00059.m4s
+[dash] D: GET /chunk-stream1-00060.m4s
+[dash] D: GET /chunk-stream1-00061.m4s
+[dash] D: GET /chunk-stream1-00062.m4s
+[dash] D: GET /chunk-stream0-00052.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream0-00053.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream0-00054.m4s
+[dash] I: stats: req=146 mpd=28 seg=118 404=0 full=146 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00055.m4s
+[dash] D: GET /chunk-stream0-00056.m4s
+[dash] D: GET /chunk-stream0-00057.m4s
+[dash] D: GET /chunk-stream0-00058.m4s
+[dash] I: stats: req=150 mpd=28 seg=122 404=0 full=150 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00059.m4s
+[dash] D: GET /chunk-stream0-00060.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 3918847 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00061.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 3963903 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00062.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 4008959 is out of range for mov/mp4 format
+[dash] I: stats: req=154 mpd=28 seg=126 404=0 full=154 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 4054015 is out of range for mov/mp4 format
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00063.m4s
+[dash] D: GET /chunk-stream1-00064.m4s
+[dash] D: GET /chunk-stream1-00065.m4s
+[dash] D: GET /chunk-stream1-00066.m4s
+[dash] D: GET /chunk-stream1-00067.m4s
+[dash] D: GET /chunk-stream1-00068.m4s
+[dash] D: GET /chunk-stream1-00069.m4s
+[dash] D: GET /chunk-stream1-00070.m4s
+[dash] D: GET /chunk-stream1-00071.m4s
+[dash] D: GET /chunk-stream1-00072.m4s
+[dash] D: GET /chunk-stream1-00073.m4s
+[dash] D: GET /chunk-stream1-00074.m4s
+[dash] D: GET /chunk-stream1-00075.m4s
+[dash] D: GET /chunk-stream0-00063.m4s
+[dash] D: GET /chunk-stream0-00064.m4s
+[dash] D: GET /chunk-stream0-00065.m4s
+[dash] D: GET /chunk-stream0-00066.m4s
+[dash] I: stats: req=172 mpd=29 seg=143 404=0 full=172 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00067.m4s
+[dash] D: GET /chunk-stream0-00068.m4s
+[dash] D: GET /chunk-stream0-00069.m4s
+[dash] I: stats: req=175 mpd=29 seg=146 404=0 full=175 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00070.m4s
+[dash] D: GET /chunk-stream0-00071.m4s
+[dash] D: GET /chunk-stream0-00072.m4s
+[dash] D: GET /chunk-stream0-00073.m4s
+[dash] I: stats: req=179 mpd=29 seg=150 404=0 full=179 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00074.m4s
+[dash] D: GET /chunk-stream0-00075.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00076.m4s
+[dash] D: GET /chunk-stream1-00077.m4s
+[dash] D: GET /chunk-stream1-00078.m4s
+[dash] D: GET /chunk-stream1-00079.m4s
+[dash] D: GET /chunk-stream1-00080.m4s
+[dash] D: GET /chunk-stream1-00081.m4s
+[dash] D: GET /chunk-stream1-00082.m4s
+[dash] D: GET /chunk-stream1-00083.m4s
+[dash] D: GET /chunk-stream1-00084.m4s
+[dash] D: GET /chunk-stream1-00085.m4s
+[dash] D: GET /chunk-stream1-00086.m4s
+[dash] D: GET /chunk-stream1-00087.m4s
+[dash] D: GET /chunk-stream1-00088.m4s
+[dash] D: GET /chunk-stream1-00089.m4s
+[dash] D: GET /chunk-stream1-00090.m4s
+[dash] D: GET /chunk-stream1-00091.m4s
+[dash] D: GET /chunk-stream0-00076.m4s
+[dash] I: stats: req=199 mpd=30 seg=169 404=0 full=199 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00077.m4s
+[dash] D: GET /chunk-stream0-00078.m4s
+[dash] D: GET /chunk-stream0-00079.m4s
+[dash] D: GET /chunk-stream0-00080.m4s
+[dash] I: stats: req=203 mpd=30 seg=173 404=0 full=203 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00081.m4s
+[dash] D: GET /chunk-stream0-00082.m4s
+[dash] D: GET /chunk-stream0-00083.m4s
+[dash] D: GET /chunk-stream0-00084.m4s
+[dash] I: stats: req=207 mpd=30 seg=177 404=0 full=207 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00085.m4s
+[dash] D: GET /chunk-stream0-00086.m4s
+[dash] D: GET /chunk-stream0-00087.m4s
+[dash] I: stats: req=210 mpd=30 seg=180 404=0 full=210 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00088.m4s
+[dash] D: GET /chunk-stream0-00089.m4s
+[dash] D: GET /chunk-stream0-00090.m4s
+[dash] D: GET /chunk-stream0-00091.m4s
+[dash] I: stats: req=214 mpd=30 seg=184 404=0 full=214 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00092.m4s
+[dash] D: GET /chunk-stream1-00093.m4s
+[dash] D: GET /chunk-stream1-00094.m4s
+[dash] D: GET /chunk-stream1-00095.m4s
+[dash] D: GET /chunk-stream1-00096.m4s
+[dash] D: GET /chunk-stream1-00097.m4s
+[dash] D: GET /chunk-stream1-00098.m4s
+[dash] D: GET /chunk-stream1-00099.m4s
+[dash] D: GET /chunk-stream1-00100.m4s
+[dash] D: GET /chunk-stream1-00101.m4s
+[dash] D: GET /chunk-stream1-00102.m4s
+[dash] D: GET /chunk-stream1-00103.m4s
+[dash] D: GET /chunk-stream1-00104.m4s
+[dash] D: GET /chunk-stream1-00105.m4s
+[dash] D: GET /chunk-stream1-00106.m4s
+[dash] D: GET /chunk-stream1-00107.m4s
+[dash] D: GET /chunk-stream1-00108.m4s
+[dash] D: GET /chunk-stream1-00109.m4s
+[dash] D: GET /chunk-stream1-00110.m4s
+[dash] D: GET /chunk-stream0-00092.m4s
+[dash] D: GET /chunk-stream0-00093.m4s
+[dash] D: GET /chunk-stream0-00094.m4s
+[dash] D: GET /chunk-stream0-00095.m4s
+[dash] I: stats: req=238 mpd=31 seg=207 404=0 full=238 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6126591 is out of range for mov/mp4 format
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6171647 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00096.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6216703 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00097.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6261759 is out of range for mov/mp4 format
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6306815 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00098.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6351871 is out of range for mov/mp4 format
+[dash] I: stats: req=241 mpd=31 seg=210 404=0 full=241 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00099.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6396927 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00100.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6441983 is out of range for mov/mp4 format
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6487039 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00101.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6532095 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00102.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6577151 is out of range for mov/mp4 format
+[dash] I: stats: req=245 mpd=31 seg=214 404=0 full=245 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6622207 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00103.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6667263 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00104.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6712319 is out of range for mov/mp4 format
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6757375 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00105.m4s
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6802431 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00106.m4s
+[dash] I: stats: req=249 mpd=31 seg=218 404=0 full=249 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5669b7fbea80] Application provided duration: -1 / timestamp: 6847487 is out of range for mov/mp4 format
+[dash] D: GET /chunk-stream0-00107.m4s
+[dash] D: GET /chunk-stream0-00108.m4s
+[dash] D: GET /chunk-stream0-00109.m4s
+[dash] I: stats: req=252 mpd=31 seg=221 404=0 full=252 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00110.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00111.m4s
+[dash] D: GET /chunk-stream1-00112.m4s
+[dash] D: GET /chunk-stream1-00113.m4s
+[dash] D: GET /chunk-stream1-00114.m4s
+[dash] D: GET /chunk-stream1-00115.m4s
+[dash] D: GET /chunk-stream1-00116.m4s
+[dash] D: GET /chunk-stream1-00117.m4s
+[dash] D: GET /chunk-stream1-00118.m4s
+[dash] D: GET /chunk-stream1-00119.m4s
+[dash] D: GET /chunk-stream1-00120.m4s
+[dash] D: GET /chunk-stream1-00121.m4s
+[dash] D: GET /chunk-stream1-00122.m4s
+[dash] D: GET /chunk-stream1-00123.m4s
+[dash] D: GET /chunk-stream1-00124.m4s
+[dash] D: GET /chunk-stream1-00125.m4s
+[dash] D: GET /chunk-stream1-00126.m4s
+[dash] D: GET /chunk-stream1-00127.m4s
+[dash] D: GET /chunk-stream1-00128.m4s
+[dash] D: GET /chunk-stream1-00129.m4s
+[dash] D: GET /chunk-stream1-00130.m4s
+[dash] D: GET /chunk-stream1-00131.m4s
+[dash] D: GET /chunk-stream1-00132.m4s
+[dash] D: GET /chunk-stream1-00133.m4s
+[dash] D: GET /chunk-stream0-00111.m4s
+[dash] D: GET /chunk-stream0-00112.m4s
+[dash] D: GET /chunk-stream0-00113.m4s
+[dash] I: stats: req=280 mpd=32 seg=248 404=0 full=280 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00114.m4s
+[dash] D: GET /chunk-stream0-00115.m4s
+[dash] D: GET /chunk-stream0-00116.m4s
+[dash] D: GET /chunk-stream0-00117.m4s
+[dash] I: stats: req=284 mpd=32 seg=252 404=0 full=284 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00118.m4s
+[dash] D: GET /chunk-stream0-00119.m4s
+[dash] D: GET /chunk-stream0-00120.m4s
+[dash] I: stats: req=287 mpd=32 seg=255 404=0 full=287 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00121.m4s
+[dash] D: GET /chunk-stream0-00122.m4s
+[dash] D: GET /chunk-stream0-00123.m4s
+[dash] D: GET /chunk-stream0-00124.m4s
+[dash] I: stats: req=291 mpd=32 seg=259 404=0 full=291 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00125.m4s
+[dash] D: GET /chunk-stream0-00126.m4s
+[dash] D: GET /chunk-stream0-00127.m4s
+[dash] D: GET /chunk-stream0-00128.m4s
+[dash] I: stats: req=295 mpd=32 seg=263 404=0 full=295 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00129.m4s
+[dash] D: GET /chunk-stream0-00130.m4s
+[dash] D: GET /chunk-stream0-00131.m4s
+[dash] I: stats: req=298 mpd=32 seg=266 404=0 full=298 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00132.m4s
+[dash] D: GET /chunk-stream0-00133.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00134.m4s
+[dash] D: GET /chunk-stream1-00135.m4s
+[dash] D: GET /chunk-stream1-00136.m4s
+[dash] D: GET /chunk-stream1-00137.m4s
+[dash] D: GET /chunk-stream1-00138.m4s
+[dash] D: GET /chunk-stream1-00139.m4s
+[dash] D: GET /chunk-stream1-00140.m4s
+[dash] D: GET /chunk-stream1-00141.m4s
+[dash] D: GET /chunk-stream1-00142.m4s
+[dash] D: GET /chunk-stream1-00143.m4s
+[dash] D: GET /chunk-stream1-00144.m4s
+[dash] D: GET /chunk-stream1-00145.m4s
+[dash] D: GET /chunk-stream1-00146.m4s
+[dash] D: GET /chunk-stream1-00147.m4s
+[dash] D: GET /chunk-stream1-00148.m4s
+[dash] D: GET /chunk-stream1-00149.m4s
+[dash] D: GET /chunk-stream1-00150.m4s
+[dash] D: GET /chunk-stream1-00151.m4s
+[dash] D: GET /chunk-stream1-00152.m4s
+[dash] D: GET /chunk-stream1-00153.m4s
+[dash] D: GET /chunk-stream1-00154.m4s
+[dash] D: GET /chunk-stream1-00155.m4s
+[dash] D: GET /chunk-stream1-00156.m4s
+[dash] D: GET /chunk-stream1-00157.m4s
+[dash] D: GET /chunk-stream1-00158.m4s
+[dash] D: GET /chunk-stream1-00159.m4s
+[dash] D: GET /chunk-stream1-00160.m4s
+[dash] D: GET /chunk-stream1-00161.m4s
+[dash] D: GET /chunk-stream0-00134.m4s
+[dash] D: GET /chunk-stream0-00135.m4s
+[dash] I: stats: req=331 mpd=33 seg=298 404=0 full=331 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00136.m4s
+[dash] D: GET /chunk-stream0-00137.m4s
+[dash] D: GET /chunk-stream0-00138.m4s
+[dash] I: stats: req=334 mpd=33 seg=301 404=0 full=334 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00139.m4s
+[dash] D: GET /chunk-stream0-00140.m4s
+[dash] D: GET /chunk-stream0-00141.m4s
+[dash] D: GET /chunk-stream0-00142.m4s
+[dash] I: stats: req=338 mpd=33 seg=305 404=0 full=338 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00143.m4s
+[dash] D: GET /chunk-stream0-00144.m4s
+[dash] D: GET /chunk-stream0-00145.m4s
+[dash] D: GET /chunk-stream0-00146.m4s
+[dash] I: stats: req=342 mpd=33 seg=309 404=0 full=342 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00147.m4s
+[dash] D: GET /chunk-stream0-00148.m4s
+[dash] D: GET /chunk-stream0-00149.m4s
+[dash] D: GET /chunk-stream0-00150.m4s
+[dash] I: stats: req=346 mpd=33 seg=313 404=0 full=346 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00151.m4s
+[dash] D: GET /chunk-stream0-00152.m4s
+[dash] D: GET /chunk-stream0-00153.m4s
+[dash] I: stats: req=349 mpd=33 seg=316 404=0 full=349 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00154.m4s
+[dash] D: GET /chunk-stream0-00155.m4s
+[dash] D: GET /chunk-stream0-00156.m4s
+[dash] D: GET /chunk-stream0-00157.m4s
+[dash] I: stats: req=353 mpd=33 seg=320 404=0 full=353 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00158.m4s
+[dash] D: GET /chunk-stream0-00159.m4s
+[dash] D: GET /chunk-stream0-00160.m4s
+[dash] D: GET /chunk-stream0-00161.m4s
+[dash] I: stats: req=357 mpd=33 seg=324 404=0 full=357 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00162.m4s
+[dash] D: GET /chunk-stream1-00163.m4s
+[dash] D: GET /chunk-stream1-00164.m4s
+[dash] D: GET /chunk-stream1-00165.m4s
+[dash] D: GET /chunk-stream1-00166.m4s
+[dash] D: GET /chunk-stream1-00167.m4s
+[dash] D: GET /chunk-stream1-00168.m4s
+[dash] D: GET /chunk-stream1-00169.m4s
+[dash] D: GET /chunk-stream1-00170.m4s
+[dash] D: GET /chunk-stream1-00171.m4s
+[dash] D: GET /chunk-stream1-00172.m4s
+[dash] D: GET /chunk-stream1-00173.m4s
+[dash] D: GET /chunk-stream1-00174.m4s
+[dash] D: GET /chunk-stream1-00175.m4s
+[dash] D: GET /chunk-stream1-00176.m4s
+[dash] D: GET /chunk-stream1-00177.m4s
+[dash] D: GET /chunk-stream1-00178.m4s
+[dash] D: GET /chunk-stream1-00179.m4s
+[dash] D: GET /chunk-stream1-00180.m4s
+[dash] D: GET /chunk-stream1-00181.m4s
+[dash] D: GET /chunk-stream1-00182.m4s
+[dash] D: GET /chunk-stream1-00183.m4s
+[dash] D: GET /chunk-stream1-00184.m4s
+[dash] D: GET /chunk-stream1-00185.m4s
+[dash] D: GET /chunk-stream1-00186.m4s
+[dash] D: GET /chunk-stream1-00187.m4s
+[dash] D: GET /chunk-stream1-00188.m4s
+[dash] D: GET /chunk-stream1-00189.m4s
+[dash] D: GET /chunk-stream1-00190.m4s
+[dash] D: GET /chunk-stream1-00191.m4s
+[dash] D: GET /chunk-stream1-00192.m4s
+[dash] D: GET /chunk-stream1-00193.m4s
+[dash] D: GET /chunk-stream1-00194.m4s
+[dash] D: GET /chunk-stream1-00195.m4s
+[dash] D: GET /chunk-stream0-00162.m4s
+[dash] D: GET /chunk-stream0-00163.m4s
+[dash] D: GET /chunk-stream0-00164.m4s
+[dash] I: stats: req=395 mpd=34 seg=361 404=0 full=395 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00165.m4s
+[dash] D: GET /chunk-stream0-00166.m4s
+[dash] D: GET /chunk-stream0-00167.m4s
+[dash] D: GET /chunk-stream0-00168.m4s
+[dash] I: stats: req=399 mpd=34 seg=365 404=0 full=399 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00169.m4s
+[dash] D: GET /chunk-stream0-00170.m4s
+[dash] D: GET /chunk-stream0-00171.m4s
+[dash] D: GET /chunk-stream0-00172.m4s
+[dash] I: stats: req=403 mpd=34 seg=369 404=0 full=403 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00173.m4s
+[dash] D: GET /chunk-stream0-00174.m4s
+[dash] D: GET /chunk-stream0-00175.m4s
+[dash] I: stats: req=406 mpd=34 seg=372 404=0 full=406 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00176.m4s
+[dash] D: GET /chunk-stream0-00177.m4s
+[dash] D: GET /chunk-stream0-00178.m4s
+[dash] D: GET /chunk-stream0-00179.m4s
+[dash] I: stats: req=410 mpd=34 seg=376 404=0 full=410 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00180.m4s
+[dash] D: GET /chunk-stream0-00181.m4s
+[dash] D: GET /chunk-stream0-00182.m4s
+[dash] D: GET /chunk-stream0-00183.m4s
+[dash] I: stats: req=414 mpd=34 seg=380 404=0 full=414 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00184.m4s
+[dash] D: GET /chunk-stream0-00185.m4s
+[dash] D: GET /chunk-stream0-00186.m4s
+[dash] I: stats: req=417 mpd=34 seg=383 404=0 full=417 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00187.m4s
+[dash] D: GET /chunk-stream0-00188.m4s
+[dash] D: GET /chunk-stream0-00189.m4s
+[dash] D: GET /chunk-stream0-00190.m4s
+[dash] I: stats: req=421 mpd=34 seg=387 404=0 full=421 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00191.m4s
+[dash] D: GET /chunk-stream0-00192.m4s
+[dash] D: GET /chunk-stream0-00193.m4s
+[dash] D: GET /chunk-stream0-00194.m4s
+[dash] I: stats: req=425 mpd=34 seg=391 404=0 full=425 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /chunk-stream0-00195.m4s
