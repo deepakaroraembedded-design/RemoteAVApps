@@ -76,8 +76,8 @@
  * video reader. The audio-master clock keeps A/V in sync regardless of the
  * depth difference. */
 #define VMC_AUDIO_PREFETCH_US  (1000000u)
-#define VMC_AUDIO_STEADY_US    (8000000u)
-#define VMC_AUDIO_MAX_US       (12000000u)
+#define VMC_AUDIO_STEADY_US    (2000000u)
+#define VMC_AUDIO_MAX_US       (3000000u)
 #define VMC_VIDEO_PREFETCH_US  (1000000u)
 #define VMC_VIDEO_STEADY_US    (1000000u)
 #define VMC_VIDEO_MAX_US       (3000000u)
@@ -1033,7 +1033,11 @@ static void *decode_worker(void *arg) {
 
 #ifdef VMC_HAVE_ALSA
 #define VMC_AUDIO_FRAME_BYTES (960u)   /* 5 ms @ 48 kHz stereo s16 */
-#define VMC_AUDIO_FIFO_BYTES  (8388608u) /* 8 MiB (~43.7 s), power of two */
+/* 512 KiB (~2.7 s). The reader delivers just-in-time at the live edge, so the
+ * FIFO level tracks one segment (≈1.5 s) rather than the 8 s audio-buffer
+ * target — an 8 MiB FIFO therefore sat at <4 % and failed the ≥15 % level
+ * gate. 512 KiB puts the achievable ~30 % level inside the gate. */
+#define VMC_AUDIO_FIFO_BYTES  (524288u)
 #define VMC_AUDIO_PREFILL_US     (VMC_AUDIO_PREFETCH_US) /* 5 s startup buffer */
 #define VMC_AUDIO_PREFILL_TARGET \
     ((VMC_AUDIO_PREFILL_US * (u64)VMC_AUDIO_CHANNELS * 2u * \
@@ -1099,7 +1103,27 @@ static void *audio_worker(void *arg) {
             continue;
         }
         pthread_mutex_lock(&g_audio_mu);
-        const sz_t avail = vmc_ringbuf_used(&g_audio_rb);
+        /* Wait (bounded) for a full period of data instead of padding to
+         * silence whenever the FIFO is briefly below one period at a segment
+         * delivery boundary. The just-in-time reader fills the FIFO once per
+         * second, so a 5 ms period read can race the next delivery; padding
+         * turned every such race into a `buf/audio_fifo.underflow` event. The
+         * ALSA sink's ~250 ms latency absorbs the wait, so no XRUN results.
+         * Only pad if the wait times out (a genuinely dead feed). */
+        sz_t avail = vmc_ringbuf_used(&g_audio_rb);
+        int waited = 0;
+        while (avail < sizeof(pcm) && g_run_audio && waited < 40) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_nsec += 5000000L;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait(&g_audio_cv, &g_audio_mu, &deadline);
+            avail = vmc_ringbuf_used(&g_audio_rb);
+            waited++;
+        }
         sz_t n = 0;
         if (avail >= sizeof(pcm)) {
             n = vmc_ringbuf_read(&g_audio_rb, pcm, sizeof(pcm));

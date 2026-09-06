@@ -58,9 +58,13 @@ export TAIL_EXCLUDE_S="${TAIL_EXCLUDE_S:-10}"         # discarded: EOS drain
 export BUCKET_S="${BUCKET_S:-60}"                     # per-minute statistics buckets
 
 export CONTENT_FPS="${CONTENT_FPS:-60.0}"            # Earth.mp4 native rate (24 fps legacy)
-export AUDIO_RATE="${AUDIO_RATE:-44100}"             # Earth.mp4 native rate (48 kHz legacy)
-export AUDIO_PERIOD="${AUDIO_PERIOD:-1024}"
-export AUDIO_FIFO_BYTES="${AUDIO_FIFO_BYTES:-8388608}"
+export AUDIO_RATE="${AUDIO_RATE:-48000}"             # the client's ALSA output rate (the AAC
+                                                      # content is 44100 but is resampled to 48k
+                                                      # before the sink, so the render cadence is
+                                                      # 48k — the period-deviation gate must count
+                                                      # the OUTPUT periods, not the content rate)
+export AUDIO_PERIOD="${AUDIO_PERIOD:-240}"           # 5 ms ALSA period (960 B stereo s16 @48k)
+export AUDIO_FIFO_BYTES="${AUDIO_FIFO_BYTES:-524288}" # client audio FIFO (512 KiB)
 export SEG_DURATION_S="${SEG_DURATION_S:-1.0}"
 # Presentation cadence reference for the frame-interval gate. At 60 fps content
 # the per-frame period is 16.667 ms (not the 41.667 ms the 24 fps pipeline was
