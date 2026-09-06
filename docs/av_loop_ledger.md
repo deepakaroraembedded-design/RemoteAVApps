@@ -42,7 +42,37 @@ journey:  First hypothesis (EBUSY→wait_flip double-poll locking flips at 2 vbl
          genuinely lost events.
 result:    cadence/DRM class CLOSED. Next: reader delivery (buffers class).
 
-## iter-002  2026-09-06T15:50Z  commit <pending>  tier=smoke (buffers class)
+## iter-003  2026-09-06T16:20Z  commit df63e41  tier=full (first 21-min)
+verdict: ERROR (window overran; sanity 22 buckets)   primary_fault: av_sync   streak: 0
+buckets: 0/22 pass   worst_bucket: 0
+run:     av_offset -3.0s → -37.5s (drift -1818ms/min)  present_delay 6.9→34.2s
+         frames_presented 3492/bucket (yield 0.97)  frame_interval_p95_err 0.34ms
+         audio_fifo_underflows 35→263/bucket, OVERFLOWS 545→2615 from bucket 4 on
+         audio_periods_written collapses 11909→1444 by bucket 14
+         eos_reached FALSE (client never signalled end; window stretched 1235→1360s)
+         rss_growth 29.6MB (near 32MB gate)  fd_growth 0  disk 47MB
+evidence: the video presents at ~58.2 fps (16.7 ms intervals, 98% clean) while the
+         audio-master deadline advances at 60 fps — a ~3 % rate shortfall that
+         accumulates ~30 ms/s into unbounded av_offset and present_delay. The
+         missing ~1.8 frames/s are vblanks skipped when the present queue is
+         empty (decode just slower than the present). Audio collapses mid-run
+         (periods_written 12000→1444 = the worker is blocked waiting for a full
+         period for most of the time) and the 512 KiB FIFO overflows when the
+         reader bursts. The client never reaches the clip end → no EOS.
+hypothesis: the decode worker's DRM-buffer cycle is marginally slower than the
+         vblank (serialization wait + conv + copy ≈ 17.7 ms vs 16.7 ms), so with
+         the 2-entry present queue it can never get ahead and the present worker
+         starves ~3 % of vblanks. The audio side is a second front: the bounded
+         wait for a full period plus the tiny 512 KiB FIFO make the audio worker
+         stall whenever the reader's delivery phase drifts.
+prediction: giving the decode a small run-ahead (present queue bound 2→6) and
+         enlarging the audio FIFO to 2 MiB (still ~30% of the gate at the
+         2 s buffer) should let the video sustain 60 fps (drift → <1 ms/min) and
+         the audio stay fed, bringing the run to EOS on time.
+change:      (next iteration)
+result:      buffers/cadence largely converged in smoke; the longrun front is the
+         video rate vs audio-master rate and the mid-run audio stall.
+
 verdict: FAIL   primary_fault: av_sync (buffers improved 12x)   streak: 0
 buckets: 0/3 pass   worst_bucket: 0
 run:     audio_fifo_underflows 34/103/107 (was 2050)  audio_pad 3.5k/11k (was 485k)
