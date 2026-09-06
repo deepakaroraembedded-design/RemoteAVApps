@@ -658,17 +658,6 @@ static void *present_worker(void *arg) {
         if (!present_pop(&e)) break;
         const u64 frame_period_us = (g_stream_fps > 0)
             ? 1000000u / (u64)g_stream_fps : 1000000u / 24u;
-        /* DRM allows ONE pending page flip per CRTC. Never submit while the
-         * previous flip is still pending: the old code hit EBUSY every frame
-         * once the deadlines were in the past (backlog), and each EBUSY went
-         * through the 20ms-tail wait_flip, locking the cadence at 2 vblanks
-         * (30fps) and starving the 5-buffer pool. Wait for the completion
-         * first so submissions serialize at exactly one flip per vblank. */
-        if (g_drm.flip_pending >= 0) {
-            if (vmc_drm_scanout_wait_flip(&g_drm,
-                                          (int)g_drm.vblank_period_us + 10) < 0)
-                break;
-        }
         if (e.deadline_us != 0) {
             for (int i = 0; i < 600; i++) {
                 const u64 c = dash_pres_clock();

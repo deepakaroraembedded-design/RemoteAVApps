@@ -1,0 +1,809 @@
+{
+  "iteration": 1,
+  "run_id": "2026-09-06T14-16-03Z-smoke",
+  "commit": "08ae789",
+  "tier": "smoke",
+  "verdict": "ERROR",
+  "primary_fault": "environment",
+  "window_actual_s": 185.22,
+  "content_fps": 60.0,
+  "bucket_s": 60.0,
+  "buckets": [
+    {
+      "index": 0,
+      "t_start_s": 0.0,
+      "span_s": 60.0,
+      "complete": true,
+      "frame_interval_ms": 16.667,
+      "av_offset_mean_ms": -66743.26,
+      "av_offset_p95_ms": 81746.7,
+      "av_offset_min_ms": -83414.26,
+      "av_offset_max_ms": -50076.92,
+      "av_envelope_violations": 3,
+      "av_envelope_violation_pct": 100.0,
+      "av_samples": 3,
+      "present_delay_mean_ms": 53678.79,
+      "present_delay_p95_ms": 68677.04,
+      "present_delay_samples": 3,
+      "frames_presented": 3,
+      "frames_expected": 3600,
+      "frames_dropped": 0,
+      "frames_repeated": 0,
+      "frame_interval_p95_err_ms": 16674.39,
+      "audio_periods_written": 11827,
+      "audio_periods_expected": 2584,
+      "audio_pad_samples": 2430594,
+      "audio_fifo_level_min_pct": 0.0,
+      "audio_fifo_underflows": 10131,
+      "audio_fifo_overflows": 0,
+      "jitter_buffer_underflows": 0,
+      "jitter_buffer_overflows": 0,
+      "drm_pool_exhausted": 18,
+      "seg_queue_starved": 0,
+      "seg_fetch_ok": 0,
+      "seg_fetch_fail": 0,
+      "seg_fetch_miss": 0,
+      "seg_fetch_p95_ms": null,
+      "seg_fetch_max_ms": null,
+      "tcp_rtt_p95_ms": null,
+      "mpd_reload_fail": 0,
+      "resyncs": 0,
+      "vsync_miss": 3,
+      "vsync_dup": 0,
+      "flip_error": 0,
+      "flip_timeout": 0,
+      "drm_event_starve": 0,
+      "async_cuda": 0,
+      "async_copy": 0,
+      "async_stage": 0,
+      "clock_fallback": 0,
+      "decode_errors": 0,
+      "decoder_unavailable": 0,
+      "decoder_reinit": 0,
+      "corrupt_frames": 0,
+      "missing_ref": 0,
+      "decode_p95_ms": 1.56,
+      "verdict": "FAIL",
+      "failed_gates": [
+        {
+          "gate": "audio_fifo_underflows",
+          "value": 10131,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 0
+        },
+        {
+          "gate": "audio_pad_samples",
+          "value": 2430594,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 0
+        },
+        {
+          "gate": "drm_pool_exhausted",
+          "value": 18,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 0
+        },
+        {
+          "gate": "vsync_miss",
+          "value": 3,
+          "limit": 0,
+          "class": "vsync_async",
+          "bucket": 0
+        },
+        {
+          "gate": "frame_yield",
+          "value": 0.0008,
+          "limit": 0.995,
+          "class": "cadence",
+          "bucket": 0
+        },
+        {
+          "gate": "frame_interval_p95_err_ms",
+          "value": 16674.39,
+          "limit": 1.6667000000000003,
+          "class": "cadence",
+          "bucket": 0
+        },
+        {
+          "gate": "audio_period_deviation",
+          "value": 3.577,
+          "limit": 0.005,
+          "class": "cadence",
+          "bucket": 0
+        },
+        {
+          "gate": "audio_fifo_level_min_pct",
+          "value": 0.0,
+          "limit": 15.0,
+          "class": "buffers",
+          "bucket": 0
+        },
+        {
+          "gate": "av_offset_samples",
+          "value": 3,
+          "limit": 10,
+          "class": "environment",
+          "bucket": 0
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "t_start_s": 60.0,
+      "span_s": 60.0,
+      "complete": true,
+      "frame_interval_ms": 16.667,
+      "av_offset_mean_ms": -124887.99,
+      "av_offset_p95_ms": 147281.67,
+      "av_offset_min_ms": -149770.44,
+      "av_offset_max_ms": -100004.62,
+      "av_envelope_violations": 4,
+      "av_envelope_violation_pct": 100.0,
+      "av_samples": 4,
+      "present_delay_mean_ms": 111822.75,
+      "present_delay_p95_ms": 134221.84,
+      "present_delay_samples": 4,
+      "frames_presented": 4,
+      "frames_expected": 3600,
+      "frames_dropped": 15,
+      "frames_repeated": 0,
+      "frame_interval_p95_err_ms": 16675.28,
+      "audio_periods_written": 11787,
+      "audio_periods_expected": 2584,
+      "audio_pad_samples": 2828880,
+      "audio_fifo_level_min_pct": 0.0,
+      "audio_fifo_underflows": 11791,
+      "audio_fifo_overflows": 0,
+      "jitter_buffer_underflows": 0,
+      "jitter_buffer_overflows": 0,
+      "drm_pool_exhausted": 18,
+      "seg_queue_starved": 0,
+      "seg_fetch_ok": 0,
+      "seg_fetch_fail": 0,
+      "seg_fetch_miss": 0,
+      "seg_fetch_p95_ms": null,
+      "seg_fetch_max_ms": null,
+      "tcp_rtt_p95_ms": null,
+      "mpd_reload_fail": 0,
+      "resyncs": 0,
+      "vsync_miss": 4,
+      "vsync_dup": 0,
+      "flip_error": 0,
+      "flip_timeout": 0,
+      "drm_event_starve": 0,
+      "async_cuda": 0,
+      "async_copy": 0,
+      "async_stage": 0,
+      "clock_fallback": 0,
+      "decode_errors": 0,
+      "decoder_unavailable": 0,
+      "decoder_reinit": 0,
+      "corrupt_frames": 0,
+      "missing_ref": 0,
+      "decode_p95_ms": 0.29,
+      "verdict": "FAIL",
+      "failed_gates": [
+        {
+          "gate": "audio_fifo_underflows",
+          "value": 11791,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 1
+        },
+        {
+          "gate": "audio_pad_samples",
+          "value": 2828880,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 1
+        },
+        {
+          "gate": "drm_pool_exhausted",
+          "value": 18,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 1
+        },
+        {
+          "gate": "vsync_miss",
+          "value": 4,
+          "limit": 0,
+          "class": "vsync_async",
+          "bucket": 1
+        },
+        {
+          "gate": "frames_dropped",
+          "value": 15,
+          "limit": 0,
+          "class": "cadence",
+          "bucket": 1
+        },
+        {
+          "gate": "frame_yield",
+          "value": 0.0011,
+          "limit": 0.995,
+          "class": "cadence",
+          "bucket": 1
+        },
+        {
+          "gate": "frame_interval_p95_err_ms",
+          "value": 16675.28,
+          "limit": 1.6667000000000003,
+          "class": "cadence",
+          "bucket": 1
+        },
+        {
+          "gate": "audio_period_deviation",
+          "value": 3.5615,
+          "limit": 0.005,
+          "class": "cadence",
+          "bucket": 1
+        },
+        {
+          "gate": "audio_fifo_level_min_pct",
+          "value": 0.0,
+          "limit": 15.0,
+          "class": "buffers",
+          "bucket": 1
+        },
+        {
+          "gate": "av_offset_samples",
+          "value": 4,
+          "limit": 10,
+          "class": "environment",
+          "bucket": 1
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "t_start_s": 120.0,
+      "span_s": 60.0,
+      "complete": true,
+      "frame_interval_ms": 16.667,
+      "av_offset_mean_ms": -191243.99,
+      "av_offset_p95_ms": 213635.56,
+      "av_offset_min_ms": -216122.74,
+      "av_offset_max_ms": -166359.95,
+      "av_envelope_violations": 4,
+      "av_envelope_violation_pct": 100.0,
+      "av_samples": 4,
+      "present_delay_mean_ms": 178173.77,
+      "present_delay_p95_ms": 200572.89,
+      "present_delay_samples": 4,
+      "frames_presented": 4,
+      "frames_expected": 3600,
+      "frames_dropped": 15,
+      "frames_repeated": 0,
+      "frame_interval_p95_err_ms": 16675.31,
+      "audio_periods_written": 11777,
+      "audio_periods_expected": 2584,
+      "audio_pad_samples": 2826480,
+      "audio_fifo_level_min_pct": 0.0,
+      "audio_fifo_underflows": 11782,
+      "audio_fifo_overflows": 0,
+      "jitter_buffer_underflows": 0,
+      "jitter_buffer_overflows": 0,
+      "drm_pool_exhausted": 18,
+      "seg_queue_starved": 0,
+      "seg_fetch_ok": 0,
+      "seg_fetch_fail": 0,
+      "seg_fetch_miss": 0,
+      "seg_fetch_p95_ms": null,
+      "seg_fetch_max_ms": null,
+      "tcp_rtt_p95_ms": null,
+      "mpd_reload_fail": 0,
+      "resyncs": 0,
+      "vsync_miss": 4,
+      "vsync_dup": 0,
+      "flip_error": 0,
+      "flip_timeout": 0,
+      "drm_event_starve": 0,
+      "async_cuda": 0,
+      "async_copy": 0,
+      "async_stage": 0,
+      "clock_fallback": 0,
+      "decode_errors": 0,
+      "decoder_unavailable": 0,
+      "decoder_reinit": 0,
+      "corrupt_frames": 0,
+      "missing_ref": 0,
+      "decode_p95_ms": 0.15,
+      "verdict": "FAIL",
+      "failed_gates": [
+        {
+          "gate": "audio_fifo_underflows",
+          "value": 11782,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 2
+        },
+        {
+          "gate": "audio_pad_samples",
+          "value": 2826480,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 2
+        },
+        {
+          "gate": "drm_pool_exhausted",
+          "value": 18,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 2
+        },
+        {
+          "gate": "vsync_miss",
+          "value": 4,
+          "limit": 0,
+          "class": "vsync_async",
+          "bucket": 2
+        },
+        {
+          "gate": "frames_dropped",
+          "value": 15,
+          "limit": 0,
+          "class": "cadence",
+          "bucket": 2
+        },
+        {
+          "gate": "frame_yield",
+          "value": 0.0011,
+          "limit": 0.995,
+          "class": "cadence",
+          "bucket": 2
+        },
+        {
+          "gate": "frame_interval_p95_err_ms",
+          "value": 16675.31,
+          "limit": 1.6667000000000003,
+          "class": "cadence",
+          "bucket": 2
+        },
+        {
+          "gate": "audio_period_deviation",
+          "value": 3.5577,
+          "limit": 0.005,
+          "class": "cadence",
+          "bucket": 2
+        },
+        {
+          "gate": "audio_fifo_level_min_pct",
+          "value": 0.0,
+          "limit": 15.0,
+          "class": "buffers",
+          "bucket": 2
+        },
+        {
+          "gate": "av_offset_samples",
+          "value": 4,
+          "limit": 10,
+          "class": "environment",
+          "bucket": 2
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "t_start_s": 180.0,
+      "span_s": 5.2,
+      "complete": false,
+      "frame_interval_ms": 16.667,
+      "av_offset_mean_ms": null,
+      "av_offset_p95_ms": null,
+      "av_offset_min_ms": null,
+      "av_offset_max_ms": null,
+      "av_envelope_violations": 0,
+      "av_envelope_violation_pct": null,
+      "av_samples": 0,
+      "present_delay_mean_ms": null,
+      "present_delay_p95_ms": null,
+      "present_delay_samples": 0,
+      "frames_presented": 0,
+      "frames_expected": 310,
+      "frames_dropped": 0,
+      "frames_repeated": 0,
+      "frame_interval_p95_err_ms": null,
+      "audio_periods_written": 1014,
+      "audio_periods_expected": 223,
+      "audio_pad_samples": 243360,
+      "audio_fifo_level_min_pct": 0.0,
+      "audio_fifo_underflows": 1014,
+      "audio_fifo_overflows": 0,
+      "jitter_buffer_underflows": 0,
+      "jitter_buffer_overflows": 0,
+      "drm_pool_exhausted": 2,
+      "seg_queue_starved": 0,
+      "seg_fetch_ok": 0,
+      "seg_fetch_fail": 0,
+      "seg_fetch_miss": 0,
+      "seg_fetch_p95_ms": null,
+      "seg_fetch_max_ms": null,
+      "tcp_rtt_p95_ms": null,
+      "mpd_reload_fail": 0,
+      "resyncs": 0,
+      "vsync_miss": 0,
+      "vsync_dup": 0,
+      "flip_error": 0,
+      "flip_timeout": 0,
+      "drm_event_starve": 0,
+      "async_cuda": 0,
+      "async_copy": 0,
+      "async_stage": 0,
+      "clock_fallback": 0,
+      "decode_errors": 0,
+      "decoder_unavailable": 0,
+      "decoder_reinit": 0,
+      "corrupt_frames": 0,
+      "missing_ref": 0,
+      "decode_p95_ms": null,
+      "verdict": "FAIL",
+      "failed_gates": [
+        {
+          "gate": "audio_fifo_underflows",
+          "value": 1014,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 3
+        },
+        {
+          "gate": "audio_pad_samples",
+          "value": 243360,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 3
+        },
+        {
+          "gate": "drm_pool_exhausted",
+          "value": 2,
+          "limit": 0,
+          "class": "buffers",
+          "bucket": 3
+        }
+      ]
+    }
+  ],
+  "failed_gates": [
+    {
+      "gate": "audio_fifo_underflows",
+      "value": 10131,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 0
+    },
+    {
+      "gate": "audio_pad_samples",
+      "value": 2430594,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 0
+    },
+    {
+      "gate": "drm_pool_exhausted",
+      "value": 18,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 0
+    },
+    {
+      "gate": "vsync_miss",
+      "value": 3,
+      "limit": 0,
+      "class": "vsync_async",
+      "bucket": 0
+    },
+    {
+      "gate": "frame_yield",
+      "value": 0.0008,
+      "limit": 0.995,
+      "class": "cadence",
+      "bucket": 0
+    },
+    {
+      "gate": "frame_interval_p95_err_ms",
+      "value": 16674.39,
+      "limit": 1.6667000000000003,
+      "class": "cadence",
+      "bucket": 0
+    },
+    {
+      "gate": "audio_period_deviation",
+      "value": 3.577,
+      "limit": 0.005,
+      "class": "cadence",
+      "bucket": 0
+    },
+    {
+      "gate": "audio_fifo_level_min_pct",
+      "value": 0.0,
+      "limit": 15.0,
+      "class": "buffers",
+      "bucket": 0
+    },
+    {
+      "gate": "av_offset_samples",
+      "value": 3,
+      "limit": 10,
+      "class": "environment",
+      "bucket": 0
+    },
+    {
+      "gate": "audio_fifo_underflows",
+      "value": 11791,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 1
+    },
+    {
+      "gate": "audio_pad_samples",
+      "value": 2828880,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 1
+    },
+    {
+      "gate": "drm_pool_exhausted",
+      "value": 18,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 1
+    },
+    {
+      "gate": "vsync_miss",
+      "value": 4,
+      "limit": 0,
+      "class": "vsync_async",
+      "bucket": 1
+    },
+    {
+      "gate": "frames_dropped",
+      "value": 15,
+      "limit": 0,
+      "class": "cadence",
+      "bucket": 1
+    },
+    {
+      "gate": "frame_yield",
+      "value": 0.0011,
+      "limit": 0.995,
+      "class": "cadence",
+      "bucket": 1
+    },
+    {
+      "gate": "frame_interval_p95_err_ms",
+      "value": 16675.28,
+      "limit": 1.6667000000000003,
+      "class": "cadence",
+      "bucket": 1
+    },
+    {
+      "gate": "audio_period_deviation",
+      "value": 3.5615,
+      "limit": 0.005,
+      "class": "cadence",
+      "bucket": 1
+    },
+    {
+      "gate": "audio_fifo_level_min_pct",
+      "value": 0.0,
+      "limit": 15.0,
+      "class": "buffers",
+      "bucket": 1
+    },
+    {
+      "gate": "av_offset_samples",
+      "value": 4,
+      "limit": 10,
+      "class": "environment",
+      "bucket": 1
+    },
+    {
+      "gate": "audio_fifo_underflows",
+      "value": 11782,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 2
+    },
+    {
+      "gate": "audio_pad_samples",
+      "value": 2826480,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 2
+    },
+    {
+      "gate": "drm_pool_exhausted",
+      "value": 18,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 2
+    },
+    {
+      "gate": "vsync_miss",
+      "value": 4,
+      "limit": 0,
+      "class": "vsync_async",
+      "bucket": 2
+    },
+    {
+      "gate": "frames_dropped",
+      "value": 15,
+      "limit": 0,
+      "class": "cadence",
+      "bucket": 2
+    },
+    {
+      "gate": "frame_yield",
+      "value": 0.0011,
+      "limit": 0.995,
+      "class": "cadence",
+      "bucket": 2
+    },
+    {
+      "gate": "frame_interval_p95_err_ms",
+      "value": 16675.31,
+      "limit": 1.6667000000000003,
+      "class": "cadence",
+      "bucket": 2
+    },
+    {
+      "gate": "audio_period_deviation",
+      "value": 3.5577,
+      "limit": 0.005,
+      "class": "cadence",
+      "bucket": 2
+    },
+    {
+      "gate": "audio_fifo_level_min_pct",
+      "value": 0.0,
+      "limit": 15.0,
+      "class": "buffers",
+      "bucket": 2
+    },
+    {
+      "gate": "av_offset_samples",
+      "value": 4,
+      "limit": 10,
+      "class": "environment",
+      "bucket": 2
+    },
+    {
+      "gate": "audio_fifo_underflows",
+      "value": 1014,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 3
+    },
+    {
+      "gate": "audio_pad_samples",
+      "value": 243360,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 3
+    },
+    {
+      "gate": "drm_pool_exhausted",
+      "value": 2,
+      "limit": 0,
+      "class": "buffers",
+      "bucket": 3
+    },
+    {
+      "gate": "present_delay_p95_ms",
+      "value": 194765.7,
+      "limit": 30000.0,
+      "class": "latency",
+      "bucket": null
+    }
+  ],
+  "artifacts": {
+    "client_ndjson": "/home/deepak7121/REMOTEAPPS/thin-client/runs/iter-1-smoke2/vmc_tlm_client.ndjson",
+    "server_ndjson": "/home/deepak7121/REMOTEAPPS/thin-client/runs/iter-1-smoke2/vmc_tlm_server.ndjson",
+    "resources": "/home/deepak7121/REMOTEAPPS/thin-client/runs/iter-1-smoke2/resources.ndjson",
+    "client_log": "/home/deepak7121/REMOTEAPPS/thin-client/runs/iter-1-smoke2/dash_client.log",
+    "server_log": "/home/deepak7121/REMOTEAPPS/thin-client/runs/iter-1-smoke2/dash_server.log"
+  },
+  "notes": [],
+  "av_sync": {
+    "av_offset_mean_ms": -133159.79,
+    "av_offset_p95_ms": 207832.14,
+    "av_offset_min_ms": -216122.74,
+    "av_offset_max_ms": -50076.92,
+    "av_offset_drift_ms_per_min": -59678.68,
+    "av_envelope_violations": 11,
+    "samples": 11
+  },
+  "render": {
+    "frames_presented": 11,
+    "frames_expected": 11110,
+    "frames_dropped": 30,
+    "frames_repeated": 0,
+    "frame_interval_p95_err_ms": 16675.3,
+    "audio_periods_written": 36405,
+    "audio_periods_expected": 7975
+  },
+  "buffers": {
+    "audio_fifo_underflows": 34718,
+    "audio_fifo_overflows": 0,
+    "audio_pad_samples": 8329314,
+    "audio_fifo_level_min_pct": 0.0,
+    "jitter_buffer_underflows": 0,
+    "jitter_buffer_overflows": 0,
+    "drm_pool_exhausted": 56,
+    "seg_queue_starved": 0
+  },
+  "network": {
+    "seg_fetch_ok": 0,
+    "seg_fetch_fail": 0,
+    "seg_fetch_miss": 0,
+    "seg_fetch_mean_ms": null,
+    "seg_fetch_p95_ms": null,
+    "seg_fetch_max_ms": null,
+    "tcp_rtt_p95_ms": null,
+    "mpd_reload_fail": 0,
+    "resyncs": 0
+  },
+  "vsync_async": {
+    "vsync_miss": 11,
+    "vsync_dup": 0,
+    "flip_error": 0,
+    "flip_timeout": 0,
+    "drm_event_starve": 0,
+    "async_cuda": 0,
+    "async_copy": 0,
+    "async_stage": 0,
+    "clock_fallback": 0
+  },
+  "decoder": {
+    "decode_errors": 0,
+    "decoder_unavailable": 0,
+    "decoder_reinit": 0,
+    "corrupt_frames": 0,
+    "missing_ref": 0,
+    "decode_mean_ms": 0.48,
+    "decode_p95_ms": 1.56
+  },
+  "latency": {
+    "present_delay_mean_ms": 120092.95,
+    "present_delay_p95_ms": 194765.7,
+    "present_delay_samples": 11
+  },
+  "longrun": {
+    "buckets_total": 3,
+    "buckets_passed": 0,
+    "buckets_failed": 3,
+    "worst_bucket": 1,
+    "av_offset_drift_ms_per_min": null,
+    "av_offset_drift_ls_ms_per_min": -59678.68,
+    "av_offset_total_excursion_ms": 124500.73,
+    "av_p95_degrade_ms_per_bucket": null,
+    "av_offset_bucket_means_ms": [
+      -66743.26,
+      -124887.99,
+      -191243.99
+    ],
+    "present_delay_bucket_means_ms": [
+      53678.79,
+      111822.75,
+      178173.77
+    ],
+    "present_delay_growth_ms_per_min": null,
+    "rss_start_mb": 281.05,
+    "rss_end_mb": 281.18,
+    "rss_growth_mb": 0.13,
+    "fd_start": 62,
+    "fd_end": 62,
+    "fd_growth": 0,
+    "disk_start_mb": 354,
+    "disk_end_mb": 421,
+    "disk_growth_mb": 67,
+    "disk_growth_last_buckets_mb": 67,
+    "eos_reached": false,
+    "eos_at_s": null,
+    "playback_span_s": 185.17,
+    "clip_duration_s": 1260.0
+  }
+}

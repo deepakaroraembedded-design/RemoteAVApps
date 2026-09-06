@@ -1,0 +1,114 @@
+[dash] I: encoder: /home/deepak7121/REMOTEAPPS/thin-client/4K/swiftrade_av_21min.mp4 (1280x720 @60 fps) -> DASH live
+[dash] I: manifest live.mpd: availabilityStartTime=yes frameRate=yes SegmentTemplate=yes SegmentTimeline=yes
+[dash] I: serving MPD at http://0.0.0.0:8080/live.mpd (/tmp/vmc_dash_out/28110)
+[dash] D: GET /live.mpd
+[dash] I: stats: req=1 mpd=1 seg=0 404=0 full=1 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[dash] D: GET /live.mpd
+[dash] D: GET /live.mpd
+[dash] D: GET /live.mpd
+[dash] D: GET /init-stream0.m4s
+[dash] D: GET /init-stream1.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00001.m4s
+[dash] D: GET /chunk-stream0-00001.m4s
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00002.m4s
+[dash] D: GET /chunk-stream0-00002.m4s
+[dash] I: stats: req=13 mpd=7 seg=6 404=0 full=13 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 449535 is out of range for mov/mp4 format
+[dash] I: stats: req=13 mpd=7 seg=6 404=0 full=13 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 719871 is out of range for mov/mp4 format
+[dash] I: stats: req=14 mpd=8 seg=6 404=0 full=14 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 764927 is out of range for mov/mp4 format
+[dash] D: GET /live.mpd
+[dash] I: stats: req=16 mpd=10 seg=6 404=0 full=16 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[dash] I: stats: req=17 mpd=11 seg=6 404=0 full=17 prog=0 hold=0 (0 ms avg) restart=0
+[dash] D: GET /live.mpd
+[dash] D: GET /chunk-stream1-00003.m4s
+[dash] D: GET /chunk-stream1-00004.m4s
+[dash] D: GET /chunk-stream1-00005.m4s
+[dash] D: GET /chunk-stream1-00006.m4s
+[dash] D: GET /chunk-stream1-00007.m4s
+[dash] D: GET /chunk-stream1-00008.m4s
+[dash] D: GET /chunk-stream1-00009.m4s
+[dash] D: GET /chunk-stream1-00010.m4s
+[dash] D: GET /chunk-stream1-00011.m4s
+[dash] D: GET /chunk-stream1-00012.m4s
+[dash] D: GET /chunk-stream1-00013.m4s
+[dash] D: GET /chunk-stream1-00014.m4s
+[dash] D: GET /chunk-stream1-00015.m4s
+[dash] D: GET /chunk-stream1-00016.m4s
+[dash] D: GET /chunk-stream1-00017.m4s
+[dash] D: GET /chunk-stream1-00018.m4s
+[dash] D: GET /chunk-stream1-00019.m4s
+[dash] D: GET /chunk-stream1-00020.m4s
+[dash] D: GET /chunk-stream1-00021.m4s
+[dash] D: GET /chunk-stream1-00022.m4s
+[dash] D: GET /chunk-stream1-00023.m4s
+[dash] D: GET /chunk-stream0-00003.m4s
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 2071551 is out of range for mov/mp4 format
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 3918847 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 3963903 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 4008959 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 4054015 is out of range for mov/mp4 format
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6126591 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6171647 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6216703 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6261759 is out of range for mov/mp4 format
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6306815 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6351871 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6396927 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6441983 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6487039 is out of range for mov/mp4 format
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6532095 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6577151 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6622207 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6667263 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6712319 is out of range for mov/mp4 format
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6757375 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6802431 is out of range for mov/mp4 format
+[mp4 @ 0x5eaed5cb3180] Application provided duration: -1 / timestamp: 6847487 is out of range for mov/mp4 format
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0
+[dash] I: stats: req=40 mpd=12 seg=28 404=0 full=40 prog=0 hold=0 (0 ms avg) restart=0

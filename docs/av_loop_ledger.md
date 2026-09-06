@@ -42,5 +42,14 @@ prediction: fixing the present path (never submit while a flip is pending:
          ≥0.995 and interval_err ≤1.7ms, which unblocks the DRM pool → decode 60fps
          → reader catches up → audio_fifo_underflows→0, av_offset bounded
          (|mean|≤10ms), present_delay growth→≤10ms/min.
-change:      (filled by iter-002's smoke report)
+## iter-001b  2026-09-06T14:24Z  commit <pending>  tier=smoke
+First fix attempt deadlocked: adding a "wait for the previous flip to complete"
+gate in the present worker made the LAST submitted flip's completion event never
+arrive (present worker stuck in wait_flip, decode starved for buffers, reader
+blocked on slots — full pipeline freeze, 11 vrenders in 185 s). Reverted the
+present-worker gate; kept ONLY the drain_events single-pass fix (removes the
+20 ms double-poll tail from the EBUSY path). Liveness restored (~49 fps during
+the first 35 s with residual drm_pool warnings).
+result:      (filled by the next smoke report)
+
 
