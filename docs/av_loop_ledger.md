@@ -42,7 +42,7 @@ journey:  First hypothesis (EBUSY→wait_flip double-poll locking flips at 2 vbl
          genuinely lost events.
 result:    cadence/DRM class CLOSED. Next: reader delivery (buffers class).
 
-## iter-004  2026-09-06T16:25Z  commit 79c419d  tier=smoke
+## iter-004  2026-09-06T16:25Z  commit 3a0d047  tier=smoke
 verdict: FAIL   primary_fault: av_sync (drift)   streak: 0
 buckets: 0/3 pass   worst_bucket: 0
 run:     av_offset -3.1s → -6.7s (drift -1810ms/min)  present_delay 7.0→10.6s
