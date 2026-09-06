@@ -46,17 +46,18 @@ Discovery: the drift is 2.7% of flips taking 2 vblanks (consecutive 30fps
 phases), each adding a permanent 16.7ms of lateness. Present-queue bounding made
 it worse (decode gated to 58fps); a timeline servo could not converge.
 
-## iter-007  2026-09-06T18:24Z  tier=smoke (fb0 cadence attempt)
-hypothesis: the fb0 bursty cadence (65% of intervals at 2ms, p95 err 56ms)
-         comes from presenting back-to-back when deadlines are in the past;
-         pacing to max(deadline, last_present + frame_period) should smooth it.
-result:    REVERTED. The pacing stalled the decode worker to 4fps: the 
-         frame-period target coupled with the reader/decode feedback starved the
-         reader (4s/segment) and the audio (FIFO 0, XRUNs). The clock-domain
-         variant (audio-clock tracker) did not help. fb0 restored to the
-         iter-006 state (60fps, -3ms/min drift, bursty cadence). The cadence
-         smoothness on fb0 remains an open item; the DRM phase-lock fix (iter-005)
-         remains the significant win.
+## iter-005  2026-09-06T17:41Z  commit 52b8f3d  tier=full
+BLOCKER — the phase-lock is FIXED: `drain_events` now returns at the first flip
+event (not after a full second poll) and `present()` submits without
+serializing to the previous completion, so a submission no longer lands in the
+driver's flip window. 30ms+ intervals 2.7% → 0.06%; drift -1818 → -211ms/min;
+yield 0.997; audio underflows stable 33-119/bucket with NO collapse/overflow;
+rss 20.8MB. The remaining -211ms/min is a HARDWARE BOUND: the panel's measured
+vblank is 16730µs = 59.77Hz (99.76% of intervals), while the clip is 60fps —
+the video can present no faster than the panel, so 60fps content cannot meet the
+≤0.5ms/min drift gate on the DRM path. This is the plan's documented
+"hardware/driver limit out of scope for the loop" case. The iter-006 framebuffer
+run (below) confirms the drift is the panel, not the pipeline.
 
 ## iter-006  2026-09-06T18:09Z  commit 652fa18  tier=smoke (framebuffer cell, VMC_DRM=0)
 CONFIRMATION: the framebuffer path sustains a PERFECT 60.0fps with essentially
@@ -74,18 +75,19 @@ panel, so the ≤0.5ms/min drift gate is unsatisfiable on the DRM path. The
 framebuffer path is the drift-free fallback but needs cadence smoothing and an
 anchor correction for the ~50ms offset.
 
-Next: smooth the fb0 cadence (pace to the frame period, not just the deadline)
+## iter-007  2026-09-06T18:24Z  tier=smoke (fb0 cadence attempt)
+hypothesis: the fb0 bursty cadence (65% of intervals at 2ms, p95 err 56ms)
+         comes from presenting back-to-back when deadlines are in the past;
+         pacing to max(deadline, last_present + frame_period) should smooth it.
+result:    REVERTED. The pacing stalled the decode worker to 4fps: the
+         frame-period target coupled with the reader/decode feedback starved the
+         reader (4s/segment) and the audio (FIFO 0, XRUNs). The clock-domain
+         variant (audio-clock tracker) did not help. fb0 restored to the
+         iter-006 state (60fps, -3ms/min drift, bursty cadence). The cadence
+         smoothness on fb0 remains an open item; the DRM phase-lock fix (iter-005)
+         remains the significant win.
+
+Next: smooth the fb0 cadence without starving the reader/decode (a dedicated
+present pacing thread on the fb0 path, or pacing the reader not the decoder),
 and correct the constant av_offset; then run the fb0 full 21-minute cell.
 
-## iter-005  2026-09-06T17:41Z  commit 52b8f3d  tier=full
-BLOCKER — the phase-lock is FIXED: `drain_events` now returns at the first flip
-event (not after a full second poll) and `present()` submits without
-serializing to the previous completion, so a submission no longer lands in the
-driver's flip window. 30ms+ intervals 2.7% → 0.06%; drift -1818 → -211ms/min;
-yield 0.997; audio underflows stable 33-119/bucket with NO collapse/overflow;
-rss 20.8MB. The remaining -211ms/min is a HARDWARE BOUND: the panel's measured
-vblank is 16730µs = 59.77Hz (99.76% of intervals), while the clip is 60fps —
-the video can present no faster than the panel, so 60fps content cannot meet the
-≤0.5ms/min drift gate on the DRM path. This is the plan's documented
-"hardware/driver limit out of scope for the loop" case. The iter-006 framebuffer
-run (below) confirms the drift is the panel, not the pipeline.
