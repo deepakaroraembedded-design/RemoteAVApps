@@ -3028,7 +3028,15 @@ static void *dash_reader_direct(void *arg) {
                 const int64_t next = m.avail_start_us +
                                      (int64_t)(live_edge + 1) *
                                          m.seg_duration_us;
-                const int64_t wait = next - (int64_t)vmc_time_now_wall_us();
+                /* Wake early enough that the segment fetch completes AT the
+                 * boundary: sleeping until `next` and then fetching (~200 ms)
+                 * added the fetch time to every loop, drifting the delivery
+                 * cadence to 1.2 s per segment (0.83 seg/s) and starving the
+                 * audio FIFO. The server holds the connection for an
+                 * in-progress segment, so an early fetch is safe. */
+                const int64_t fetch_lead = (int64_t)g_seg_fetch_ewma_us;
+                const int64_t wait =
+                    next - (int64_t)vmc_time_now_wall_us() - fetch_lead;
                 if (wait > 0) av_usleep((unsigned)wait);
                 VMC_LOGI("reader loop: wait=%lld us dur=%lld us "
                          "audio=%lld vfetch=%lld vdemux=%lld vpost=%lld sleep=%lld us",
