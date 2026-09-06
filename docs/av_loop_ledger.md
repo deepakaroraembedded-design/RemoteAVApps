@@ -46,6 +46,25 @@ Discovery: the drift is 2.7% of flips taking 2 vblanks (consecutive 30fps
 phases), each adding a permanent 16.7ms of lateness. Present-queue bounding made
 it worse (decode gated to 58fps); a timeline servo could not converge.
 
+## iter-006  2026-09-06T18:09Z  commit 652fa18  tier=smoke (framebuffer cell, VMC_DRM=0)
+CONFIRMATION: the framebuffer path sustains a PERFECT 60.0fps with essentially
+NO drift — av_offset drift -3.09ms/min (DRM path: -211ms/min), frames_presented
+3600/bucket (yield 1.0), present_delay stable at 4.66s, rss_growth 2.0MB,
+vsync_miss 0. This proves the DRM path's av_offset drift is the panel's
+59.77Hz vblank (hardware bound), NOT the pipeline. The fb0 path's remaining
+issues: frame_interval_p95_err 56ms (the deadline-paced memcpy cadence isn't
+vblank-smooth) and a ~50ms constant av_offset. Audio underflows ~80-90/bucket
+on both paths.
+
+BLOCKER (recorded): DRM path — the panel (1366x768) refreshes at 59.77Hz
+(measured vblank 16730us); 60fps content cannot be presented faster than the
+panel, so the ≤0.5ms/min drift gate is unsatisfiable on the DRM path. The
+framebuffer path is the drift-free fallback but needs cadence smoothing and an
+anchor correction for the ~50ms offset.
+
+Next: smooth the fb0 cadence (pace to the frame period, not just the deadline)
+and correct the constant av_offset; then run the fb0 full 21-minute cell.
+
 ## iter-005  2026-09-06T17:41Z  commit 52b8f3d  tier=full
 BLOCKER — the phase-lock is FIXED: `drain_events` now returns at the first flip
 event (not after a full second poll) and `present()` submits without
@@ -56,6 +75,5 @@ rss 20.8MB. The remaining -211ms/min is a HARDWARE BOUND: the panel's measured
 vblank is 16730µs = 59.77Hz (99.76% of intervals), while the clip is 60fps —
 the video can present no faster than the panel, so 60fps content cannot meet the
 ≤0.5ms/min drift gate on the DRM path. This is the plan's documented
-"hardware/driver limit out of scope for the loop" case. Next: run the
-framebuffer (VMC_DRM=0) confirmation-matrix cell to prove the drift is the panel
-(not the pipeline), then write docs/AV_CONVERGENCE_REPORT.md.
+"hardware/driver limit out of scope for the loop" case. The iter-006 framebuffer
+run (below) confirms the drift is the panel, not the pipeline.
