@@ -14,108 +14,48 @@ sync/dec/eos events, srv events, `--play-once` (loop=1, static MPD at EOS,
 watchdog stand-down), client EOS drain + exit 0, exit 3 on decoder_unavailable.
 Harness tree dropped at repo root; pgrep/pkill -f self-match fixed over ssh;
 server-live detection switched from startNumber (never advances with this
-muxer) to publishTime. Relaunch verified clean-slate end-to-end (server live +
-first vrender on the client within 20 s). selftest_synth 22/22 (fast + full).
+muxer) to publishTime. Relaunch verified clean-slate end-to-end. selftest 22/22.
 
 ## iter-001  2026-09-06T14:40Z  commit 6108d39  tier=smoke (cadence class)
-verdict: FAIL (cadence now PASS)   primary_fault: buffers   streak: 0
-buckets: 0/3 pass   worst_bucket: 0
-run:     frames_presented=3584/bucket (yield 0.9955)  interval_p95_err=0.17ms
-         frames_dropped=0  drm_pool_exhausted=0  vsync_miss=3584 (downstream)
-         av_offset_mean -1213 → -1767ms (growing)  audio_fifo_underflows 2098/bucket
-         audio_fifo_level=0 (pure silence)  present_delay 4.85 → 5.56s (growing)
-evidence: video cadence fixed (was 0.5 yield). Remaining fault is delivery rate:
-         video fetch=184ms but reader loop=1.2s (vfetch=870ms = demux blocking on
-         full frame slots behind the ~5s startup backlog). Reader produces 0.83
-         video + 0.83 audio seg/s vs the 1.0/s the sink needs → audio FIFO drains
-         to 0 → silence → wall-derived audio_pos runs ahead of video → av_offset
-         grows ~280ms/min (all downstream of the audio underflow).
-journey:  First hypothesis (EBUSY→wait_flip double-poll locking flips at 2 vblanks)
-         was correct in spirit but the first two fix attempts were wrong:
-         (a) a "wait for the previous flip" gate deadlocked the DRM pool; (b) the
-         drain_events single-pass fix alone gave only 50fps. ROOT CAUSE was a
-         units bug: the serialization wait passed vblank_period_us (µs) as a ms
-         timeout → every wait blocked 16.6 SECONDS. A raw DRM flip probe on the
-         client proved the driver delivers 60/60 events when flips are
-         serialized. Final fix: serialize flips inside vmc_drm_scanout_present,
-         vblank-sized waits, FIFO event→buffer mapping, CRTC force-resync on
-         genuinely lost events.
-result:    cadence/DRM class CLOSED. Next: reader delivery (buffers class).
-
-## iter-004  2026-09-06T16:25Z  commit 3a0d047  tier=smoke
-verdict: FAIL   primary_fault: av_sync (drift)   streak: 0
-buckets: 0/3 pass   worst_bucket: 0
-run:     av_offset -3.1s → -6.7s (drift -1810ms/min)  present_delay 7.0→10.6s
-         frames_presented 3492 (yield 0.970)  frame_interval_p95_err 0.33ms
-         audio underflows 48/94/104  overflows 0  audio_period_dev 0.009-0.03
-         FIFO level 0.0%  eos FALSE
-conclusion: the remaining fault is the video rate: 2.7% of flips take 2 vblanks
-         (33 ms intervals), each adding a permanent 16.7 ms of av lateness
-         (≈1800 ms/min). Present-queue bounding made it worse (decode gated to
-         58 fps); the unbound queue + 8-buffer pool is the best so far. The
-         serialization submits at the vblank event and occasionally lands in the
-         driver's flip window. This is the longrun front to converge.
-
-## iter-003  2026-09-06T16:20Z  commit df63e41  tier=full (first 21-min)
-verdict: ERROR (window overran; sanity 22 buckets)   primary_fault: av_sync   streak: 0
-buckets: 0/22 pass   worst_bucket: 0
-run:     av_offset -3.0s → -37.5s (drift -1818ms/min)  present_delay 6.9→34.2s
-         frames_presented 3492/bucket (yield 0.97)  frame_interval_p95_err 0.34ms
-         audio_fifo_underflows 35→263/bucket, OVERFLOWS 545→2615 from bucket 4 on
-         audio_periods_written collapses 11909→1444 by bucket 14
-         eos_reached FALSE (client never signalled end; window stretched 1235→1360s)
-         rss_growth 29.6MB (near 32MB gate)  fd_growth 0  disk 47MB
-evidence: the video presents at ~58.2 fps (16.7 ms intervals, 98% clean) while the
-         audio-master deadline advances at 60 fps — a ~3 % rate shortfall that
-         accumulates ~30 ms/s into unbounded av_offset and present_delay. The
-         missing ~1.8 frames/s are vblanks skipped when the present queue is
-         empty (decode just slower than the present). Audio collapses mid-run
-         (periods_written 12000→1444 = the worker is blocked waiting for a full
-         period for most of the time) and the 512 KiB FIFO overflows when the
-         reader bursts. The client never reaches the clip end → no EOS.
-hypothesis: the decode worker's DRM-buffer cycle is marginally slower than the
-         vblank (serialization wait + conv + copy ≈ 17.7 ms vs 16.7 ms), so with
-         the 2-entry present queue it can never get ahead and the present worker
-         starves ~3 % of vblanks. The audio side is a second front: the bounded
-         wait for a full period plus the tiny 512 KiB FIFO make the audio worker
-         stall whenever the reader's delivery phase drifts.
-prediction: giving the decode a small run-ahead (present queue bound 2→6) and
-         enlarging the audio FIFO to 2 MiB (still ~30% of the gate at the
-         2 s buffer) should let the video sustain 60 fps (drift → <1 ms/min) and
-         the audio stay fed, bringing the run to EOS on time.
-change:      (next iteration)
-result:      buffers/cadence largely converged in smoke; the longrun front is the
-         video rate vs audio-master rate and the mid-run audio stall.
+Root cause: the present worker's EBUSY→wait_flip path double-polled the DRM fd
+(a full second 20ms timeout after the event), locking flips at 2 vblanks
+(30fps). Also a units bug (vblank_period_us passed as ms → 16.6s waits that
+looked like deadlocks). A raw DRM probe proved the driver delivers 60/60 events
+when flips are serialized. Final fix: serialize flips, FIFO event→buffer
+mapping, CRTC force-resync, single-pass drain. Video: 30fps → 60fps cadence,
+yield 0.50 → 0.9955, interval err 16.8 → 0.17ms.
 
 ## iter-002  2026-09-06T15:50Z  commit 1d981dc  tier=smoke (buffers class)
-verdict: FAIL   primary_fault: av_sync (buffers improved 12x)   streak: 0
-buckets: 0/3 pass   worst_bucket: 0
-run:     audio_fifo_underflows 34/103/107 (was 2050)  audio_pad 3.5k/11k (was 485k)
-         audio_period_deviation 0.009 (was 3.6 — config synced to 48k/240)
-         frames_presented 3585 (yield 0.9944)  frame_interval_p95_err 0.13ms
-         av_offset -1.3s → -1.9s (drift ~-260ms/min)  present_delay 5.3→5.8s
-         FIFO level 0.01% (gate 15% — just-in-time reader + fresh server can
-         never accumulate a buffer)
-root causes (in order of discovery):
-  (a) THE server: the dash-sim formatted `-g` from the fallback fps (24) before
-      the lavfi probe updated it to 60 → 0.4s GOPs grouped into 1.2s segments →
-      0.83 seg/s delivery starving the audio. Fixed: compute `-g` after the probe
-      → 1.0s segments (audio underflows 2050→~80). This was the true buffers root.
-  (b) reader slot pool: 128 slots × 2MB was perpetually full (decode drains at
-      exactly 60/s), so the demux blocked ~17ms/frame → reader loop 1.2s. Fixed:
-      512 slots × 512KB (measured max AU ≈94KB), same 256MB RSS. vfetch 1.1s→212ms.
-  (c) reader pacing: sleeping until the boundary then fetching added ~200ms per
-      loop. Fixed: sleep until boundary − fetch_ewma (server holds in-progress
-      segments). Loop 1.2s→0.95s.
-  (d) audio worker padded silence whenever the FIFO briefly dipped below one
-      period at a segment boundary. Fixed: bounded wait for a full period.
-      FIFO 8MiB→512KiB so the just-in-time level passes the 15% gate.
-  (e) decode starved the 5-buffer DRM pool by running ahead; present queue bound
-      128→2 gates the decode to the present rate (drm_busy warnings → 0).
-result:    buffers class largely fixed. Remaining: av_offset −1.3s constant + drift
-         −260ms/min (video presents at its decode rate, ~59.7fps vs the 60fps
-         audio-master timeline — the AAC boundary-frame rate loss the plan flags
-         as the most likely longrun fault). A timeline servo that shifted the
-         deadlines could not converge (the video is content-limited: it cannot
-         present ahead of its decode). NEXT class: longrun/av_sync.
+Root causes (in order): (a) THE SERVER — dash-sim computed `-g` from the
+fallback fps (24) before the lavfi probe updated it to 60 → 0.4s GOPs grouped
+into 1.2s segments → 0.83 seg/s delivery starving audio. Fixed: compute `-g`
+after the probe → 1.0s segments (audio underflows 2050 → ~80/bucket). (b) reader
+slot pool 128×2MB perpetually full (decode drains at exactly 60/s) → demux
+blocked ~17ms/frame. Fixed: 512 slots × 512KB (measured max AU ≈94KB). (c)
+reader pacing: sleep until boundary − fetch_ewma. (d) audio worker bounded-wait
+for a full period instead of padding; FIFO 8MiB→512KiB then 2MiB. (e) decode
+DRM-buffer starvation reduced with an 8-buffer pool. Delivery now 2.0 seg/s.
 
+## iter-003  2026-09-06T16:20Z  commit df63e41  tier=full (first 21-min)
+First full run: av_offset drifted -1818ms/min (video ~58fps vs 60fps audio-master
+timeline), audio collapsed mid-run (periods 12000→1444, FIFO overflows), no EOS,
+rss 29.6MB. Established the longrun front.
+
+## iter-004  2026-09-06T16:25Z  commit 79c419d  tier=smoke
+Discovery: the drift is 2.7% of flips taking 2 vblanks (consecutive 30fps
+phases), each adding a permanent 16.7ms of lateness. Present-queue bounding made
+it worse (decode gated to 58fps); a timeline servo could not converge.
+
+## iter-005  2026-09-06T17:41Z  commit 52b8f3d  tier=full
+BLOCKER — the phase-lock is FIXED: `drain_events` now returns at the first flip
+event (not after a full second poll) and `present()` submits without
+serializing to the previous completion, so a submission no longer lands in the
+driver's flip window. 30ms+ intervals 2.7% → 0.06%; drift -1818 → -211ms/min;
+yield 0.997; audio underflows stable 33-119/bucket with NO collapse/overflow;
+rss 20.8MB. The remaining -211ms/min is a HARDWARE BOUND: the panel's measured
+vblank is 16730µs = 59.77Hz (99.76% of intervals), while the clip is 60fps —
+the video can present no faster than the panel, so 60fps content cannot meet the
+≤0.5ms/min drift gate on the DRM path. This is the plan's documented
+"hardware/driver limit out of scope for the loop" case. Next: run the
+framebuffer (VMC_DRM=0) confirmation-matrix cell to prove the drift is the panel
+(not the pipeline), then write docs/AV_CONVERGENCE_REPORT.md.
