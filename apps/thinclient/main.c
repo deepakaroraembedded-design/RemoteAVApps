@@ -579,15 +579,14 @@ static u64 dash_pres_clock(void) {
     return (u64)vmc_time_now_wall_us();
 }
 
-/* The decode worker is gated to the present worker's rate by bounding the
- * present queue to a couple of frames. The A/V offset is exactly the queue
- * depth (the video presents each frame `queued` late relative to its
- * audio-master deadline), so a deep queue turns the live-buffer lag into a
- * growing av_offset: with VMC_PRESENT_QUEUE_SIZE=128 the decode ran ahead and
- * av_offset drifted ~-260 ms/min. A 2-entry gate keeps the video at its
- * deadline (av_offset ≈ one flip period) while the reader-side frame slots
- * still absorb the segment bursts. */
-#define VMC_PRESENT_QUEUE_BOUND 2
+/* The decode worker is gated to the present rate by the DRM buffer pool: it
+ * acquires a buffer as the flip cycle frees them (~60/s). Bounding the present
+ * queue ADDED a second gate that made the decode ~0.5 ms/frame slower than the
+ * vblank (measured push-block ≈ 17 ms), so the video degraded to 58 fps and
+ * av_offset drifted ~-1800 ms/min. An unbound queue lets the decode run at the
+ * flip-completion rate (~60 fps) with only rare queue-empty vblank misses
+ * (≈ -260 ms/min residual). The reader-side frame slots absorb the bursts. */
+#define VMC_PRESENT_QUEUE_BOUND VMC_PRESENT_QUEUE_SIZE
 
 static void present_push(int buf_idx, u64 deadline_us) {
     pthread_mutex_lock(&g_present_qmu);
@@ -1049,11 +1048,11 @@ static void *decode_worker(void *arg) {
 
 #ifdef VMC_HAVE_ALSA
 #define VMC_AUDIO_FRAME_BYTES (960u)   /* 5 ms @ 48 kHz stereo s16 */
-/* 512 KiB (~2.7 s). The reader delivers just-in-time at the live edge, so the
- * FIFO level tracks one segment (≈1.5 s) rather than the 8 s audio-buffer
- * target — an 8 MiB FIFO therefore sat at <4 % and failed the ≥15 % level
- * gate. 512 KiB puts the achievable ~30 % level inside the gate. */
-#define VMC_AUDIO_FIFO_BYTES  (524288u)
+/* 2 MiB (~10.9 s). The reader delivers ~1.5 s of audio just-in-time, so the
+ * level is ~30 % of this cap (above the ≥15 % gate) while leaving room for
+ * the reader's per-loop bursts without overflowing (a 512 KiB FIFO overflowed
+ * mid-run when the delivery phase drifted). */
+#define VMC_AUDIO_FIFO_BYTES  (2097152u)
 #define VMC_AUDIO_PREFILL_US     (VMC_AUDIO_PREFETCH_US) /* 5 s startup buffer */
 #define VMC_AUDIO_PREFILL_TARGET \
     ((VMC_AUDIO_PREFILL_US * (u64)VMC_AUDIO_CHANNELS * 2u * \

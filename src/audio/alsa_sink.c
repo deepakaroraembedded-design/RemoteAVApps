@@ -51,7 +51,7 @@ static vmc_status alsa_play(void *ctx, const i16 *pcm, sz_t frames) {
         if (vmc_tlm_enabled())
             vmc_tlm_emit("buf", "\"which\":\"audio_fifo\","
                          "\"event\":\"underflow\",\"level\":0,"
-                         "\"cap\":524288,\"count\":1");
+                         "\"cap\":2097152,\"count\":1");
         r = snd_pcm_recover(a->pcm, (int)r, 1);
         if (r < 0) {
 #ifdef VMC_DEBUG

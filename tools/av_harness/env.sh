@@ -64,7 +64,7 @@ export AUDIO_RATE="${AUDIO_RATE:-48000}"             # the client's ALSA output 
                                                       # 48k — the period-deviation gate must count
                                                       # the OUTPUT periods, not the content rate)
 export AUDIO_PERIOD="${AUDIO_PERIOD:-240}"           # 5 ms ALSA period (960 B stereo s16 @48k)
-export AUDIO_FIFO_BYTES="${AUDIO_FIFO_BYTES:-524288}" # client audio FIFO (512 KiB)
+export AUDIO_FIFO_BYTES="${AUDIO_FIFO_BYTES:-2097152}" # client audio FIFO (2 MiB)
 export SEG_DURATION_S="${SEG_DURATION_S:-1.0}"
 # Presentation cadence reference for the frame-interval gate. At 60 fps content
 # the per-frame period is 16.667 ms (not the 41.667 ms the 24 fps pipeline was
