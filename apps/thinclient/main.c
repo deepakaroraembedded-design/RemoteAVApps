@@ -695,37 +695,36 @@ static void *present_worker(void *arg) {
             VMC_LOGW("present: PageFlip failed for buf %d", e.buf_idx);
             break;
         }
-        /* Drain again so any flip that completed while we were waiting is
-         * picked up and reported as a vrender with its real vblank time. */
-        if (vmc_drm_scanout_drain(&g_drm) > 0 && g_drm.last_completed >= 0) {
+        /* Drain again so the flip completed while we waited is reported as a
+         * vrender with its real vblank timestamp. */
+        (void)vmc_drm_scanout_drain(&g_drm);
+        if (g_drm.last_completed >= 0 && g_drm.last_completed < VMC_DRM_MAX_BUFS) {
             const int cb = g_drm.last_completed;
             const u64 vblank_us = g_drm.last_flip_ts_us;
             g_drm.last_completed = -1;
-            if (cb < VMC_DRM_MAX_BUFS && cb >= 0) {
-                const vmc_vmeta *m = &g_vmeta[cb];
-                const int repeat = (cb == g_last_presented_buf) ? 1 : 0;
-                g_last_presented_buf = cb;
-                const i64 apos = tlm_audio_content_us();
-                const u64 wall_now = vmc_time_wall_us();
-                tlm_vrender_emit(cb, vblank_us, g_drm.bufs[cb].submit_wall_us,
-                                 m->deadline_us, m->fidx, m->seg, m->pts_us,
-                                 m->decode_us, m->conv_us, repeat,
-                                 (u64)apos);
-                if (apos >= 0) {
-                    const i64 late = (i64)wall_now - (i64)m->deadline_us;
-                    if (late > (i64)(frame_period_us * 3u / 2u) &&
-                        vmc_tlm_enabled())
-                        vmc_tlm_emit("sync", "\"kind\":\"vsync_miss\","
-                                     "\"detail\":\"deadline_exceeded\","
-                                     "\"us\":%lld,\"frame_idx\":%u",
-                                     (long long)late, m->fidx);
-                }
-                if (repeat && vmc_tlm_enabled())
-                    vmc_tlm_emit("sync", "\"kind\":\"vsync_dup\","
-                                 "\"detail\":\"same_buffer_rescan\","
-                                 "\"us\":%llu,\"frame_idx\":%u",
-                                 (unsigned long long)vblank_us, m->fidx);
+            const vmc_vmeta *m = &g_vmeta[cb];
+            const int repeat = (cb == g_last_presented_buf) ? 1 : 0;
+            g_last_presented_buf = cb;
+            const i64 apos = tlm_audio_content_us();
+            const u64 wall_now = vmc_time_wall_us();
+            tlm_vrender_emit(cb, vblank_us, g_drm.bufs[cb].submit_wall_us,
+                             m->deadline_us, m->fidx, m->seg, m->pts_us,
+                             m->decode_us, m->conv_us, repeat,
+                             (u64)apos);
+            if (apos >= 0) {
+                const i64 late = (i64)wall_now - (i64)m->deadline_us;
+                if (late > (i64)(frame_period_us * 3u / 2u) &&
+                    vmc_tlm_enabled())
+                    vmc_tlm_emit("sync", "\"kind\":\"vsync_miss\","
+                                 "\"detail\":\"deadline_exceeded\","
+                                 "\"us\":%lld,\"frame_idx\":%u",
+                                 (long long)late, m->fidx);
             }
+            if (repeat && vmc_tlm_enabled())
+                vmc_tlm_emit("sync", "\"kind\":\"vsync_dup\","
+                             "\"detail\":\"same_buffer_rescan\","
+                             "\"us\":%llu,\"frame_idx\":%u",
+                             (unsigned long long)vblank_us, m->fidx);
         }
         g_presented++;
         g_av_armed = true;
