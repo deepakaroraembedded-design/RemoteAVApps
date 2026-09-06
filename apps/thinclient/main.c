@@ -1018,17 +1018,43 @@ static void *decode_worker(void *arg) {
                 const u64 handoff_us = t_handoff - t_decoded;
                 latency_record((u64)e2e, decode_us, queue_us, handoff_us);
             }
+            static u64 s_last_present_wall_us = 0;
             if (frame_period_us > 0 && deadline_us != 0) {
-                /* Hold to the (audio-master) presentation clock before
-                 * presenting. Iterates so a stalled audio clock (dash_pres_clock
-                 * reverts to wall) can never hold video more than a moment. */
+                /* Smooth the fb0 cadence: present at max(deadline,
+                 * last_present_wall + frame_period), BOTH in the wall domain.
+                 * The deadline gates the A/V sync (never present ahead of the
+                 * audio); the frame-period floor removes the back-to-back
+                 * bursts that otherwise happen when the video is briefly
+                 * behind (2 ms intervals then a ~70 ms gap — the jitter the
+                 * operator sees). The wall clock is used for the cadence so a
+                 * momentarily stale audio clock (dash_pres_clock falling back
+                 * to wall) can never stall the presentation cadence. */
+                u64 target = deadline_us;
+                if (s_last_present_wall_us != 0) {
+                    const u64 next = s_last_present_wall_us + frame_period_us;
+                    if (next > target) target = next;
+                }
+                /* NOTE: no catch-up branch. Presenting immediately whenever
+                 * the video is behind (the old `wall0 > target + period`
+                 * branch) paced the presentation at the reader's burst+idle
+                 * rate (~54 fps instead of 60), which made the content lag the
+                 * audio by ~5 s/min until it stabilized at a -5.4 s offset.
+                 * The cadence floor (max(deadline, last + period)) holds the
+                 * presentation at exactly one frame per period, and the reader
+                 * delivers each segment ~1 s before its deadlines, so the
+                 * presentation lands ON the deadlines (av_offset ≈ 0). */
                 for (int i = 0; i < 600; i++) {
-                    const u64 c = dash_pres_clock();
-                    if (c >= deadline_us) break;
-                    av_usleep(3000);
+                    if ((u64)vmc_time_wall_us() >= target) break;
+                    av_usleep(1000);
                     if (!g_run_decode) break;
                 }
-                const u64 now2 = dash_pres_clock();
+                /* Pace the present STARTS at exactly frame_period: record the
+                 * scheduled target (not the wall AFTER the memcpy) so the
+                 * present time does not inflate the next frame's cadence by
+                 * ~1.6 ms/frame — that accumulated to 18.3 ms intervals
+                 * (54 fps) and a ~8 s/min drift. */
+                s_last_present_wall_us = target;
+                const u64 now2 = (u64)vmc_time_wall_us();
                 if (now2 > deadline_us + frame_period_us) {
 #ifdef VMC_DEBUG
                     g_frames_late++;
@@ -1051,7 +1077,10 @@ static void *decode_worker(void *arg) {
                 const i64 apos = tlm_audio_content_us();
                 tlm_vrender_emit(-1, vblank, 0, deadline_us,
                                  g_frames[idx].fidx, g_frames[idx].seg,
-                                 g_frames[idx].pts_us, decode_us, 0, 0,
+                                 g_frames[idx].pts_us, decode_us,
+                                 (vblank > t_before_present)
+                                     ? vblank - t_before_present : 0,
+                                 0,
                                  (u64)apos);
             }
             (void)t_before_present;
@@ -1089,13 +1118,13 @@ static vmc_audio_pipeline g_audio_pipe;
 static pthread_t g_audio_tid;
 static bool g_audio_started = false;
 #ifdef VMC_HAVE_FFMPEG
-/* Adaptive rate compensation: the audio worker stretches/compresses the
- * decoded 48 kHz audio by a servo-adjusted delta (sample duplication, see the
- * render path) so the delivered sample rate matches the ALSA/HDMI sink clock
- * exactly. Without it, AAC segment quantization and HDMI clock offset make
- * delivered audio run short of realtime, draining the FIFO. */
+/* Fixed rate compensation: the audio worker stretches the decoded 48 kHz
+ * audio by a fixed delta (sample duplication, see the render path) so the
+ * FIFO consumption matches the reader's delivery rate (which is ~2.3 %
+ * short of realtime because the per-segment demux drops ~1 AAC boundary
+ * frame per second). Without it, delivered audio runs short of realtime,
+ * draining the FIFO and producing audible underflows/xruns. */
 static int g_rate_delta = 0;
-static u64 g_rate_check_us = 0;
 #endif
 
 static void *audio_worker(void *arg) {
@@ -1113,8 +1142,15 @@ static void *audio_worker(void *arg) {
         pthread_mutex_unlock(&g_audio_mu);
     }
 #ifdef VMC_HAVE_FFMPEG
-    g_rate_delta = 0;
-    g_rate_check_us = 0;
+    /* Fixed make-up for the AAC boundary-frame loss: the per-segment demux
+     * drops ~1 AAC frame per 1 s segment (~2.3 %), so the reader delivers
+     * ~97.7 % of the nominal 48 kHz/s and the FIFO drains to underflow/xrun
+     * once the prefill is gone. Duplicate a fixed fraction of output samples
+     * (1 per ~43) so the FIFO consumption matches the delivery rate and the
+     * FIFO holds its level. A constant, deterministic compensation — NOT a
+     * FIFO-level-chasing servo — so the audio-master clock (the ALSA
+     * position, realtime) and the video timeline are unaffected. */
+    g_rate_delta = 1120; /* +2.33 % (measured loss 2.3 %) */
 #endif
 #ifdef VMC_DEBUG
     bool low_water = false;
@@ -1251,23 +1287,6 @@ static void *audio_worker(void *arg) {
             /* Starved: pace this path so a silent/non-blocking sink does not
              * spin at 100 % CPU while we wait for the next audio segment. */
             if (avail < sizeof(pcm)) av_usleep(5000);
-            /* Adaptive rate compensation servo (every 2 s): if the FIFO is
-             * draining, stretch the audio slightly (more output frames per
-             * input) so delivered rate matches the sink clock exactly; if it
-             * overflows, relax. Keeps the FIFO inside the 0.4-1.2 MB band. */
-            {
-                const u64 now_mono = vmc_time_now_us();
-                if (g_rate_check_us == 0) g_rate_check_us = now_mono;
-                if (now_mono - g_rate_check_us >= 2000000u) {
-                    g_rate_check_us = now_mono;
-                    /* Disabled: adaptive pitch compensation was duplicating/dropping
-                     * samples to chase a FIFO level, which made the audio clock
-                     * drift away from the video timeline. With a large live
-                     * buffer, the small DASH/AAC boundary loss is absorbed as
-                     * occasional silence rather than a continuous A/V drift. */
-                    g_rate_delta = 0;
-                }
-            }
 #endif
         /* Audio-master clock: drive the video presenter from the actual ALSA
          * playback position, not the amount of data consumed from the FIFO.
@@ -1287,23 +1306,14 @@ static void *audio_worker(void *arg) {
             /* Fallback for a sink that lost its position (e.g. after a fatal
              * ALSA error). Estimate from the bytes fed to the sink. */
             if (data_n > 0) {
-                if (g_audio_start_wall_us == 0) {
-                    g_audio_start_wall_us = (u64)vmc_time_now_wall_us();
-                    g_audio_delay_us = 0; /* fallback has no sink delay info */
-                    pthread_mutex_lock(&g_anchor_mu);
-                    const int anchor_seg = g_anchor_seg;
-                    pthread_mutex_unlock(&g_anchor_mu);
-                    if (anchor_seg != 0)
-                        dash_resync(anchor_seg, 0, "audio-start");
-                }
                 g_audio_bytes_consumed += data_n;
                 g_audio_active = true;
                 g_audio_last_advance_wall = (u64)vmc_time_now_wall_us();
-            }
-            if (g_audio_start_wall_us != 0) {
-                g_audio_pos_us = g_audio_start_wall_us +
-                    (g_audio_bytes_consumed / 4u) * 1000000u /
-                        VMC_AUDIO_SAMPLE_RATE;
+                if (g_audio_start_wall_us != 0) {
+                    g_audio_pos_us = g_audio_start_wall_us +
+                        (g_audio_bytes_consumed / 4u) * 1000000u /
+                            VMC_AUDIO_SAMPLE_RATE;
+                }
             }
         }
         if (g_audio_active && g_audio_start_wall_us == 0) {
@@ -2795,7 +2805,7 @@ static void *dash_reader_direct(void *arg) {
                           (u64)m.seg_duration_us);
                 int video_target = live_edge - 1 - video_buffer_segments;
                 if (video_target < m.start_number) video_target = m.start_number;
-                int audio_target = live_edge - 1;
+                int audio_target = live_edge;
                 if (audio_target < (int)m.start_number)
                     audio_target = (int)m.start_number;
                 int audio_oldest = live_edge - 1 - audio_buffer_segments;
@@ -2839,13 +2849,13 @@ static void *dash_reader_direct(void *arg) {
                     }
                     last_anum = (int)m.start_number - 1;
                     at = last_anum + 1;
-                    /* Skip the deleted content entirely and start from the
-                     * current buffered window (ahead of the deleted tail), so
-                     * the catch-up burst stays bounded to the window size. */
-                    if (at < audio_oldest) {
-                        last_anum = audio_oldest - 1;
-                        at = audio_oldest;
-                    }
+                    /* Jump to the manifest window start (startNumber), the
+                     * SAME position the video guard jumps to. Jumping the
+                     * audio to audio_oldest (the live edge) instead left the
+                     * audio ~50-80 s ahead of the video after a fall-behind
+                     * recovery and broke A/V alignment for the rest of the
+                     * run. The catch-up burst fetches startNumber..live_edge,
+                     * bounded by the FIFO cap. */
                     if (at > audio_target) at = audio_target;
                 }
                 if (at > audio_target) at = audio_target;
@@ -2907,8 +2917,19 @@ static void *dash_reader_direct(void *arg) {
              * that, one new segment per second (the edge advance) keeps it
              * full. */
             int video_fetched = 0;
-            int vfetch_hi = live_edge - 1;
+            /* Fetch up to live_edge + 1: the segment completing at the NEXT
+             * boundary. Fetching it while it is still being written makes the
+             * server hold the connection until it completes, so the delivery
+             * lands exactly ON the boundary instead of boundary + (poll
+             * granularity + fetch time) — which drifted the delivery cadence
+             * to ~1.12 s/segment (the video fell behind the audio ~8 s/min).
+             * The fetch of live_edge + 1 blocks the loop at most the remaining
+             * segment duration; the fall-behind guard below still recovers if
+             * the reader is far behind the window. */
+            int vfetch_hi = live_edge + 1;
             if (vfetch_hi < video_target) vfetch_hi = video_target;
+            if (total_segments > 0 && vfetch_hi > (int)total_segments)
+                vfetch_hi = (int)total_segments;
             int vn = (last_vnum < 0) ? video_target : (last_vnum + 1);
             /* Same rolling-window guard as audio: if we fell behind and the
              * next segment was deleted by the server (startNumber rolled past
@@ -3086,12 +3107,19 @@ static void *dash_reader_direct(void *arg) {
                                      (int64_t)(live_edge + 1) *
                                          m.seg_duration_us;
                 /* Wake early enough that the segment fetch completes AT the
-                 * boundary: sleeping until `next` and then fetching (~200 ms)
-                 * added the fetch time to every loop, drifting the delivery
-                 * cadence to 1.2 s per segment (0.83 seg/s) and starving the
-                 * audio FIFO. The server holds the connection for an
-                 * in-progress segment, so an early fetch is safe. */
-                const int64_t fetch_lead = (int64_t)g_seg_fetch_ewma_us;
+                 * boundary. The fetch_lead must cover the FULL pre-sleep loop
+                 * work (audio fetch + video fetch + demux), not just the video
+                 * fetch: with only the video-fetch EWMA (~150 ms) the reader
+                 * woke ~110 ms late every loop, drifting the delivery cadence
+                 * to 1.14 s/segment (0.88 seg/s) and making the video present
+                 * at ~52 fps — the A/V offset accumulated ~8 s/min. The server
+                 * holds the connection for an in-progress segment, so an early
+                 * fetch is safe. */
+                static int64_t s_prev_work_us = 0;
+                const int64_t work_us = t3_vpost - t0;
+                const int64_t fetch_lead =
+                    (s_prev_work_us > 0) ? s_prev_work_us : work_us;
+                s_prev_work_us = work_us;
                 const int64_t wait =
                     next - (int64_t)vmc_time_now_wall_us() - fetch_lead;
                 if (wait > 0) av_usleep((unsigned)wait);
