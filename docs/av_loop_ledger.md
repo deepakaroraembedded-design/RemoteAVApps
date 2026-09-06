@@ -42,6 +42,20 @@ journey:  First hypothesis (EBUSY→wait_flip double-poll locking flips at 2 vbl
          genuinely lost events.
 result:    cadence/DRM class CLOSED. Next: reader delivery (buffers class).
 
+## iter-004  2026-09-06T16:25Z  commit 79c419d  tier=smoke
+verdict: FAIL   primary_fault: av_sync (drift)   streak: 0
+buckets: 0/3 pass   worst_bucket: 0
+run:     av_offset -3.1s → -6.7s (drift -1810ms/min)  present_delay 7.0→10.6s
+         frames_presented 3492 (yield 0.970)  frame_interval_p95_err 0.33ms
+         audio underflows 48/94/104  overflows 0  audio_period_dev 0.009-0.03
+         FIFO level 0.0%  eos FALSE
+conclusion: the remaining fault is the video rate: 2.7% of flips take 2 vblanks
+         (33 ms intervals), each adding a permanent 16.7 ms of av lateness
+         (≈1800 ms/min). Present-queue bounding made it worse (decode gated to
+         58 fps); the unbound queue + 8-buffer pool is the best so far. The
+         serialization submits at the vblank event and occasionally lands in the
+         driver's flip window. This is the longrun front to converge.
+
 ## iter-003  2026-09-06T16:20Z  commit df63e41  tier=full (first 21-min)
 verdict: ERROR (window overran; sanity 22 buckets)   primary_fault: av_sync   streak: 0
 buckets: 0/22 pass   worst_bucket: 0
@@ -73,6 +87,7 @@ change:      (next iteration)
 result:      buffers/cadence largely converged in smoke; the longrun front is the
          video rate vs audio-master rate and the mid-run audio stall.
 
+## iter-002  2026-09-06T15:50Z  commit 1d981dc  tier=smoke (buffers class)
 verdict: FAIL   primary_fault: av_sync (buffers improved 12x)   streak: 0
 buckets: 0/3 pass   worst_bucket: 0
 run:     audio_fifo_underflows 34/103/107 (was 2050)  audio_pad 3.5k/11k (was 485k)
