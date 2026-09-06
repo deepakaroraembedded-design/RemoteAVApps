@@ -212,7 +212,6 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
     long bitrate = (long)width * (long)height * 3L;
     if (bitrate < 5000000L) bitrate = 5000000L;
     char gv[16], bv[32], mr[32], bs[32], size[64], manifest[320];
-    snprintf(gv, sizeof(gv), "%d", fps);
     snprintf(bv, sizeof(bv), "%ld", bitrate);
     snprintf(mr, sizeof(mr), "%ld", (long)(bitrate * 12L / 10L));
     snprintf(bs, sizeof(bs), "%ld", (long)(bitrate / 2L));
@@ -282,6 +281,12 @@ static int spawn_ffmpeg(const char *input, int width, int height, int fps,
         argv[n++] = "-i";
         argv[n++] = size;
     }
+    /* The GOP must match the real content frame rate. It is computed HERE
+     * (after the lavfi probe updated `fps` from the input's r_frame_rate), not
+     * before: with the old ordering the `-g` used the 24 fps fallback while the
+     * filter paced at 60 fps, so keyframes landed every 0.4 s and the dash
+     * muxer grouped 3 GOPs into 1.2 s segments (0.83 seg/s). */
+    snprintf(gv, sizeof(gv), "%d", fps);
     argv[n++] = "-map";
     argv[n++] = "0:v:0";
     if (has_audio) {
