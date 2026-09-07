@@ -294,6 +294,7 @@ def build_buckets(path, t0, span_s, bucket_s, fifo_cap, lat_ctx, fps):
 
     bad = 0
     eos = None
+    drain_from = None
     a_timeline = []          # (render_us, content_pts_us) for the fallback path
     need_timeline = True     # decided after the first few vrenders
     direct_seen = 0
@@ -312,6 +313,12 @@ def build_buckets(path, t0, span_s, bucket_s, fifo_cap, lat_ctx, fps):
         if ts is None:
             continue
         rel = (ts - t0) / 1e6
+        # EOS drain: once the client has emitted `eos` (end of content), the
+        # remaining events are the drain tail — the plan says its underflows are
+        # expected and must not count as failures. Drop them so they cannot land
+        # in a gated bucket.
+        if drain_from is not None and rel > drain_from:
+            continue
         bi = int(rel // bucket_s)
         if bi < 0:
             continue
@@ -394,6 +401,7 @@ def build_buckets(path, t0, span_s, bucket_s, fifo_cap, lat_ctx, fps):
                 b.rtt_ms.append(e["rtt_us"] / 1000.0)
         elif t == "eos":
             eos = rel
+            drain_from = rel
 
         # once enough direct pairs exist, stop growing the fallback timeline
         if need_timeline and vr_seen > 500:
@@ -971,6 +979,12 @@ def main():
         return 1
 
     span_s = (t1 - t0) / 1e6
+    # Buckets are built against the NOMINAL measured window (1260 - warmup -
+    # tail), clamped so a harness window overshoot (30 s heartbeat sleeps + the
+    # full-tier EOS wait inflate the raw telemetry span) cannot mint extra
+    # gated buckets out of the EOS drain. The raw span is kept for the
+    # completion / stream-ended-early accounting.
+    bucket_span = min(span_s, float(meta.get("window_s", span_s)))
 
     # Latency context: align the client monotonic timeline to realtime via the
     # 1 Hz clock_sync pairs, and the content timeline via the server's mpd_update
@@ -989,7 +1003,7 @@ def main():
                "seg_dur_s": float(meta.get("seg_duration_s", 1.0))}
 
     buckets, bad, eos_rel, a_tl, direct, vr = build_buckets(
-        cli_path, t0, span_s, bucket_s, fifo_cap, lat_ctx, fps)
+        cli_path, t0, bucket_span, bucket_s, fifo_cap, lat_ctx, fps)
 
     # Fallback A/V pairing when audio_pos_us was not stamped in the flip handler.
     if vr and direct < 0.5 * vr and a_tl:
