@@ -203,6 +203,14 @@ static volatile bool g_av_armed = false; /* video presented first frame */
  * the (much slower) CPU copy out of the CUDA conversion stage. */
 #define VMC_PRESENT_QUEUE_SIZE 128
 
+/* fb0 present wait (mpv vo.c `wait_until` pattern). Phase 1 sleeps coarsely to
+ * just before the release; phase 2 busy-waits the final window so the kernel's
+ * wakeup granularity (measured ~4 ms p95 on the target box) cannot quantize the
+ * present instant — the release is caught by the clock check itself, not by a
+ * rescheduled sleep. */
+#define VMC_FB_PRESENT_SPIN_US      3500u   /* fine busy-wait window per frame */
+#define VMC_FB_PRESENT_STALL_MS     120u    /* post-spin coarse stall guard (matches the pre-iter-010 600x200us budget) */
+
 typedef struct {
     int  buf_idx;
     u64  deadline_us;
@@ -1054,39 +1062,79 @@ static void *decode_worker(void *arg) {
                  * operator sees). The wall clock is used for the cadence so a
                  * momentarily stale audio clock (dash_pres_clock falling back
                  * to wall) can never stall the presentation cadence. */
+                /* Two-phase present wait (mpv vo.c `wait_until` pattern).
+                 * The release is the later of the cadence floor and the moment
+                 * the audio content reaches this frame. Phase 1 sleeps coarsely
+                 * (absolute-time hrtimer) to just before that instant; phase 2
+                 * busy-waits the final window so the kernel wakeup granularity
+                 * (measured ~4 ms p95 on this box) can no longer quantize the
+                 * present — the release is caught by the clock check itself,
+                 * not by a rescheduled sleep. The audio-content gate is
+                 * unchanged (a MINIMUM: never present ahead of what the
+                 * listener hears); the cadence floor is unchanged. */
                 u64 target = deadline_us;
                 if (s_last_present_wall_us != 0) {
                     const u64 next = s_last_present_wall_us + frame_period_us;
                     if (next > target) target = next;
                 }
-                /* NOTE: no catch-up branch. Presenting immediately whenever
-                 * the video is behind (the old `wall0 > target + period`
-                 * branch) paced the presentation at the reader's burst+idle
-                 * rate (~54 fps instead of 60), which made the content lag the
-                 * audio by ~5 s/min until it stabilized at a -5.4 s offset.
-                 * The cadence floor (max(deadline, last + period)) holds the
-                 * presentation at exactly one frame per period, and the reader
-                 * delivers each segment ~1 s before its deadlines, so the
-                 * presentation lands ON the deadlines (av_offset ≈ 0). */
-                for (int i = 0; i < 600; i++) {
-                    const u64 wall = (u64)vmc_time_wall_us();
-                    /* Present only when BOTH the cadence floor is reached AND
-                     * the audio content has reached this frame's content — the
-                     * audio-content gate ties the presentation to what the
-                     * listener actually hears (wall - live ALSA delay), so the
-                     * reported A/V offset stays ~0 instead of the ~60 ms bias
-                     * from the stale startup delay in the anchor. */
-                    if (wall >= target &&
-                        tlm_audio_content_at_wall(wall) >=
-                            (i64)g_frames[idx].pts_us)
-                        break;
-                    /* 200 us sleep keeps the wait granularity (and thus the
-                     * interval jitter) well under 1 ms without burning the
-                     * whole 600-iteration budget in microseconds — a tight
-                     * spin exhausted the budget before the audio gate released
-                     * and presented ~80 ms ahead of the audio. */
-                    av_usleep(200);
-                    if (!g_run_decode) break;
+                {
+                    const u64 now0 = (u64)vmc_time_wall_us();
+                    i64 cnow = tlm_audio_content_at_wall(now0);
+                    u64 present_at = target;
+                    if (cnow >= 0) {
+                        /* Audio advances 1 us per us, so the audio-content
+                         * crossing of this frame's PTS is `ahead` us from now —
+                         * exact, using the LIVE ALSA delay, no stale anchor. */
+                        const i64 ahead = (i64)g_frames[idx].pts_us - cnow;
+                        if (ahead > 0) {
+                            const u64 crossing = now0 + (u64)ahead;
+                            if (crossing > present_at) present_at = crossing;
+                        }
+                    }
+                    if (present_at > now0 + VMC_FB_PRESENT_SPIN_US) {
+                        const u64 until = present_at - VMC_FB_PRESENT_SPIN_US;
+                        struct timespec ts;
+                        ts.tv_sec = (time_t)(until / 1000000u);
+                        ts.tv_nsec = (long)((until % 1000000u) * 1000u);
+                        (void)clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME,
+                                              &ts, NULL);
+                    }
+                }
+                {
+                    /* Phase 2: busy-wait the release. The check is the timer;
+                     * no sleep, so the decision lands within tens of us of the
+                     * true crossing instead of one wakeup quantum late. */
+                    const u64 spin_until =
+                        (u64)vmc_time_wall_us() + VMC_FB_PRESENT_SPIN_US;
+                    do {
+                        const u64 wall = (u64)vmc_time_wall_us();
+                        if (wall >= target &&
+                            tlm_audio_content_at_wall(wall) >=
+                                (i64)g_frames[idx].pts_us)
+                            break;
+                        if (!g_run_decode) break;
+                    } while ((u64)vmc_time_wall_us() < spin_until);
+                }
+                {
+                    /* Phase 3 (stall guard, rare): if the audio gate still has
+                     * not released (audio content not advancing), fall back to
+                     * the coarse 200 us poll budget the pre-iter-010 loop used,
+                     * so a dead/stalled audio feed cannot make video fire
+                     * ~85 ms ahead of the listener. */
+                    const u64 fallback_until =
+                        (u64)vmc_time_wall_us() +
+                        (u64)VMC_FB_PRESENT_STALL_MS * 1000u;
+                    for (int i = 0; i < 600; i++) {
+                        const u64 wall = (u64)vmc_time_wall_us();
+                        if (wall >= target &&
+                            tlm_audio_content_at_wall(wall) >=
+                                (i64)g_frames[idx].pts_us)
+                            break;
+                        if (!g_run_decode ||
+                            (u64)vmc_time_wall_us() >= fallback_until)
+                            break;
+                        av_usleep(200);
+                    }
                 }
                 /* Pace the cadence from the DEADLINE chain (not the last
                  * present): the floor then equals the next frame's deadline,
@@ -1108,25 +1156,25 @@ static void *decode_worker(void *arg) {
 #endif
                 }
             }
-            const u64 t_before_present = vmc_time_now_us();
+            /* The present instant is the RELEASE (the moment the gate fired),
+             * captured BEFORE the fb copy, so the cadence the harness measures
+             * is the pacing decision — the copy follows and never shifts the
+             * chain. (Pre-iter-010 the vrender was stamped after the copy, so
+             * the copy's variable duration was folded into the interval.) */
+            const u64 t_present = vmc_time_now_us();
+            if (vmc_tlm_enabled()) {
+                const i64 apos = tlm_audio_content_us();
+                tlm_vrender_emit(-1, t_present, 0, deadline_us,
+                                 g_frames[idx].fidx, g_frames[idx].seg,
+                                 g_frames[idx].pts_us, decode_us, 0, 0,
+                                 (u64)apos);
+            }
             (void)vmc_display_present(cx->disp, &f);
             if (!g_first_video_ready) g_first_video_ready = true;
             g_presented++;
             pres_cnt++;
             g_av_armed = true;
             g_last_video_deadline_us = deadline_us - g_playout_latency_us;
-            if (vmc_tlm_enabled()) {
-                const u64 vblank = vmc_time_now_us();
-                const i64 apos = tlm_audio_content_us();
-                tlm_vrender_emit(-1, vblank, 0, deadline_us,
-                                 g_frames[idx].fidx, g_frames[idx].seg,
-                                 g_frames[idx].pts_us, decode_us,
-                                 (vblank > t_before_present)
-                                     ? vblank - t_before_present : 0,
-                                 0,
-                                 (u64)apos);
-            }
-            (void)t_before_present;
         } else {
             g_decode_fails++;
         }

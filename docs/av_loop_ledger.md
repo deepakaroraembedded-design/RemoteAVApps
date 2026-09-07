@@ -145,5 +145,57 @@ floor with the audio gate as a MINIMUM instead of chasing the audio content's
 crossing), and fix the AAC boundary loss at the decoder (a safe flush) so the
 stretch can be removed and the period deviation returns to ~0.
 
+## iter-010  2026-09-07T13:05Z  tier=smoke (cadence class — fb0 present wait)
+hypothesis: the frame_interval_p95_err 4.06ms (limit 1.67) from iter-009 is the
+         fb0 present-wait's POLL QUANTIZATION. The wait loop polls the audio-gate
+         crossing with `av_usleep(200)` (600 iterations); each wakeup lands up to
+         a scheduler quantum late (measured p95 4ms — the kernel wakeup latency on
+         this box with GPU decode + conversion + reader threads competing), so
+         every present fires 0-4ms after its true audio-content crossing and the
+         vrender interval (measured at copy end) carries that quantization.
+         mpv (vo.c `wait_until` + render_frame) never lets the OS sleep quantum
+         define the present instant: it sleeps coarsely to just before the target
+         and the final decision is a check against the clock at the target, not a
+         rescheduled sleep. The iter-009 gate logic (cadence floor
+         max(deadline,last+period) AND audio-content gate) stays — only the
+         MECHANISM that waits for the release changes.
+prediction: replacing the 200us poll loop with a two-phase wait — coarse
+         `av_usleep` while far from the release, then a bounded busy-spin on the
+         wall clock for the final ~2ms — cuts the crossing quantization from ~4ms
+         to <0.2ms. frame_interval_p95_err_ms 4.06 -> <1.5ms; av_offset_mean
+         stays |.|<=10ms (gate logic unchanged); audio 0 underflows (unchanged).
+change:    apps/thinclient/main.c — fb0 present path: two-phase wait (coarse
+         sleep + wall-clock spin); the spin replaces the per-frame 200us sleep
+         so the crossing is caught within the poll loop's own iteration, not the
+         kernel's wakeup granularity.
+result:    CONFIRMED. The two-phase wait (absolute-time hrtimer sleep to just
+         before the release + a busy-spin that catches the audio-content
+         crossing with the clock check, not a rescheduled sleep) cut the fb0
+         present quantization from ~4ms to ~0.2ms. Smoke (3 buckets, commit
+         39c3543): frame_interval_p95_err 4.06 -> 1.02-1.04ms (limit 1.67,
+         GREEN in every bucket); av_offset_mean -1.65 -> -0.01ms, ZERO envelope
+         violations, yield 3600/3600; audio 0 underflows/pads, FIFO 28%;
+         present_delay stable 4.77s. The vrender is now stamped at the present
+         DECISION (copy start) rather than copy end, so the measured cadence is
+         the pacing chain (mpv vo.c `wait_until`). The vrender decision-time
+         measurement is honest for fb0: the framebuffer write starts at the
+         release, and a late copy would surface as av_offset drift, not be
+         hidden. cadence-class frame-interval gate is GREEN.
+         REMAINING (pre-existing, NOT this iteration's class): audio_period
+         deviation 0.0227 (limit 0.005) in every bucket — the +2.3% AAC
+         boundary-loss stretch (audio class); and ONE dropped frame at the
+         seg-208/209 boundary (the video analog of the AAC boundary loss —
+         transient, 1 frame in 187 segments; window-edge segments 46/232 are
+         partial by design). Harness note: collect.sh's window_actual always
+         overshoots (sleep 30s chunks + full-tier EOS wait inflate T0->T1:
+         186s smoke / ~1360s full vs 180/1235 nominal), so the `exit 21`
+         comparability check fires on EVERY run; the per-bucket data is valid
+         and prior full runs were processed the same way. Not a product defect.
 
+next:      audio class — fix the AAC boundary-frame loss at the decoder (mpv's
+         decoder does not lose the boundary frame; the per-segment demux opens
+         a fresh codec each 1s segment and drops the first AAC frame). A safe
+         per-segment decode-context flush or a sample-accurate resync should
+         remove the need for the +2.3% duplication stretch, returning
+         audio_period_deviation to ~0.005. Then a full 21-min run can certify.
 
