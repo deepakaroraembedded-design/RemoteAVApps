@@ -119,4 +119,31 @@ Next: eliminate the residual av_offset (-60ms converging), reduce the cadence
 jitter below 1.67ms, and reconcile the audio period deviation with the FIFO
 stability (the stretch trades 0 underflows for a 2.3% period deviation).
 
+## iter-009  2026-09-07T00:50Z  commit 007eb08  tier=smoke (fb0 A/V sync)
+hypothesis: the reported A/V offset (stable -62ms, run-variable to -400ms) was
+         (a) the audio-content mapping using the startup ALSA delay (~5ms)
+         while the live buffer delay was ~170-250ms, so the deadline was
+         ~160ms ahead of what the listener heard; and (b) the audio-start
+         resync re-anchoring the deadlines by -240..-900ms while the cadence's
+         last-present clock did not move, leaving a permanent backlog.
+result:    CONFIRMED. Fixes: the content mapping + the deadline now use the
+         live EWMA-smoothed ALSA delay; the cadence tracks the frame's DEADLINE
+         (so resyncs propagate into the cadence, no permanent backlog); the
+         wait gates the presentation on the audio content reaching the frame;
+         wait granularity 200us. Measured (smoke): av_offset mean -1.65ms
+         (p95 4.2, ZERO envelope violations, drift 0), yield ~1.0 (11160/11162),
+         audio 0 underflows/pads, FIFO 21%. av_sync class is GREEN.
+         Remaining: frame_interval_p95_err 4.06ms (limit 1.67) — the audio
+         gate's content-crossing jitter + the decode overhead; and
+         audio_period_deviation 0.0227 (limit 0.005) — the stretch's longer
+         periods (the AAC boundary loss needs a decoder-level fix, the
+         avcodec_send_packet(NULL) flush attempt broke the decoder and was
+         reverted).
+
+Next: tighten the cadence under 1.67ms (pace the presents on the cadence
+floor with the audio gate as a MINIMUM instead of chasing the audio content's
+crossing), and fix the AAC boundary loss at the decoder (a safe flush) so the
+stretch can be removed and the period deviation returns to ~0.
+
+
 
