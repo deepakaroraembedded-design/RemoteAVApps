@@ -294,3 +294,31 @@ next:      full 21-minute fb0 run to certify (drift, leaks, EOS are only
          measurable at full scale). Then the confirmation matrix (VMC_DRM=1,
          second clip, back-to-back replay).
 
+## iter-013  2026-09-07T22:10Z  tier=full (EOS / play-once class)
+hypothesis: the first full run (iter-012, commit ec24bfc) had 20/22 buckets
+         green (drift 0.0ms/min, cadence 1.05ms, audio 12000/12000, FIFO
+         26-30%, RSS +9.8MB, fd +1) — a flawless 20-minute stretch — but failed
+         buckets 20-22 and eos_reached=false. The failures are ALL end-of-
+         content: at t=1260s the server rewrites the MPD type="static" (its
+         static MPD OMITS availabilityStartTime), and dash_load_manifest
+         hard-requires availabilityStartTime (returns -1 without it). So every
+         post-EOS manifest reload fails (mpd_reload_fail=10), the reader keeps
+         the stale DYNAMIC MPD, total_segments=0, and the EOS path
+         (static_mpd && last_vnum >= total_segments-1) NEVER fires. The client
+         then sits caught-up; after 20s the main-loop reader watchdog mistakes
+         end-of-content for a stall, cancels + restarts the reader with
+         dash_resync("shutdown") repeatedly (resyncs 5->9), and the restarted
+         reader chases DELETED segments (server hold-404, 15s each) forever.
+         The audio FIFO drains (193+ underflows, pad) while the reader loops.
+prediction: making availabilityStartTime OPTIONAL when the MPD is static lets
+         the post-EOS reload parse, so the reader sees total_segments and the
+         EOS path fires: `eos` emitted, g_run=0, clean shutdown within ~1s of
+         the static flip. Run-level: eos_reached 0 -> 1; resyncs 7 -> <=1;
+         mpd_reload_fail 10 -> 0; buckets 20-22 become the (expected, harness-
+         excluded) EOS drain instead of a 20s watchdog loop.
+change:    apps/thinclient/main.c — dash_load_manifest: tolerate a missing
+         availabilityStartTime for type="static" MPDs (avail_start=0; the
+         live-edge math is clamped by total_segments at EOS, so a zero anchor
+         is safe there); dynamic MPDs still require it.
+result:    (filled in by iter-014's report)
+

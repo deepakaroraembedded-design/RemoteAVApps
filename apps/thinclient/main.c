@@ -2318,17 +2318,23 @@ static int dash_load_manifest(const char *mpd_url, dash_manifest *m) {
             m->duration_us = parse_duration_us(mdbuf);
         }
     }
-    /* availabilityStartTime */
+    /* availabilityStartTime. OPTIONAL for a type="static" MPD (play-once EOS:
+     * the server's static manifest omits it), where a zero anchor is safe
+     * because the live-edge math is clamped by total_segments and the EOS path
+     * exits before the anchor is ever used. A dynamic MPD without it is
+     * malformed — keep failing so we never chase phantom segments. */
     const char *at = strstr(s, "availabilityStartTime=\"");
-    if (!at) { free(body); return -1; }
-    const char *ae = strchr(at + strlen("availabilityStartTime=\""), '"');
-    char ast[64] = {0};
-    if (ae) {
-        size_t l = (size_t)(ae - (at + strlen("availabilityStartTime=\"")));
-        if (l > sizeof(ast) - 1) l = sizeof(ast) - 1;
-        memcpy(ast, at + strlen("availabilityStartTime=\""), l);
-        m->avail_start_us = parse_iso8601(ast);
+    if (!at) {
+        if (!m->static_mpd) { free(body); return -1; }
     } else {
+        const char *ae = strchr(at + strlen("availabilityStartTime=\""), '"');
+        char ast[64] = {0};
+        if (ae) {
+            size_t l = (size_t)(ae - (at + strlen("availabilityStartTime=\"")));
+            if (l > sizeof(ast) - 1) l = sizeof(ast) - 1;
+            memcpy(ast, at + strlen("availabilityStartTime=\""), l);
+            m->avail_start_us = parse_iso8601(ast);
+        }
     }
     /* publishTime: when the MPD was published; the live simulator advances
      * the live edge from this point, not from availabilityStartTime. */
@@ -2401,8 +2407,14 @@ static int dash_load_manifest(const char *mpd_url, dash_manifest *m) {
                                (u64)m->seg_duration_us);
     if (m->window_segments < 1) m->window_segments = 1;
 
+    if (m->seg_duration_us <= 0) { free(body); return -1; }
+    /* A static MPD (play-once EOS) has no availabilityStartTime (see above);
+     * a zero anchor is safe there because the live edge is clamped by
+     * total_segments and the EOS path exits before the anchor is used. */
+    if (m->static_mpd) { free(body); return 0; }
+    if (m->avail_start_us <= 0) { free(body); return -1; }
     free(body);
-    return (m->avail_start_us > 0 && m->seg_duration_us > 0) ? 0 : -1;
+    return 0;
 }
 
 /* Convert one decoded audio frame to S16 48 kHz stereo and push it into the
