@@ -320,5 +320,28 @@ change:    apps/thinclient/main.c — dash_load_manifest: tolerate a missing
          availabilityStartTime for type="static" MPDs (avail_start=0; the
          live-edge math is clamped by total_segments at EOS, so a zero anchor
          is safe there); dynamic MPDs still require it.
-result:    (filled in by iter-014's report)
+result:    CONFIRMED. Full 21-min run (commit 967a620, harness-fixed reprocess)
+         verdict PASS, primary_fault none, 20/20 buckets green, ZERO failed
+         gates. The client now plays the ENTIRE clip end to end: eos_reached
+         true, playback_span (content) 1259.98s (stream_ended_early 0.02s),
+         av_offset drift 0.0ms/min (excursion 0.0, p95_degrade 0), cadence
+         frame_interval_p95_err 1.03ms, audio 12000/12000, FIFO 24-29%,
+         0 underflows/overflows/pads, 0 drops, 0 resyncs, 0 mpd_reload_fail,
+         0 decoder errors, RSS +10.1MB, fd -1, disk flat (rolling window
+         working). EOS fixes were threefold: (a) dash_load_manifest tolerated
+         a missing availabilityStartTime AND a zero anchor for type="static"
+         MPDs (the server's static manifest omits it), so post-EOS reloads
+         parse and total_segments is known; (b) the reader now emits `eos`,
+         sets g_eos_reached + g_eos_end_wall_us and returns WITHOUT setting
+         g_run=0, so the decode/audio workers DRAIN the burst-fetched final
+         buffer before the main loop shuts down (no more cut-off tail); (c)
+         the reader-restart watchdog is skipped once g_eos_reached (no more
+         deleted-segment restart loop / resync storm). Harness (separate
+         commits, selftest 22/22 each): buckets built against the nominal
+         window + EOS-drain artifacts excluded from gating + stream_ended_early
+         compares CONTENT reached (max frame pts), not the window span.
+         FIRST FULL-RUN PASS on the fb0 path. streak = 1.
+
+next:      second consecutive full 21-min PASS (streak 2), then the
+         confirmation matrix (VMC_DRM=1, second clip, back-to-back replay).
 
