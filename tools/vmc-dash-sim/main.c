@@ -472,10 +472,30 @@ static void serve_progressive(int fd, const char *tmp_path,
 #ifdef VMC_DEBUG
     g_serve_progressive++;
 #endif
-    (void)final_path;
     http_headers(fd, 200, ct, -1, true);
     int f = open(tmp_path, O_RDONLY);
     if (f < 0) {
+        /* The tmp was already renamed away: serve the final file outright. */
+        int ff = open(final_path, O_RDONLY);
+        if (ff >= 0) {
+            struct stat fst;
+            if (fstat(ff, &fst) == 0 && fst.st_size > 0) {
+                char buf[65536];
+                off_t off = 0;
+                while (off < fst.st_size) {
+                    ssize_t n = pread(ff, buf, sizeof(buf), off);
+                    if (n <= 0) break;
+                    char hdr[32];
+                    int hn = snprintf(hdr, sizeof(hdr), "%zx\r\n",
+                                      (size_t)n);
+                    (void)write(fd, hdr, (size_t)hn);
+                    if (write(fd, buf, (size_t)n) != n) break;
+                    (void)write(fd, "\r\n", 2);
+                    off += n;
+                }
+            }
+            close(ff);
+        }
         const char term[] = "0\r\n\r\n";
         (void)write(fd, term, sizeof(term) - 1);
         return;
@@ -502,6 +522,35 @@ static void serve_progressive(int fd, const char *tmp_path,
         usleep(30000);
     }
     close(f);
+    /* The muxer renamed tmp -> m4s; bytes appended between our last read and
+     * the rename (the segment's tail, its final frame) were not sent. Send the
+     * remainder from the final file so the client never receives a truncated
+     * segment with a dropped last frame (iter-012: frames_dropped gate). */
+    {
+        struct stat fst;
+        if (stat(final_path, &fst) == 0 && fst.st_size > off) {
+            const size_t tail = (size_t)(fst.st_size - off);
+            char *buf = (char *)malloc(tail);
+            if (buf) {
+                int ff = open(final_path, O_RDONLY);
+                if (ff >= 0) {
+                    ssize_t n = pread(ff, buf, tail, off);
+                    if (n > 0) {
+                        char hdr[32];
+                        int hn = snprintf(hdr, sizeof(hdr), "%zx\r\n",
+                                          (size_t)n);
+                        (void)write(fd, hdr, (size_t)hn);
+                        if (write(fd, buf, (size_t)n) != n) {
+                            /* socket closed: nothing more to do */
+                        }
+                        (void)write(fd, "\r\n", 2);
+                    }
+                    close(ff);
+                }
+                free(buf);
+            }
+        }
+    }
     const char term[] = "0\r\n\r\n";
     (void)write(fd, term, sizeof(term) - 1);
 }

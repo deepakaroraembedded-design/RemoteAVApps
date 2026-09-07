@@ -255,3 +255,42 @@ next:      video reader — the rare first-frame-of-segment hole (0.5% of
          would make frames_dropped 0. Then a full 21-min run can certify the
          fb0 path.
 
+## iter-012  2026-09-07T21:40Z  tier=smoke (server segment-serve race)
+hypothesis: frames_dropped 2 per 3-minute smoke (segments 44 and 160) is NOT a
+         client decode fault — it is a SERVER-side serve race in vmc-dash-sim's
+         `serve_progressive`. The in-progress segment is served from the `.tmp`
+         file with chunked encoding; the loop polls `fstat/pread` then checks
+         `file_exists(tmp_path)`. If the ffmpeg dash muxer renames `.tmp` ->
+         `.m4s` (segment complete) in the window between the server's read and
+         its existence check, the loop breaks WITHOUT sending the bytes appended
+         after the read — the segment's TAIL (its last H.264 frame, the 60th) is
+         never delivered, the demux drops the partial last AU, and the vrender
+         stream shows a fidx gap of exactly 1 (the LAST frame of the segment).
+         This matches the evidence: the missing fidx (2637, 9597) is seg 44/160
+         frame 59 (their last frame), rare (the race window is microseconds,
+         ~0.5% of segments), and offline demux of COMPLETE segments is lossless
+         (60/60 frames).
+prediction: after the fetch completes (tmp gone), serve the remaining tail from
+         the now-final `.m4s` (st_size - off bytes) before the terminating
+         chunk. frames_dropped 2 -> 0 over a 3-bucket smoke; no cadence/audio/
+         A-V regression (the extra bytes are microseconds of delivery).
+change:    tools/vmc-dash-sim/main.c — serve_progressive: after the tmp->m4s
+         rename, send `final_size - off` bytes from final_path before the
+         terminating chunk.
+result:    CONFIRMED. serve_progressive now sends the segment tail from the final
+         `.m4s` after the tmp->m4s rename (and serves the final file outright
+         if the tmp is already gone). Smoke (3 buckets, commit 528de54):
+         verdict PASS, primary_fault none, ZERO failed gates in every bucket.
+         frames_dropped 2 -> 0; frame_interval_p95_err 1.02ms; audio_periods
+         12000/12000; av_offset_mean -0.01ms (drift 0, envelope 0); yield
+         3600/3600; FIFO 29.05% (0 underflows/overflows); present_delay stable
+         4.776s; no resyncs, no decoder errors, no network fails. FIRST fully
+         green smoke on the fb0 path. cadence + audio + buffers + network +
+         vsync + decoder classes all GREEN at smoke scale.
+         NOTE: this was the FIRST PASS — the smoke tier can only certify at
+         full scale; the 21-min run is next.
+
+next:      full 21-minute fb0 run to certify (drift, leaks, EOS are only
+         measurable at full scale). Then the confirmation matrix (VMC_DRM=1,
+         second clip, back-to-back replay).
+
