@@ -196,6 +196,14 @@ static pthread_mutex_t g_anchor_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static volatile bool g_av_armed = false; /* video presented first frame */
 
+/* Play-once EOS: set by the reader when the static MPD's final segment is
+ * fetched. The client does NOT exit immediately — the reader burst-fetches the
+ * last buffer-window of segments at EOS (live edge clamped to total_segments),
+ * and the decode/present workers must DRAIN them before shutdown, else the
+ * final ~2 s..43 s of content is never played (stream_ended_early). */
+static volatile bool g_eos_reached = false;
+static u64 g_eos_end_wall_us = 0;   /* wall time when all content has played */
+
 /* Separate present thread for DRM scanout: the decode worker decodes, converts,
  * and copies into a free DRM dumb buffer, then queues the DRM buffer index for
  * a dedicated thread. The present worker only waits for the audio-master
@@ -2801,7 +2809,7 @@ static void *dash_reader_direct(void *arg) {
     size_t init_a_len = 0;
     AVPacket *out = av_packet_alloc();
     dash_session s;
-    while (g_run) {
+    while (g_run && !g_eos_reached) {
         dash_manifest m;
         if (dash_load_manifest(url, &m) != 0) {
             VMC_LOGW("dash: manifest fetch failed — retrying");
@@ -3215,7 +3223,17 @@ static void *dash_reader_direct(void *arg) {
                                  g_video_frame_count > 0
                                      ? g_video_frame_count - 1u : 0u,
                                  last_vnum);
-                g_run = 0;
+                /* Do NOT set g_run=0 yet: the reader just burst-fetched the
+                 * final buffer-window of segments (live edge clamped to
+                 * total_segments), and the decode/present workers must drain
+                 * them (the last frames' deadlines are still seconds away). The
+                 * main loop watches g_eos_reached and shuts down once the
+                 * content has actually played out (g_eos_end_wall_us). */
+                g_eos_reached = true;
+                g_eos_end_wall_us = g_anchor_wall_us +
+                                    (u64)total_segments *
+                                        (u64)m.seg_duration_us +
+                                    g_playout_latency_us + 500000u;
                 break;
             }
 
@@ -3509,11 +3527,14 @@ static int run_dash(const char *url, vmc_log_level log_level) {
 #endif
             /* Reader watchdog: if no video packets for 20 s, the dash demuxer
              * is stuck (e.g. after the server restarted its encoder). Restart
-             * the reader thread so it re-reads the manifest. */
+             * the reader thread so it re-reads the manifest. At play-once EOS
+             * the reader has exited by design (it emits `eos` and returns); do
+             * NOT restart it — the decode worker is draining the final buffer
+             * and g_run is still set until g_eos_end_wall_us. */
             if (g_dash_pkts != last_pkts_seen) {
                 last_pkts_seen = g_dash_pkts;
                 last_pkts_time = now_ms;
-            } else if (now_ms - last_pkts_time > 20000u) {
+            } else if (!g_eos_reached && now_ms - last_pkts_time > 20000u) {
                 VMC_LOGW("dash: reader stalled — restarting reader thread");
                 pthread_cancel(dash_tid);
                 pthread_join(dash_tid, NULL);
@@ -3521,6 +3542,14 @@ static int run_dash(const char *url, vmc_log_level log_level) {
                                      (void *)url);
                 dash_resync(0, 0, "shutdown");
                 last_pkts_time = now_ms;
+            }
+            /* Play-once EOS drain: the reader has fetched everything; wait
+             * until the final frame/audio has actually played out (content end
+             * in the wall domain + playout latency + margin), then exit. */
+            if (g_eos_reached &&
+                (u64)vmc_time_wall_us() >= g_eos_end_wall_us) {
+                g_run = 0;
+                break;
             }
             last_stats_ms = now_ms;
         }
