@@ -187,6 +187,7 @@ static u64 g_seg_duration_us = 0;      /* nominal DASH segment duration */
 static u64 g_anchor_wall_us = 0;       /* wall-clock anchor (segment arrival) */
 static int g_anchor_seg = 0;           /* anchor segment number */
 static i64 g_timeline_adj_us = 0;      /* deadline shift from drift estimator */
+static i64 g_cadence_shift_us = 0;     /* pending fb0 cadence reset from a resync */
 static u64 g_playout_latency_us = 85000u;
 static i64 g_seg_interval_ewma = 0;    /* measured segment cadence (drift) */
 static u64 g_last_seg_arrival_wall = 0;
@@ -367,16 +368,29 @@ static vmc_vmeta g_vmeta[VMC_DRM_MAX_BUFS];
 static i64 tlm_audio_content_at_wall(u64 wall_us) {
     const u64 anchor = __atomic_load_n(&g_anchor_wall_us, __ATOMIC_RELAXED);
     if (anchor == 0) return -1;
-    i64 c = (i64)wall_us - (i64)anchor -
-            (i64)g_playout_latency_us -
+    /* Map a wall time to the audio CONTENT that reaches the DAC at that time
+     * using the LIVE ALSA delay (updated every audio-worker iteration). The
+     * startup delay baked into the anchor under-predicts the buffered latency
+     * by ~50-150 ms, which skews the reported A/V offset. */
+    const u64 astart =
+        __atomic_load_n(&g_audio_start_wall_us, __ATOMIC_RELAXED);
+    const u64 adelay = __atomic_load_n(&g_audio_delay_us, __ATOMIC_RELAXED);
+    if (astart == 0 || adelay == 0) {
+        i64 c = (i64)wall_us - (i64)anchor -
+                (i64)g_playout_latency_us -
+                __atomic_load_n(&g_timeline_adj_us, __ATOMIC_RELAXED);
+        return c < 0 ? 0 : c;
+    }
+    i64 c = (i64)wall_us - (i64)astart - (i64)adelay -
             __atomic_load_n(&g_timeline_adj_us, __ATOMIC_RELAXED);
     return c < 0 ? 0 : c;
 }
 
 static i64 tlm_audio_content_us(void) {
-    const u64 apos = __atomic_load_n(&g_audio_pos_us, __ATOMIC_RELAXED);
-    if (apos == 0) return -1;
-    return tlm_audio_content_at_wall(apos);
+    /* Report the audio content at the CURRENT wall (not the possibly-stale
+     * ALSA position captured at the audio worker's last iteration), so the
+     * reported A/V offset matches the presentation the listener hears. */
+    return tlm_audio_content_at_wall((u64)vmc_time_wall_us());
 }
 
 static void latency_update_rtt(vmc_session_ctx *sc, u32 sim_echo_ts) {
@@ -1019,6 +1033,17 @@ static void *decode_worker(void *arg) {
                 latency_record((u64)e2e, decode_us, queue_us, handoff_us);
             }
             static u64 s_last_present_wall_us = 0;
+            {
+                /* Reset the cadence when the anchor re-based (audio-start
+                 * resync): the re-anchored deadlines are ~240 ms earlier, and
+                 * keeping the old cadence phase left the video presenting the
+                 * whole backlog late. With the cadence reset the next present
+                 * lands on the (already-past) deadline, clearing the backlog
+                 * immediately instead of carrying a permanent offset. */
+                if (__atomic_exchange_n(&g_cadence_shift_us, 0,
+                                        __ATOMIC_RELAXED))
+                    s_last_present_wall_us = 0;
+            }
             if (frame_period_us > 0 && deadline_us != 0) {
                 /* Smooth the fb0 cadence: present at max(deadline,
                  * last_present_wall + frame_period), BOTH in the wall domain.
@@ -1044,16 +1069,34 @@ static void *decode_worker(void *arg) {
                  * delivers each segment ~1 s before its deadlines, so the
                  * presentation lands ON the deadlines (av_offset ≈ 0). */
                 for (int i = 0; i < 600; i++) {
-                    if ((u64)vmc_time_wall_us() >= target) break;
-                    av_usleep(1000);
+                    const u64 wall = (u64)vmc_time_wall_us();
+                    /* Present only when BOTH the cadence floor is reached AND
+                     * the audio content has reached this frame's content — the
+                     * audio-content gate ties the presentation to what the
+                     * listener actually hears (wall - live ALSA delay), so the
+                     * reported A/V offset stays ~0 instead of the ~60 ms bias
+                     * from the stale startup delay in the anchor. */
+                    if (wall >= target &&
+                        tlm_audio_content_at_wall(wall) >=
+                            (i64)g_frames[idx].pts_us)
+                        break;
+                    /* 200 us sleep keeps the wait granularity (and thus the
+                     * interval jitter) well under 1 ms without burning the
+                     * whole 600-iteration budget in microseconds — a tight
+                     * spin exhausted the budget before the audio gate released
+                     * and presented ~80 ms ahead of the audio. */
+                    av_usleep(200);
                     if (!g_run_decode) break;
                 }
-                /* Pace the present STARTS at exactly frame_period: record the
-                 * scheduled target (not the wall AFTER the memcpy) so the
-                 * present time does not inflate the next frame's cadence by
-                 * ~1.6 ms/frame — that accumulated to 18.3 ms intervals
-                 * (54 fps) and a ~8 s/min drift. */
-                s_last_present_wall_us = target;
+                /* Pace the cadence from the DEADLINE chain (not the last
+                 * present): the floor then equals the next frame's deadline,
+                 * so a resync's re-anchored deadlines propagate into the
+                 * cadence and the audio-content gate holds each presentation
+                 * on the audio — eliminating the run-variable resync backlog
+                 * that otherwise left the video a permanent 100-700 ms behind
+                 * the audio. The present time is not recorded (it would inflate
+                 * the cadence by the memcpy time, ~1.6 ms/frame → 54 fps). */
+                s_last_present_wall_us = deadline_us;
                 const u64 now2 = (u64)vmc_time_wall_us();
                 if (now2 > deadline_us + frame_period_us) {
 #ifdef VMC_DEBUG
@@ -1314,6 +1357,22 @@ static void *audio_worker(void *arg) {
                         (g_audio_bytes_consumed / 4u) * 1000000u /
                             VMC_AUDIO_SAMPLE_RATE;
                 }
+            }
+        }
+        /* Keep the ALSA sink delay current so the audio-content mapping, the
+         * fb0 audio-content gate and the deadline all use the LIVE buffered
+         * latency. An EWMA smooths the per-period steps of the raw
+         * snd_pcm_delay, which otherwise made the gate's content-crossing wall
+         * (and thus the frame intervals) jitter by a full period (~5 ms). */
+        {
+            static u64 ewma = 0;
+            u64 cdelay = 0;
+            if (vmc_alsa_sink_delay_us(&g_audio_pipe.sink, &cdelay)) {
+                if (ewma == 0)
+                    ewma = cdelay;
+                else
+                    ewma = (15 * ewma + cdelay) / 16;
+                g_audio_delay_us = ewma;
             }
         }
         if (g_audio_active && g_audio_start_wall_us == 0) {
@@ -2396,8 +2455,22 @@ static u64 dash_au_deadline(int seg_num, int k) {
     i64 seg_off = ((i64)seg_num - (i64)g_anchor_seg) *
                   (i64)g_seg_duration_us;
     if (seg_off < 0) seg_off = 0;
-    i64 d = (i64)g_anchor_wall_us + seg_off + (i64)k * (i64)frame_period_us +
-            (i64)g_playout_latency_us + g_timeline_adj_us;
+    /* Anchor the deadline on the audio content's arrival at the DAC using the
+     * LIVE ALSA delay (g_audio_delay_us, updated every audio-worker
+     * iteration). With the cadence's s_last tracking the deadline chain and the
+     * audio-content gate, the floor then equals the gate — the presentation
+     * lands exactly on the audio at one frame per period (smooth AND in sync).
+     * The startup delay in g_anchor_wall_us alone was ~160 ms smaller than the
+     * live buffer delay, leaving the floor far ahead of the audio and forcing
+     * the gate to hold every presentation (chasing the delay's steps → jitter). */
+    i64 d = (i64)__atomic_load_n(&g_audio_start_wall_us, __ATOMIC_RELAXED);
+    if (d == 0) {
+        d = (i64)g_anchor_wall_us + (i64)g_playout_latency_us;
+    } else {
+        d += (i64)__atomic_load_n(&g_audio_delay_us, __ATOMIC_RELAXED);
+        d -= (i64)g_playout_latency_us;
+    }
+    d += seg_off + (i64)k * (i64)frame_period_us + g_timeline_adj_us;
     pthread_mutex_unlock(&g_anchor_mu);
     if (d < 0) d = 0;
     return (u64)d;
@@ -2593,6 +2666,13 @@ static void dash_resync(int next_seg, int live_edge, const char *reason) {
     if (old_wall != 0 && old_seg == next_seg) {
         const i64 delta = (i64)g_anchor_wall_us - (i64)old_wall;
         if (delta != 0) {
+            /* The fb0 decode worker's cadence (its last-present clock) must
+             * RESET when the anchor re-bases (the audio-start resync shifted
+             * the deadlines by ~240 ms). Shifting the cadence would preserve
+             * the backlog and leave the video presenting ~60-100 ms after the
+             * audio; resetting makes it present the queued frames AT their new
+             * deadlines. */
+            __atomic_store_n(&g_cadence_shift_us, 1, __ATOMIC_RELAXED);
             pthread_mutex_lock(&g_fmu);
             for (int i = 0; i < VMC_FRAME_SLOTS; i++) {
                 if (g_frames[i].state != SLOT_FREE) {
