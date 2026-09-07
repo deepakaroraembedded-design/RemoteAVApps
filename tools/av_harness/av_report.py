@@ -295,6 +295,7 @@ def build_buckets(path, t0, span_s, bucket_s, fifo_cap, lat_ctx, fps):
     bad = 0
     eos = None
     drain_from = None
+    max_pts = 0               # last presented frame's CONTENT pts (us)
     a_timeline = []          # (render_us, content_pts_us) for the fallback path
     need_timeline = True     # decided after the first few vrenders
     direct_seen = 0
@@ -329,6 +330,9 @@ def build_buckets(path, t0, span_s, bucket_s, fifo_cap, lat_ctx, fps):
         if t == "vrender":
             vr_seen += 1
             b.v_count += 1
+            pv = e.get("pts_us")
+            if pv is not None and int(pv) > max_pts:
+                max_pts = int(pv)
             if e.get("repeat"):
                 b.v_repeat += 1
             fi = e.get("frame_idx")
@@ -409,7 +413,7 @@ def build_buckets(path, t0, span_s, bucket_s, fifo_cap, lat_ctx, fps):
                 need_timeline = False
                 a_timeline = []
 
-    return buckets, bad, eos, a_timeline, direct_seen, vr_seen
+    return buckets, bad, eos, a_timeline, direct_seen, vr_seen, max_pts
 
 
 def audio_pts_at(tl, t_us):
@@ -1002,7 +1006,7 @@ def main():
     lat_ctx = {"rt": rt_pairs, "avail_start_us": avail, "start_number": snum,
                "seg_dur_s": float(meta.get("seg_duration_s", 1.0))}
 
-    buckets, bad, eos_rel, a_tl, direct, vr = build_buckets(
+    buckets, bad, eos_rel, a_tl, direct, vr, max_pts = build_buckets(
         cli_path, t0, bucket_span, bucket_s, fifo_cap, lat_ctx, fps)
 
     # Fallback A/V pairing when audio_pos_us was not stamped in the flip handler.
@@ -1041,7 +1045,12 @@ def main():
     agg = aggregate(views, buckets, fps, rate, period)
     report.update(agg)
     res = load_resources(run_dir)
-    lr = longrun_block(views, agg, res, meta, eos_rel, span_s)
+    # playback_span = the CONTENT reached (max frame pts in seconds), so the
+    # completion gate compares like-for-like against clip_duration_s (the
+    # window-relative span is offset by the warm-up and would falsely report an
+    # early end). Falls back to the window span if no vrender carried a pts.
+    content_end_s = max_pts / 1e6 if max_pts else span_s
+    lr = longrun_block(views, agg, res, meta, eos_rel, content_end_s)
     report["longrun"] = lr
     failed.extend(gate_run(lr, agg, tier))
 
