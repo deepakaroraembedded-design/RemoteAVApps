@@ -1209,13 +1209,8 @@ static vmc_audio_pipeline g_audio_pipe;
 static pthread_t g_audio_tid;
 static bool g_audio_started = false;
 #ifdef VMC_HAVE_FFMPEG
-/* Fixed rate compensation: the audio worker stretches the decoded 48 kHz
- * audio by a fixed delta (sample duplication, see the render path) so the
- * FIFO consumption matches the reader's delivery rate (which is ~2.3 %
- * short of realtime because the per-segment demux drops ~1 AAC boundary
- * frame per second). Without it, delivered audio runs short of realtime,
- * draining the FIFO and producing audible underflows/xruns. */
-static int g_rate_delta = 0;
+/* Rate compensation moved to the DELIVERY path (audio_fifo_write_compensated),
+ * so the render loop below emits clean 240-frame periods at the ALSA clock. */
 #endif
 
 static void *audio_worker(void *arg) {
@@ -1232,17 +1227,6 @@ static void *audio_worker(void *arg) {
         }
         pthread_mutex_unlock(&g_audio_mu);
     }
-#ifdef VMC_HAVE_FFMPEG
-    /* Fixed make-up for the AAC boundary-frame loss: the per-segment demux
-     * drops ~1 AAC frame per 1 s segment (~2.3 %), so the reader delivers
-     * ~97.7 % of the nominal 48 kHz/s and the FIFO drains to underflow/xrun
-     * once the prefill is gone. Duplicate a fixed fraction of output samples
-     * (1 per ~43) so the FIFO consumption matches the delivery rate and the
-     * FIFO holds its level. A constant, deterministic compensation — NOT a
-     * FIFO-level-chasing servo — so the audio-master clock (the ALSA
-     * position, realtime) and the video timeline are unaffected. */
-    g_rate_delta = 1120; /* +2.33 % (measured loss 2.3 %) */
-#endif
 #ifdef VMC_DEBUG
     bool low_water = false;
 #endif
@@ -1304,35 +1288,13 @@ static void *audio_worker(void *arg) {
         {
             const sz_t frames = n / 2u / VMC_AUDIO_CHANNELS;
             static i16 outbuf[VMC_AUDIO_FRAME_BYTES / 2u + 128u];
-            static i32 dup_frac = 0;
             sz_t out_n = frames;
-            if (g_rate_delta != 0) {
-                /* Manual zero-order-hold stretch: output exactly
-                 * frames*(48000+delta)/48000 frames by duplicating samples,
-                 * with a fractional accumulator for an exact long-run rate.
-                 * (swr_convert on this FFmpeg buffers its stretched output
-                 * internally and never flushes it here, so its compensation
-                 * was ~0 in effect; duplication is guaranteed by count.) */
-                out_n = frames +
-                        (sz_t)((i64)frames * g_rate_delta /
-                               (i64)VMC_AUDIO_SAMPLE_RATE);
-                dup_frac += (i32)((i64)frames * g_rate_delta %
-                                  (i64)VMC_AUDIO_SAMPLE_RATE);
-                if (dup_frac >= (i32)VMC_AUDIO_SAMPLE_RATE) {
-                    out_n++;
-                    dup_frac -= (i32)VMC_AUDIO_SAMPLE_RATE;
-                }
-                if (out_n > sizeof(outbuf) / 2u)
-                    out_n = sizeof(outbuf) / 2u;
-                for (sz_t i = 0; i < out_n; i++) {
-                    const sz_t src =
-                        (sz_t)((i64)i * (i64)frames / (i64)out_n);
-                    outbuf[i * 2u] = pcm[src * 2u];
-                    outbuf[i * 2u + 1u] = pcm[src * 2u + 1u];
-                }
-            } else {
-                memcpy(outbuf, pcm, frames * 2u * 2u);
-            }
+            /* Clean render cadence: the +2.3 % delivery compensation is applied
+             * upstream (audio_fifo_write_compensated), so every 240-frame FIFO
+             * period renders as exactly 240 frames at the ALSA clock — 200
+             * periods/s — instead of the pre-iter-011 245.6-frame (5.117 ms)
+             * periods that produced audio_period_deviation 0.0227. */
+            memcpy(outbuf, pcm, frames * 2u * 2u);
 #ifdef VMC_DEBUG
             g_rate_out += out_n;
             g_rate_in += frames;
@@ -2446,6 +2408,53 @@ static int dash_load_manifest(const char *mpd_url, dash_manifest *m) {
 /* Convert one decoded audio frame to S16 48 kHz stereo and push it into the
  * audio FIFO. Shared by the per-packet drain and the end-of-segment flush. */
 #ifdef VMC_HAVE_ALSA
+/* Delivery-side rate compensation (mpv: resample in the filter chain, the AO
+ * consumes at its own clock with clean fixed periods). The live LL-DASH fetch
+ * delivers ~1 AAC boundary frame per 1 s segment short (~2.3 % — the
+ * in-progress segment's tail is truncated by the availabilityTimeComplete=false
+ * fetch), so the decoded 48 kHz PCM is duplicated +2.33 % HERE, before the
+ * FIFO. The audio worker then renders clean 240-frame periods at 200/s. The
+ * pre-iter-011 location (the render loop) slowed each render period to 5.117 ms
+ * and produced audio_period_deviation 0.0227. Zero-order-hold duplication with
+ * a fractional accumulator for an exact long-run rate; the audio-master clock
+ * (ALSA position, realtime) and the video timeline are unaffected either way. */
+#define VMC_AUDIO_DELIVERY_DELTA 1120 /* +2.33 % (measured live loss) */
+static i16 g_delivery_out[8192];
+static i32 g_delivery_dup_frac = 0;
+
+static void audio_fifo_write_compensated(const i16 *in, int frames) {
+    int out_n = frames +
+        (int)((i64)frames * VMC_AUDIO_DELIVERY_DELTA /
+              (i64)VMC_AUDIO_SAMPLE_RATE);
+    g_delivery_dup_frac +=
+        (i32)((i64)frames * VMC_AUDIO_DELIVERY_DELTA %
+              (i64)VMC_AUDIO_SAMPLE_RATE);
+    if (g_delivery_dup_frac >= (i32)VMC_AUDIO_SAMPLE_RATE) {
+        out_n++;
+        g_delivery_dup_frac -= (i32)VMC_AUDIO_SAMPLE_RATE;
+    }
+    if (out_n > (int)(sizeof(g_delivery_out) / 2u / sizeof(g_delivery_out[0])))
+        out_n = (int)(sizeof(g_delivery_out) / 2u / sizeof(g_delivery_out[0]));
+    for (int i = 0; i < out_n; i++) {
+        const sz_t src = (sz_t)((i64)i * (i64)frames / (i64)out_n);
+        g_delivery_out[i * 2] = in[src * 2];
+        g_delivery_out[i * 2 + 1] = in[src * 2 + 1];
+    }
+    pthread_mutex_lock(&g_audio_mu);
+    const sz_t wr = vmc_ringbuf_write(&g_audio_rb, g_delivery_out,
+                                      (sz_t)out_n * 2u * 2u);
+    if (wr < (sz_t)out_n * 2u * 2u && vmc_tlm_enabled())
+        vmc_tlm_emit("buf", "\"which\":\"audio_fifo\","
+                     "\"event\":\"overflow\",\"level\":%zu,"
+                     "\"cap\":%u,\"count\":1",
+                     vmc_ringbuf_used(&g_audio_rb), VMC_AUDIO_FIFO_BYTES);
+    pthread_cond_signal(&g_audio_cv);
+    pthread_mutex_unlock(&g_audio_mu);
+#ifdef VMC_DEBUG
+    g_audio_pcm_bytes += (u64)out_n * 2u * 2u;
+#endif
+}
+
 static void dash_audio_write_frame(dash_session *s) {
     const int out_samples = swr_get_out_samples(s->swr, s->aframe->nb_samples);
     const int out_bytes = out_samples * 2 * 2;
@@ -2458,41 +2467,15 @@ static void dash_audio_write_frame(dash_session *s) {
     const int got = swr_convert(s->swr, (u8 **)&s->apcm, out_samples,
                                 (const u8 **)s->aframe->extended_data,
                                 s->aframe->nb_samples);
-    if (got > 0) {
-        pthread_mutex_lock(&g_audio_mu);
-        const sz_t wr = vmc_ringbuf_write(&g_audio_rb, s->apcm,
-                                          (sz_t)got * 2 * 2);
-        if (wr < (sz_t)got * 2 * 2 && vmc_tlm_enabled())
-            vmc_tlm_emit("buf", "\"which\":\"audio_fifo\","
-                         "\"event\":\"overflow\",\"level\":%zu,"
-                         "\"cap\":%u,\"count\":1",
-                         vmc_ringbuf_used(&g_audio_rb),
-                         VMC_AUDIO_FIFO_BYTES);
-        pthread_cond_signal(&g_audio_cv);
-        pthread_mutex_unlock(&g_audio_mu);
-#ifdef VMC_DEBUG
-        g_audio_pcm_bytes += (u64)got * 2u * 2u;
-#endif
-    }
+    if (got > 0)
+        audio_fifo_write_compensated(s->apcm, got);
     av_frame_unref(s->aframe);
 }
 
 /* Push already-resampled S16 PCM (frames*4 bytes) from s->apcm to the FIFO. */
 static void dash_audio_push_pcm(dash_session *s, int frames) {
     if (frames <= 0) return;
-    pthread_mutex_lock(&g_audio_mu);
-    const sz_t wr = vmc_ringbuf_write(&g_audio_rb, s->apcm,
-                                      (sz_t)frames * 2 * 2);
-    if (wr < (sz_t)frames * 2 * 2 && vmc_tlm_enabled())
-        vmc_tlm_emit("buf", "\"which\":\"audio_fifo\","
-                     "\"event\":\"overflow\",\"level\":%zu,"
-                     "\"cap\":%u,\"count\":1",
-                     vmc_ringbuf_used(&g_audio_rb), VMC_AUDIO_FIFO_BYTES);
-    pthread_cond_signal(&g_audio_cv);
-    pthread_mutex_unlock(&g_audio_mu);
-#ifdef VMC_DEBUG
-    g_audio_pcm_bytes += (u64)frames * 2u * 2u;
-#endif
+    audio_fifo_write_compensated(s->apcm, frames);
 }
 #endif /* VMC_HAVE_ALSA */
 
@@ -3510,7 +3493,7 @@ static int run_dash(const char *url, vmc_log_level log_level) {
                      (long long)g_av_offset_ewma_us,
                      (long long)g_seg_interval_ewma,
                      (long long)g_timeline_adj_us,
-                     g_rate_delta);
+                     VMC_AUDIO_DELIVERY_DELTA);
 #endif
             /* Reader watchdog: if no video packets for 20 s, the dash demuxer
              * is stuck (e.g. after the server restarted its encoder). Restart

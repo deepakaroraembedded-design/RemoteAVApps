@@ -199,3 +199,59 @@ next:      audio class — fix the AAC boundary-frame loss at the decoder (mpv's
          remove the need for the +2.3% duplication stretch, returning
          audio_period_deviation to ~0.005. Then a full 21-min run can certify.
 
+## iter-011  2026-09-07T14:10Z  tier=smoke (audio class — compensation location)
+hypothesis: audio_period_deviation 0.0227 (limit 0.005) is NOT an audio-content
+         loss — it is the RENDER-path +2.3% sample-duplication stretch slowing
+         the ALSA render cadence. The audio worker reads a 240-frame (5ms)
+         period, duplicates to 245.6 frames, and ALSA plays 245.6 frames in
+         5.117ms -> 195.5 render periods/s vs the 200/s the gate expects
+         (deviation = 200-195.5 / 200 = 2.25% = 0.0227). Verified from the run:
+         36,368 arender over 186s = 195.5/s; FIFO equilibrium at 28% proves the
+         live per-segment fetch genuinely delivers ~2.3% short of realtime
+         (~1 AAC boundary frame per segment — the in-progress LL-DASH segment
+         tail is truncated by the availabilityTimeComplete=false fetch, NOT a
+         decoder fault: an offline repro of the exact per-segment fMP4 demux +
+         continuous AAC decode + monotonic pts + swr + per-segment drain delivers
+         100% of the nominal 48k PCM). The fixed compensation is therefore
+         required, but its LOCATION is wrong: mpv resamples in the filter chain
+         (before the AO) and the AO consumes at its own clock with clean fixed
+         periods. Moving the +2.3% duplication to the DELIVERY side (when the
+         reader writes decoded PCM into the FIFO) keeps the render path at clean
+         240-frame periods -> render cadence back to 200/s -> period deviation
+         ~0, while the FIFO balance (delivery = consumption = realtime) is
+         unchanged.
+prediction: audio_period_deviation 0.0227 -> <0.005; audio_fifo_level_min_pct
+         stays >=15 (delivery and consumption rates unchanged); audio 0
+         underflows/overflows; av_offset unchanged (~0, audio-master clock is
+         ALSA-realtime regardless of where the duplication happens).
+change:    apps/thinclient/main.c — (1) audio worker: remove the render-path
+         stretch (g_rate_delta = 0); (2) delivery path (dash_audio_write_frame
+         and dash_audio_push_pcm): duplicate samples +2.33% (same zero-order-hold
+         + fractional accumulator) BEFORE the ringbuf write.
+result:    CONFIRMED. Moving the +2.33% duplication to the delivery path (before
+         the FIFO) restored the render cadence to clean 240-frame periods.
+         Smoke (3 buckets, commit f7291b8): audio_periods_written 12000 /
+         12000 in every bucket — audio_period_deviation 0.0227 -> 0.0000
+         (the render stretch that had slowed the ALSA cadence to 195.5
+         periods/s is gone; rout == rin in the log confirms no render-side
+         stretching). FIFO stable 28.7-29.6% (delivery and consumption both
+         at realtime), 0 underflows/overflows, av_offset_mean -0.01ms, ZERO
+         envelope violations, cadence frame_interval_p95_err 1.01-1.05ms,
+         yield 3600/3600. The audio-master clock (ALSA-realtime) is
+         unchanged, so A/V sync is untouched. audio class GREEN.
+         REMAINING (pre-existing, next class): frames_dropped 2 over 3
+         buckets (segments 44 and 160 each lost their FIRST frame — a
+         reader-side fetch/demux transient at segment boundaries; seg 44 was
+         fetched after seg 45, so a late-fetch hole at the boundary. ~0.5% of
+         segments, independent of audio. Offline: per-segment fMP4 demux +
+         continuous AAC decode + monotonic pts + swr + drain delivers 100% of
+         nominal PCM; avformat_find_stream_info consumes no frames on complete
+         segments, so the hole is the LIVE in-progress fetch, not the decode).
+
+next:      video reader — the rare first-frame-of-segment hole (0.5% of
+         segments). Root cause is the live fetch of in-progress segments
+         (availabilityTimeComplete=false); a robust fetch that refuses a
+         truncated segment tail, or a demux that tolerates a missing first AU,
+         would make frames_dropped 0. Then a full 21-min run can certify the
+         fb0 path.
+
