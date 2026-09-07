@@ -314,12 +314,16 @@ def build_buckets(path, t0, span_s, bucket_s, fifo_cap, lat_ctx, fps):
         if ts is None:
             continue
         rel = (ts - t0) / 1e6
-        # EOS drain: once the client has emitted `eos` (end of content), the
-        # remaining events are the drain tail — the plan says its underflows are
-        # expected and must not count as failures. Drop them so they cannot land
-        # in a gated bucket.
+        # EOS drain: once the client has emitted `eos` (the reader detected end
+        # of content), the DRAIN artifacts — underflows/pads/resyncs/reload
+        # failures the drain produces — must not count as failures. Drop only
+        # those artifact events; the vrender/arender content events during the
+        # drain are REAL presentation (the final buffered frames/audio playing
+        # out) and must stay for the frame counts and the completion gate.
         if drain_from is not None and rel > drain_from:
-            continue
+            if t in ("buf", "sync", "dec", "net") or \
+               (t == "arender" and e.get("pad_samples", 0)):
+                continue
         bi = int(rel // bucket_s)
         if bi < 0:
             continue
