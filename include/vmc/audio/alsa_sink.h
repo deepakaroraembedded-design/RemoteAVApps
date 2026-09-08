@@ -11,7 +11,7 @@
 VMC_BEGIN_DECLS
 
 /* Detect an attached USB audio device (e.g. a USB headset) and write an ALSA
- * playback device string ("plughw:<card-id>,0") into out/out_len. Returns
+ * playback device string ("plughw:<card-index>,0") into out/out_len. Returns
  * true if a USB-Audio card with a playback PCM is present. The sink prefers
  * this over the configured HDMI device, so audio follows a physically-attached
  * headset. */

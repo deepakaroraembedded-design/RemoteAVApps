@@ -22,26 +22,27 @@ static u64 g_xrun_fatal;
 
 /* Detect an attached USB audio device (USB headset) by scanning
  * /proc/asound/cards for a USB-Audio card that exposes a playback PCM. Writes
- * the ALSA device string "plughw:<card-id>,0" into out. Returns true if found.
- * plughw is used (rather than hw) so the PCM handles any rate/format the USB
- * device does not natively accept (the pipeline always writes 48k s16). */
+ * the ALSA device string "plughw:<card-index>,0" into out. Returns true if
+ * found. plughw is used (rather than hw) so the PCM handles any rate/format
+ * the USB device does not natively accept (the pipeline always writes 48k
+ * s16). The card INDEX is used (not the padded name in the [ ] column) so the
+ * device string is always a valid ALSA PCM name. */
 bool vmc_alsa_find_usb_device(char *out, size_t out_len) {
     FILE *f = fopen("/proc/asound/cards", "r");
     if (!f) return false;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         int card = -1;
-        char id[64] = {0};
         char driver[64] = {0};
         /* " 0 [Seri           ]: USB-Audio - Plantronics ..." */
-        if (sscanf(line, " %d [%63[^]]]: %63s -", &card, id, driver) == 3 &&
+        if (sscanf(line, " %d [%*[^]]]: %63s -", &card, driver) == 2 &&
             strcmp(driver, "USB-Audio") == 0) {
             char pcm_path[128];
             snprintf(pcm_path, sizeof(pcm_path),
                      "/proc/asound/card%d/pcm0p/sub0/info", card);
             struct stat st;
             if (stat(pcm_path, &st) == 0) {
-                snprintf(out, out_len, "plughw:%s,0", id);
+                snprintf(out, out_len, "plughw:%d,0", card);
                 fclose(f);
                 return true;
             }
