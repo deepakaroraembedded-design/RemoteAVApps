@@ -407,3 +407,17 @@ change:    apps/thinclient/main.c — present_entry carries pts_us; present
          half-vblank lead, falling back to the deadline when audio is stalled;
          vsync_miss threshold now measures beyond playout_latency.
 result:    (filled in by iter-018's report)
+
+## confirmation-matrix cell: VMC_DRM=1 (shipping) — SAMSUNG 60Hz + iter-017  2026-09-08T15:10Z
+verdict: PASS   primary_fault: none   tier=full
+buckets: 20/20 pass   failed_gates: 0
+run:     av_offset_mean -1.84ms (was -805ms)  drift -0.02ms/min (was -210)
+         cadence frame_interval_p95_err 0.05ms (vblank-perfect)  vsync_miss 0
+         audio 12000/12000  0 underflows/pads/drops/resyncs/mpd_fails
+         FIFO 17.6-22%  present_delay stable 4.0s  rss +8.5MB  fd +1
+         eos at 1259.95s (stream_ended_early 0.05)
+The iter-017 fix (DRM present gated on the LIVE audio-content crossing with a
+2-vblank lead, and vsync_miss flagged only beyond playout_latency) turned the
+shipping DRM path fully green on a true 60Hz panel. The old panel (59.77Hz)
+drift is no longer a blocker on this hardware. Remaining confirmation cells:
+second 21-min clip, back-to-back replay.
