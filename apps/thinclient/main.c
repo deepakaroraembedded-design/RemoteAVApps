@@ -1266,6 +1266,12 @@ static void *decode_worker(void *arg) {
  * path — NOT a naive sample-duplication, which produces an audible zipper on
  * sustained audio. */
 #define VMC_AUDIO_DELIVERY_DELTA 1120 /* +2.33 % per input second (44.1 kHz) */
+/* swr output rate = 48k + delta: the polyphase resampler stretches the decoded
+ * 44.1 kHz AAC by +2.33 % (the AAC boundary-loss make-up) continuously. This
+ * is how the rate compensation is applied — a proper resampler, not sample
+ * duplication and not the one-shot swr_set_compensation correction. */
+#define VMC_AUDIO_SWR_OUT_RATE \
+    (VMC_AUDIO_SAMPLE_RATE + VMC_AUDIO_DELIVERY_DELTA)
 #define VMC_AUDIO_FRAME_BYTES (960u)   /* 5 ms @ 48 kHz stereo s16 */
 /* 2 MiB (~10.9 s). The reader delivers ~1.5 s of audio just-in-time, so the
  * level is ~30 % of this cap (above the ≥15 % gate) while leaving room for
@@ -1588,13 +1594,11 @@ static int dash_session_setup(AVFormatContext *fmt, dash_session *s) {
 #if LIBSWRESAMPLE_VERSION_MAJOR >= 4
                 AVChannelLayout ch_out = AV_CHANNEL_LAYOUT_STEREO;
                 if (swr_alloc_set_opts2(&s->swr, &ch_out, AV_SAMPLE_FMT_S16,
-                                        VMC_AUDIO_SAMPLE_RATE,
+                                        VMC_AUDIO_SWR_OUT_RATE,
                                         &s->actx->ch_layout,
                                         s->actx->sample_fmt,
                                         s->actx->sample_rate, 0, NULL) == 0 &&
                     swr_init(s->swr) == 0) {
-                    swr_set_compensation(s->swr, VMC_AUDIO_DELIVERY_DELTA,
-                                         s->actx->sample_rate);
                     s->aframe = av_frame_alloc();
                 } else {
                     if (s->swr) swr_free(&s->swr);
@@ -1605,11 +1609,9 @@ static int dash_session_setup(AVFormatContext *fmt, dash_session *s) {
 #else
                 s->swr = swr_alloc_set_opts(
                     NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16,
-                    VMC_AUDIO_SAMPLE_RATE, s->actx->channel_layout,
+                    VMC_AUDIO_SWR_OUT_RATE, s->actx->channel_layout,
                     s->actx->sample_fmt, s->actx->sample_rate, 0, NULL);
                 if (s->swr && swr_init(s->swr) == 0) {
-                    swr_set_compensation(s->swr, VMC_AUDIO_DELIVERY_DELTA,
-                                         s->actx->sample_rate);
                     s->aframe = av_frame_alloc();
                 } else {
                     if (s->swr) swr_free(&s->swr);
@@ -1747,13 +1749,10 @@ static int dash_init_setup_one(const u8 *init, size_t init_len, int want_audio,
                         AVChannelLayout ch_out = AV_CHANNEL_LAYOUT_STEREO;
                         if (swr_alloc_set_opts2(
                                 &s->swr, &ch_out, AV_SAMPLE_FMT_S16,
-                                VMC_AUDIO_SAMPLE_RATE, &s->actx->ch_layout,
+                                VMC_AUDIO_SWR_OUT_RATE, &s->actx->ch_layout,
                                 s->actx->sample_fmt, s->actx->sample_rate, 0,
                                 NULL) == 0 &&
                             swr_init(s->swr) == 0) {
-                            swr_set_compensation(s->swr,
-                                                 VMC_AUDIO_DELIVERY_DELTA,
-                                                 s->actx->sample_rate);
                             s->aframe = av_frame_alloc();
                         } else {
                             if (s->swr) swr_free(&s->swr);
@@ -1764,13 +1763,10 @@ static int dash_init_setup_one(const u8 *init, size_t init_len, int want_audio,
 #else
                         s->swr = swr_alloc_set_opts(
                             NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16,
-                            VMC_AUDIO_SAMPLE_RATE, s->actx->channel_layout,
+                            VMC_AUDIO_SWR_OUT_RATE, s->actx->channel_layout,
                             s->actx->sample_fmt, s->actx->sample_rate, 0,
                             NULL);
                         if (s->swr && swr_init(s->swr) == 0) {
-                            swr_set_compensation(s->swr,
-                                                 VMC_AUDIO_DELIVERY_DELTA,
-                                                 s->actx->sample_rate);
                             s->aframe = av_frame_alloc();
                         } else {
                             if (s->swr) swr_free(&s->swr);
