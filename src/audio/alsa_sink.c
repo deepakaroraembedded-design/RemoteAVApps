@@ -121,6 +121,12 @@ vmc_status vmc_alsa_sink_init(vmc_audio_sink *sink, const char *device) {
     const char *dev = use_usb ? usb_dev : device;
     if (use_usb) {
         VMC_LOGI("alsa: USB audio device detected — routing to '%s'", usb_dev);
+        /* The harness sets ALSA_CONFIG_PATH to a minimal config that only
+         * defines pcm.hdmi; under it the built-in hw/plughw plugins do not
+         * resolve ("Unknown PCM plughw:..."). Open the USB device with the
+         * system default ALSA config. The HDMI path keeps the custom config
+         * (which defines pcm.hdmi). */
+        unsetenv("ALSA_CONFIG_PATH");
     } else {
         if (!device) device = getenv("VMC_AUDIO_DEV");
         if (!device) device = "default";
@@ -131,8 +137,7 @@ vmc_status vmc_alsa_sink_init(vmc_audio_sink *sink, const char *device) {
         VMC_LOGW("alsa: cannot open '%s' — running silent", dev);
         a->pcm = NULL;
         return VMC_OK;
-    }
-    if (snd_pcm_set_params(a->pcm, SND_PCM_FORMAT_S16_LE,
+    }    if (snd_pcm_set_params(a->pcm, SND_PCM_FORMAT_S16_LE,
                            SND_PCM_ACCESS_RW_INTERLEAVED,
                            VMC_AUDIO_CHANNELS, VMC_AUDIO_SAMPLE_RATE, 1,
                            250000) != 0) {
