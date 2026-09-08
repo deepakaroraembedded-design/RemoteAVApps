@@ -1259,6 +1259,13 @@ static void *decode_worker(void *arg) {
 #endif /* VMC_HAVE_FFMPEG */
 
 #ifdef VMC_HAVE_ALSA
+/* AAC boundary-loss rate compensation: the live per-segment fetch delivers
+ * ~1 AAC frame per segment short (~2.33 %), so the decoded audio must be
+ * stretched +2.33 % to fill the realtime ALSA timeline. Applied through
+ * libswresample's polyphase compensator (swr_set_compensation) in the delivery
+ * path — NOT a naive sample-duplication, which produces an audible zipper on
+ * sustained audio. */
+#define VMC_AUDIO_DELIVERY_DELTA 1120 /* +2.33 % per input second (44.1 kHz) */
 #define VMC_AUDIO_FRAME_BYTES (960u)   /* 5 ms @ 48 kHz stereo s16 */
 /* 2 MiB (~10.9 s). The reader delivers ~1.5 s of audio just-in-time, so the
  * level is ~30 % of this cap (above the ≥15 % gate) while leaving room for
@@ -1586,6 +1593,8 @@ static int dash_session_setup(AVFormatContext *fmt, dash_session *s) {
                                         s->actx->sample_fmt,
                                         s->actx->sample_rate, 0, NULL) == 0 &&
                     swr_init(s->swr) == 0) {
+                    swr_set_compensation(s->swr, VMC_AUDIO_DELIVERY_DELTA,
+                                         s->actx->sample_rate);
                     s->aframe = av_frame_alloc();
                 } else {
                     if (s->swr) swr_free(&s->swr);
@@ -1599,6 +1608,8 @@ static int dash_session_setup(AVFormatContext *fmt, dash_session *s) {
                     VMC_AUDIO_SAMPLE_RATE, s->actx->channel_layout,
                     s->actx->sample_fmt, s->actx->sample_rate, 0, NULL);
                 if (s->swr && swr_init(s->swr) == 0) {
+                    swr_set_compensation(s->swr, VMC_AUDIO_DELIVERY_DELTA,
+                                         s->actx->sample_rate);
                     s->aframe = av_frame_alloc();
                 } else {
                     if (s->swr) swr_free(&s->swr);
@@ -1740,6 +1751,9 @@ static int dash_init_setup_one(const u8 *init, size_t init_len, int want_audio,
                                 s->actx->sample_fmt, s->actx->sample_rate, 0,
                                 NULL) == 0 &&
                             swr_init(s->swr) == 0) {
+                            swr_set_compensation(s->swr,
+                                                 VMC_AUDIO_DELIVERY_DELTA,
+                                                 s->actx->sample_rate);
                             s->aframe = av_frame_alloc();
                         } else {
                             if (s->swr) swr_free(&s->swr);
@@ -1754,6 +1768,9 @@ static int dash_init_setup_one(const u8 *init, size_t init_len, int want_audio,
                             s->actx->sample_fmt, s->actx->sample_rate, 0,
                             NULL);
                         if (s->swr && swr_init(s->swr) == 0) {
+                            swr_set_compensation(s->swr,
+                                                 VMC_AUDIO_DELIVERY_DELTA,
+                                                 s->actx->sample_rate);
                             s->aframe = av_frame_alloc();
                         } else {
                             if (s->swr) swr_free(&s->swr);
@@ -2494,42 +2511,15 @@ static int dash_load_manifest(const char *mpd_url, dash_manifest *m) {
 /* Convert one decoded audio frame to S16 48 kHz stereo and push it into the
  * audio FIFO. Shared by the per-packet drain and the end-of-segment flush. */
 #ifdef VMC_HAVE_ALSA
-/* Delivery-side rate compensation (mpv: resample in the filter chain, the AO
- * consumes at its own clock with clean fixed periods). The live LL-DASH fetch
- * delivers ~1 AAC boundary frame per 1 s segment short (~2.3 % — the
- * in-progress segment's tail is truncated by the availabilityTimeComplete=false
- * fetch), so the decoded 48 kHz PCM is duplicated +2.33 % HERE, before the
- * FIFO. The audio worker then renders clean 240-frame periods at 200/s. The
- * pre-iter-011 location (the render loop) slowed each render period to 5.117 ms
- * and produced audio_period_deviation 0.0227. Zero-order-hold duplication with
- * a fractional accumulator for an exact long-run rate; the audio-master clock
- * (ALSA position, realtime) and the video timeline are unaffected either way. */
-#define VMC_AUDIO_DELIVERY_DELTA 1120 /* +2.33 % (measured live loss) */
-static i16 g_delivery_out[8192];
-static i32 g_delivery_dup_frac = 0;
-
-static void audio_fifo_write_compensated(const i16 *in, int frames) {
-    int out_n = frames +
-        (int)((i64)frames * VMC_AUDIO_DELIVERY_DELTA /
-              (i64)VMC_AUDIO_SAMPLE_RATE);
-    g_delivery_dup_frac +=
-        (i32)((i64)frames * VMC_AUDIO_DELIVERY_DELTA %
-              (i64)VMC_AUDIO_SAMPLE_RATE);
-    if (g_delivery_dup_frac >= (i32)VMC_AUDIO_SAMPLE_RATE) {
-        out_n++;
-        g_delivery_dup_frac -= (i32)VMC_AUDIO_SAMPLE_RATE;
-    }
-    if (out_n > (int)(sizeof(g_delivery_out) / 2u / sizeof(g_delivery_out[0])))
-        out_n = (int)(sizeof(g_delivery_out) / 2u / sizeof(g_delivery_out[0]));
-    for (int i = 0; i < out_n; i++) {
-        const sz_t src = (sz_t)((i64)i * (i64)frames / (i64)out_n);
-        g_delivery_out[i * 2] = in[src * 2];
-        g_delivery_out[i * 2 + 1] = in[src * 2 + 1];
-    }
+/* The +2.33 % AAC boundary-loss rate compensation is applied INSIDE the swr
+ * resampler (swr_set_compensation, set at session setup) with proper polyphase
+ * interpolation — not naive zero-order-hold sample duplication, which produces
+ * an audible zipper on sustained audio. The FIFO therefore receives the raw
+ * (already-compensated) swr output; the audio worker renders clean periods. */
+static void audio_fifo_write_raw(const i16 *in, int frames) {
     pthread_mutex_lock(&g_audio_mu);
-    const sz_t wr = vmc_ringbuf_write(&g_audio_rb, g_delivery_out,
-                                      (sz_t)out_n * 2u * 2u);
-    if (wr < (sz_t)out_n * 2u * 2u && vmc_tlm_enabled())
+    const sz_t wr = vmc_ringbuf_write(&g_audio_rb, in, (sz_t)frames * 2u * 2u);
+    if (wr < (sz_t)frames * 2u * 2u && vmc_tlm_enabled())
         vmc_tlm_emit("buf", "\"which\":\"audio_fifo\","
                      "\"event\":\"overflow\",\"level\":%zu,"
                      "\"cap\":%u,\"count\":1",
@@ -2537,12 +2527,16 @@ static void audio_fifo_write_compensated(const i16 *in, int frames) {
     pthread_cond_signal(&g_audio_cv);
     pthread_mutex_unlock(&g_audio_mu);
 #ifdef VMC_DEBUG
-    g_audio_pcm_bytes += (u64)out_n * 2u * 2u;
+    g_audio_pcm_bytes += (u64)frames * 2u * 2u;
 #endif
 }
 
 static void dash_audio_write_frame(dash_session *s) {
-    const int out_samples = swr_get_out_samples(s->swr, s->aframe->nb_samples);
+    /* +2048 frames headroom: swr_set_compensation can output more per call
+     * than swr_get_out_samples predicts (the +2.33 % delta over the distance
+     * accumulates into the call's output). */
+    const int out_samples =
+        swr_get_out_samples(s->swr, s->aframe->nb_samples) + 2048;
     const int out_bytes = out_samples * 2 * 2;
     if (out_bytes > s->apcm_cap) {
         i16 *nb = (i16 *)realloc(s->apcm, (sz_t)out_bytes);
@@ -2554,14 +2548,14 @@ static void dash_audio_write_frame(dash_session *s) {
                                 (const u8 **)s->aframe->extended_data,
                                 s->aframe->nb_samples);
     if (got > 0)
-        audio_fifo_write_compensated(s->apcm, got);
+        audio_fifo_write_raw(s->apcm, got);
     av_frame_unref(s->aframe);
 }
 
 /* Push already-resampled S16 PCM (frames*4 bytes) from s->apcm to the FIFO. */
 static void dash_audio_push_pcm(dash_session *s, int frames) {
     if (frames <= 0) return;
-    audio_fifo_write_compensated(s->apcm, frames);
+    audio_fifo_write_raw(s->apcm, frames);
 }
 #endif /* VMC_HAVE_ALSA */
 
