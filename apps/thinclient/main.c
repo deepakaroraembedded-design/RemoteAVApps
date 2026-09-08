@@ -715,6 +715,10 @@ static void tlm_vrender_emit(int buf_idx, u64 vblank_us, u64 submit_us,
 static void *present_worker(void *arg) {
     (void)arg;
     static int g_last_presented_buf = -1;
+    /* Measured decision->scanout latency (us), EWMA-updated after every flip
+     * from (vblank - gate-release). The lead compensates it so the scanout
+     * lands ON the audio-content crossing. */
+    static i64 s_present_latency_us = 16667;
     while (g_run) {
         /* Wait a short while for audio playback to start so the first frame
          * is anchored to the audio clock, but never gate video permanently on
@@ -741,19 +745,17 @@ static void *present_worker(void *arg) {
              * delay), NOT the startup-anchored deadline — the deadline carries
              * a stale ~890 ms bias (astart/adelay baked in at reader time) that
              * made every DRM frame present ~890 ms late (constant av_offset
-             * ≈ -805 ms, video behind audio). Lead the crossing by half a
-             * vblank so the flip lands ON the crossing (the page flip completes
-             * at the next vblank, 0..1 period after the submit). Falls back to
+             * ≈ -805 ms, video behind audio). Falls back to
              * the deadline when the audio clock is unavailable/stalled. */
-            const u64 vblank_us = g_drm.vblank_period_us > 0
-                ? g_drm.vblank_period_us : 16667u;
-            /* Lead the audio-content crossing by TWO vblanks: measured, the
-             * decision->scanout path is ~2 vblanks (the pre-flip drain waits
-             * out a pending flip, then the page flip completes one vblank
-             * later). With a half-vblank lead the frame appeared ~28ms after
-             * the audio content it pairs with (av_offset -27.8ms); a 2-vblank
-             * lead lands the scanout ON the crossing. */
-            const i64 gate_pts = e.pts_us - (i64)(vblank_us * 2u);
+            /* Lead the audio-content crossing by the MEASURED decision->
+             * scanout latency (mpv vsync-offset feedback), not a fixed
+             * vblank count: the latency varies with the pre-flip drain and the
+             * vblank phase (measured ~33ms at 60fps with a pending flip, but
+             * ~2.5ms at 30fps when the previous flip already completed). A
+             * fixed 2-vblank lead landed the 60fps scanout ON the crossing
+             * (-1.84ms) but overshot at 30fps (-35ms). The EWMA is updated
+             * after each flip from (vblank - gate-release). */
+            const i64 gate_pts = e.pts_us - s_present_latency_us;
             for (int i = 0; i < 600; i++) {
                 const u64 wall = (u64)vmc_time_wall_us();
                 const i64 ac = tlm_audio_content_at_wall(wall);
@@ -766,6 +768,7 @@ static void *present_worker(void *arg) {
                 av_usleep(3000);
                 if (!g_run) break;
             }
+            (void)vmc_time_wall_us();
             const u64 now2 = dash_pres_clock();
             if (now2 > e.deadline_us + frame_period_us) {
 #ifdef VMC_DEBUG
@@ -823,6 +826,22 @@ static void *present_worker(void *arg) {
             const int repeat = (cb == g_last_presented_buf) ? 1 : 0;
             g_last_presented_buf = cb;
             const i64 apos = tlm_audio_content_us();
+            /* A/V alignment servo (mpv display_sync_error / drift compensation):
+             * the measured av_offset = pts - audio_content(vblank) at this flip
+             * is the ERROR; nudge the lead to drive it to zero. This corrects
+             * the decision->scanout latency AND any content-fps/mapping bias in
+             * one loop — a fixed vblank-count lead cannot (60fps needed ~33ms,
+             * 30fps ~54ms; the difference is the mapping/latency, not the
+             * vblank count). /8 = slow tau (~8 frames), clamped sane. */
+            {
+                const i64 off = m->pts_us - apos;
+                if (off > -500000 && off < 500000) {
+                    s_present_latency_us -= off / 8;
+                    if (s_present_latency_us < 0) s_present_latency_us = 0;
+                    if (s_present_latency_us > 200000)
+                        s_present_latency_us = 200000;
+                }
+            }
             const u64 wall_now = vmc_time_wall_us();
             tlm_vrender_emit(cb, vblank_us, g_drm.bufs[cb].submit_wall_us,
                              m->deadline_us, m->fidx, m->seg, m->pts_us,
