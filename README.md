@@ -37,7 +37,7 @@ Roles:
   and presents to the framebuffer/HDMI. A decode worker keeps reception
   independent of decode cost; in DRM mode a separate **present worker**
   thread waits on the audio-master clock and submits the page-flip, so the
-  24 fps presentation cadence is independent of the conversion-to-scanout copy.
+  content-frame presentation cadence is independent of the conversion-to-scanout copy.
 - **LL-DASH server** (`tools/vmc-dash-sim/vmc-dash-sim`) — optional
   standards-based transport: ffmpeg NVENC+AAC → Low-Latency DASH (CMAF
   segments, dynamic MPD) served over HTTP. The client's `--dash <mpd-url>` mode
@@ -188,7 +188,8 @@ the reader run watchdog restarts so the stream self-heals. To use the old
 
 ### DASH playback quality
 
-The DASH path is tuned for a stable 24 fps A/V presentation at the live edge:
+The DASH path is tuned for a stable A/V presentation at the live edge (the
+21-min 4K test clip is 60 fps / 44.1 kHz):
 
 - **Audio-master A/V lock.** Every video access unit is stamped with a
   wall-clock deadline. The DRM present worker (or the decode worker in
@@ -202,8 +203,11 @@ The DASH path is tuned for a stable 24 fps A/V presentation at the live edge:
   buffer, runs the NV12→BGRA conversion, waits for the previous conversion,
   copies the result into the DRM buffer, and pushes the buffer index and
   deadline to a queue. A dedicated present worker reads that queue and flips at
-  the audio-master deadline. This keeps the 24 fps cadence independent of the
-  (currently CPU-bound) conversion-to-scanout copy.
+  the audio-master deadline. This keeps the content cadence independent of the
+  (currently CPU-bound) conversion-to-scanout copy. The page flip itself rides
+  the DRM vblank (drain/wait-flip with a fixed 2-vblank lead so scanout lands on
+  the audio-content crossing) — audio is the master clock, the vblank is the
+  cadence clock.
 
 - **Single-threaded DRM event handling.** The present worker is the *only*
   thread that submits page flips and reads flip-complete events. The decode
@@ -231,20 +235,24 @@ The DASH path is tuned for a stable 24 fps A/V presentation at the live edge:
 - **Per-segment frame indexing.** The video packet PTS inside each CMAF segment
   is mapped to a zero-based frame index, so every NAL for the same frame shares
   the same deadline and the presentation cadence matches the content frame rate
-  (24 fps) rather than the packet/NAL rate.
+  (60 fps) rather than the packet/NAL rate.
 
-- **Audio startup.** The audio FIFO is 8 MiB. A prefill of
+- **Audio startup.** The audio FIFO is 2 MiB (~10.9 s). A prefill of
   `VMC_AUDIO_PREFETCH_US` (currently 1 s) is required before the ALSA sink
   starts; playback waits until the first decoded video frame is ready so A/V
   begins together. The audio clock is read from the ALSA sink position, with a
   bytes-consumed fallback. The video anchor is adjusted to include the ALSA
   delay.
 
-- **Audio rate compensation.** The AAC decoder loses ~1 boundary frame per 1 s
-  segment (1024-sample frames do not divide evenly into 1 s). Instead of
-  `swr_convert` (which buffers stretched output and never flushes it here), the
-  audio worker uses a manual zero-order-hold sample duplication to stretch the
-  stream by a small servo-controlled delta when the FIFO level drifts.
+- **Lossless AAC decode (the audio-quality fix).** The mov demuxer attaches side
+  data to the FIRST packet of each per-segment demux (track
+  disposition/initial-padding), and FFmpeg 8's AAC decoder drops that frame —
+  ~1 frame (23 ms) per 1 s segment, the "2.33 % boundary loss". The client
+  clears the packet side data before `avcodec_send_packet`, so per-segment
+  decode is now lossless (`apkt == afrm/1024`). No rate compensation is needed:
+  the swr converts 44.1k → 48k directly, the FIFO holds clean 48k content at
+  native pitch, and the worker's 240-frame/5 ms reads align exactly with the
+  device rate. The old stretch/duplication approaches are removed.
 
 - **DRM flip bookkeeping.** `vmc_drm_scanout_present` now takes an explicit buffer
   index. `next_idx` marks the chosen buffer busy and skips the on-screen and
@@ -281,9 +289,9 @@ All jitter instrumentation is compiled only when the CMake option `VMC_DEBUG`
 is ON, and is preserved in the source under `#ifdef VMC_DEBUG` blocks. A debug
 build logs a `dash dbg:` line every 5 s: `seg ok/fail/miss`, fetch-time avg/max,
 `early/late/drop/resync`, audio `low/xrun`, audio-fetch `ok/fail`, `pcm/pad`
-delivered, `apkt/afrm` (demuxed packets vs decoded samples), rate-compensation
-`rout/rin`, A/V `av-offset`, drift `interval/rate-adj`, and `adelta` (the live
-audio stretch percentage).
+delivered, `apkt/afrm` (demuxed packets vs decoded samples — with lossless
+decode `apkt*1024 ≈ afrm`), `rout/rin`, A/V `av-offset`, and drift
+`interval/rate-adj`.
 
 ## Deployment guide (live topology)
 
@@ -352,14 +360,18 @@ to the GPU and the console VT active: with no monitor attached the driver does
 not scan out the framebuffer and the screen shows a stale/frozen console frame
 (the client itself still decodes/presents correctly).
 
-Audio output to the HDMI monitor (one-time setup):
+Audio output: the client auto-detects a USB headset (e.g. a Plantronics
+Blackwire, opened as `hw:<card>,0` mono 48k with an explicit stereo→mono
+downmix) and falls back to the HDMI monitor. HDMI one-time setup:
 
 ```sh
 sudo usermod -aG audio deepak7121
 printf 'pcm.hdmi { type hw; card 1; device 3; }\n' | sudo tee /etc/vmc-audio.conf
 # the system ALSA config on this device cannot resolve card indices, so the
 # service uses this minimal config via ALSA_CONFIG_PATH=/etc/vmc-audio.conf
-# and VMC_AUDIO_DEV=hdmi (card1 = NVIDIA HDA, device 3 = connected LG monitor)
+# and VMC_AUDIO_DEV=hdmi (card1 = NVIDIA HDA, device 3 = connected LG monitor).
+# When a USB headset is attached, the client unsets ALSA_CONFIG_PATH and routes
+# directly to the USB PCM (hw:<card>,0), overriding VMC_AUDIO_DEV.
 ```
 
 UDP mode (systemd default):
@@ -398,7 +410,7 @@ also prints `dash dbg:` with `early/late/drop/resync`, audio `low/xrun`, A/V
 `drop=0 resync=1 xrun=0 pad=0` and an `av-offset` that stays bounded (the
 audio-master lock keeps it ~0 instead of drifting).
 
-### Quick start — LL-DASH with HDMI audio (two-box, this repo)
+### Quick start — LL-DASH with audio (two-box, this repo)
 
 All commands below are the ones that work with the current branch. Build the
 client on the client device (its FFmpeg ABI differs from the host's — do not
@@ -585,16 +597,22 @@ mode:
 ## Audio downlink (ALSA)
 
 The MEC stream carries PCM (UDP mode) or AAC (DASH mode) audio; the client
-plays it through the monitor's HDMI output:
+plays it through the monitor's HDMI output, or a USB headset when one is
+attached:
 
 - **UDP mode**: `vmc-mec-sim` streams raw PCM (48 kHz stereo s16) as
   `STREAM_AUDIO` datagrams on a dedicated real-time thread (exact 200 pps,
   5 ms frames). The client feeds them straight to the ALSA sink.
 - **DASH mode**: the client decodes AAC → FLTP → resamples to S16 48 kHz
-  (version-guarded for FFmpeg 4.x vs 5+ channel-layout APIs) → ALSA.
+  (version-guarded for FFmpeg 4.x vs 5+ channel-layout APIs) → ALSA. The decode
+  is lossless per segment (packet side data cleared), so no rate-stretch is
+  needed and the audio plays at native pitch.
 - `src/audio/alsa_sink.c` — ALSA sink (48k/s16/stereo) with a silent fallback,
   plus an **HDMI unmute** (`alsa_unmute_hdmi()`): NVIDIA HDA outputs boot with
-  the IEC958 playback switch off, so the sink turns it on at init.
+  the IEC958 playback switch off, so the sink turns it on at init. When a USB
+  audio device is present, `vmc_alsa_find_usb_device()` routes playback to it
+  (`hw:<card>,0`, mono) with an explicit stereo→mono downmix; otherwise the
+  device falls back to `VMC_AUDIO_DEV` (hdmi).
 
 The client device needs the user in the `audio` group and a working ALSA
 configuration (the system config on this device can't resolve card indices, so
@@ -688,9 +706,12 @@ pixels). The decoder test requires FFmpeg dev headers.
   segments — sustained runs show `fail=0`. The server-side hold-then-404
   behaviour remains as a defensive fallback.
 - **A/V sync in DASH mode is now corrected** via the audio-master clock (video
-  follows the ALSA sink position). A manual rate-stretch servo absorbs the
-  residual AAC boundary-frame loss. The old `A/V sync correction over long runs`
-  roadmap item is addressed for the live path.
+  follows the ALSA sink position). The residual AAC boundary-frame loss that
+  used to require a rate-stretch servo was root-caused to the demuxer's
+  per-segment packet side data and eliminated at the source — the decode is
+  lossless, so audio plays at native pitch with no compensation. Gold baseline
+  tagged `BASELINE.GOLD.4K.60fps` (4K / 60 fps clip, verified on a USB headset:
+  no chip, native pitch, stable FIFO, 0 xruns).
 - **HDMI audio requires setup** on the client: user in the `audio` group, a
   minimal ALSA config (`/etc/vmc-audio.conf`), and `VMC_AUDIO_DEV=hdmi`.
 - **DRM mode** is the connector's preferred mode (1366×768 on this monitor),
@@ -723,8 +744,9 @@ pixels). The decoder test requires FFmpeg dev headers.
 - [x] DASH playback quality: `availabilityStartTime`-anchored live-edge math,
       dynamic live-buffer (steady/max), per-segment frame indexing,
       audio-master A/V lock, separate DRM present worker, DRM flip fixes,
-      single-threaded DRM event handling, manual rate-stretch servo, 8 MiB audio
-      FIFO, watchdog underflow guard, seamless `movie=:loop=0` encoder loop
+      single-threaded DRM event handling, lossless AAC decode (side-data
+      clear), 2 MiB audio FIFO, watchdog underflow guard, seamless
+      `movie=:loop=0` encoder loop
 - [x] DASH end-to-end fixes: fix live-edge overshoot (was ~100 segments ahead,
       every fetch 404'd), fix DRM present-event deadlock (decode worker no longer
       reads DRM events → flips/presentation froze), fix resync churn (anchor no
@@ -736,10 +758,16 @@ pixels). The decoder test requires FFmpeg dev headers.
       a second → audible dropouts), seamless continuous looping (no per-loop
       pause), restart-safe reader (re-anchors A/V clocks to NOW if the watchdog
       ever respawns a crashed encoder), remove the on-screen latency overlay
-      (HUD). Verified end-to-end on `ai2`: `fail=0 xrun=0 pad=0 av-offset≈0`,
-      24 fps DRM presentation + HDMI audio, audio FIFO stable, no restart gaps.
+       (HUD). Verified end-to-end on `ai2`: `fail=0 xrun=0 pad=0 av-offset≈0`,
+       60 fps DRM presentation + audio (USB headset / HDMI), audio FIFO stable,
+       no restart gaps.
 - [x] DRM prime-fd export and CUDA import/pin attempts
 - [x] SSE streaming-store CPU copy fallback for DRM scanout
+- [x] Audio quality gold baseline: per-segment AAC boundary loss eliminated
+      (clear demuxer packet side data → lossless decode), USB headset
+      auto-route with stereo→mono downmix, no rate-stretch (native pitch,
+      no chip), stable FIFO + 0 xruns over the 21-min 4K/60fps run. Tagged
+      `BASELINE.GOLD.4K.60fps`.
 - [ ] DASH ABR (multi-representation MPD → the demuxer picks bitrate)
 - [ ] Remove the CPU copy from conversion stage to DRM buffer (zero-copy via
       EGL interop, GBM/CUDA import, or a modified conversion library)
