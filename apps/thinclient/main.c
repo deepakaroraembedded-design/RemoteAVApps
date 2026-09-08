@@ -222,6 +222,7 @@ static u64 g_eos_end_wall_us = 0;   /* wall time when all content has played */
 typedef struct {
     int  buf_idx;
     u64  deadline_us;
+    i64  pts_us;      /* content PTS of the frame (for the audio-content gate) */
 } present_entry;
 static present_entry g_present_queue[VMC_PRESENT_QUEUE_SIZE];
 static int g_present_qhead = 0;
@@ -618,12 +619,13 @@ static u64 dash_pres_clock(void) {
  * (≈ -260 ms/min residual). The reader-side frame slots absorb the bursts. */
 #define VMC_PRESENT_QUEUE_BOUND VMC_PRESENT_QUEUE_SIZE
 
-static void present_push(int buf_idx, u64 deadline_us) {
+static void present_push(int buf_idx, u64 deadline_us, i64 pts_us) {
     pthread_mutex_lock(&g_present_qmu);
     while (g_present_qcount >= VMC_PRESENT_QUEUE_BOUND && g_run) {
         pthread_cond_wait(&g_present_qspace, &g_present_qmu);
     }
-    g_present_queue[g_present_qtail] = (present_entry){buf_idx, deadline_us};
+    g_present_queue[g_present_qtail] =
+        (present_entry){buf_idx, deadline_us, pts_us};
     g_present_qtail = (g_present_qtail + 1) % VMC_PRESENT_QUEUE_SIZE;
     g_present_qcount++;
     pthread_cond_signal(&g_present_qready);
@@ -734,9 +736,27 @@ static void *present_worker(void *arg) {
             ? 1000000u / (u64)g_stream_fps : 1000000u / 24u;
         const u64 t_dl0 = vmc_time_now_us();
         if (e.deadline_us != 0) {
+            /* Gate the flip on the LIVE audio-content crossing (the same
+             * mapping the fb0 path uses: wall - audio_start - live ALSA
+             * delay), NOT the startup-anchored deadline — the deadline carries
+             * a stale ~890 ms bias (astart/adelay baked in at reader time) that
+             * made every DRM frame present ~890 ms late (constant av_offset
+             * ≈ -805 ms, video behind audio). Lead the crossing by half a
+             * vblank so the flip lands ON the crossing (the page flip completes
+             * at the next vblank, 0..1 period after the submit). Falls back to
+             * the deadline when the audio clock is unavailable/stalled. */
+            const u64 vblank_us = g_drm.vblank_period_us > 0
+                ? g_drm.vblank_period_us : 16667u;
+            const i64 gate_pts = e.pts_us - (i64)(vblank_us / 2u);
             for (int i = 0; i < 600; i++) {
-                const u64 c = dash_pres_clock();
-                if (c >= e.deadline_us) break;
+                const u64 wall = (u64)vmc_time_wall_us();
+                const i64 ac = tlm_audio_content_at_wall(wall);
+                if (ac >= 0 && ac >= gate_pts) break;
+                if (ac < 0 ||
+                    (u64)vmc_time_wall_us() - g_audio_last_advance_wall >
+                        1000000u) {
+                    if (dash_pres_clock() >= e.deadline_us) break;
+                }
                 av_usleep(3000);
                 if (!g_run) break;
             }
@@ -804,7 +824,15 @@ static void *present_worker(void *arg) {
                              (u64)apos);
             if (apos >= 0) {
                 const i64 late = (i64)wall_now - (i64)m->deadline_us;
-                if (late > (i64)(frame_period_us * 3u / 2u) &&
+                /* The DRM present is scheduled at the AUDIO CONTENT crossing,
+                 * which is `deadline + playout_latency` BY DESIGN (the deadline
+                 * is the audio-start-anchored schedule minus the playout lead).
+                 * Only flag a real miss — a present that overshoots the
+                 * crossing by more than a frame period beyond that. The old
+                 * bare 1.5x-frame-period threshold fired on EVERY frame because
+                 * late ≈ playout (85ms) was always above it. */
+                if (late > (i64)g_playout_latency_us +
+                               (i64)(frame_period_us * 3u / 2u) &&
                     vmc_tlm_enabled())
                     vmc_tlm_emit("sync", "\"kind\":\"vsync_miss\","
                                  "\"detail\":\"deadline_exceeded\","
@@ -1012,7 +1040,8 @@ static void *decode_worker(void *arg) {
                     g_pending_decode_us = decode_us;
                     slot_release(idx);
 
-                    present_push(g_pending_buf_idx, g_pending_deadline_us);
+                    present_push(g_pending_buf_idx, g_pending_deadline_us,
+                                 g_pending_pts);
                     if (!g_first_video_ready) g_first_video_ready = true;
                     const u64 t_after_push = vmc_time_now_us();
                     {

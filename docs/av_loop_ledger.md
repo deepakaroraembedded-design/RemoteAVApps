@@ -381,3 +381,29 @@ blocker:  hardware-bound ONLY under the current audio-master design. mpv's
          the DRM path to become the DISPLAY clock (audio follows the panel,
          not wall realtime). That is the next optimization for the shipping
          path.
+
+## iter-017  2026-09-08T01:40Z  tier=full (DRM present alignment, Samsung 60Hz)
+hypothesis: the Samsung panel (1920x1080@60, vblank 16666us) ELIMINATED the
+         -210ms/min drift (av_offset flat at -805ms across buckets 0-10). But
+         the DRM path still fails av_sync on a CONSTANT -805ms offset: every
+         frame presents ~890ms after its deadline (late_us constant 890ms,
+         ~54-frame present-queue backlog). Root cause: the present worker
+         gates on `dash_pres_clock() >= deadline`, where dash_pres_clock is
+         the raw ALSA position and the deadline was anchored at READER time
+         (startup astart/adelay baked in) — a ~890ms domain bias vs the live
+         content timeline. The fb0 path avoids this by gating on the LIVE
+         audio-content crossing (wall - astart - live adelay). The vsync_miss
+         gate then fires on EVERY frame because `late ≈ deadline+playout`
+         (85ms) exceeds the bare 1.5x-frame-period threshold (25ms).
+prediction: gating the DRM flip on `tlm_audio_content_at_wall(wall) >= pts -
+         vblank/2` (live content crossing, half-vblank lead so the flip lands
+         ON the crossing) and flagging vsync_miss only when late exceeds
+         playout + 1.5x-period (a real miss) cuts the constant av_offset from
+         -805ms to ≈0 (±8ms vblank quantization) and vsync_miss from
+         3600/bucket to 0. Cadence stays vblank-locked (the flips land on
+         vblanks regardless of the gate).
+change:    apps/thinclient/main.c — present_entry carries pts_us; present
+         worker gates on the live audio-content crossing (fb0 mapping) with a
+         half-vblank lead, falling back to the deadline when audio is stalled;
+         vsync_miss threshold now measures beyond playout_latency.
+result:    (filled in by iter-018's report)
