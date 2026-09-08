@@ -1,6 +1,8 @@
 #include <alsa/asoundlib.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "vmc/audio/alsa_sink.h"
@@ -17,6 +19,37 @@ typedef struct {
 static u64 g_xrun_recover;
 static u64 g_xrun_fatal;
 #endif
+
+/* Detect an attached USB audio device (USB headset) by scanning
+ * /proc/asound/cards for a USB-Audio card that exposes a playback PCM. Writes
+ * the ALSA device string "plughw:<card-id>,0" into out. Returns true if found.
+ * plughw is used (rather than hw) so the PCM handles any rate/format the USB
+ * device does not natively accept (the pipeline always writes 48k s16). */
+bool vmc_alsa_find_usb_device(char *out, size_t out_len) {
+    FILE *f = fopen("/proc/asound/cards", "r");
+    if (!f) return false;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        int card = -1;
+        char id[64] = {0};
+        char driver[64] = {0};
+        /* " 0 [Seri           ]: USB-Audio - Plantronics ..." */
+        if (sscanf(line, " %d [%63[^]]]: %63s -", &card, id, driver) == 3 &&
+            strcmp(driver, "USB-Audio") == 0) {
+            char pcm_path[128];
+            snprintf(pcm_path, sizeof(pcm_path),
+                     "/proc/asound/card%d/pcm0p/sub0/info", card);
+            struct stat st;
+            if (stat(pcm_path, &st) == 0) {
+                snprintf(out, out_len, "plughw:%s,0", id);
+                fclose(f);
+                return true;
+            }
+        }
+    }
+    fclose(f);
+    return false;
+}
 
 /* NVIDIA HDA HDMI outputs are digitally muted (IEC958 playback switch off) by
  * default. Turn the switch on for every IEC958 element so the PCM we write
@@ -79,11 +112,22 @@ vmc_status vmc_alsa_sink_init(vmc_audio_sink *sink, const char *device) {
     sink->ctx = a;
     sink->play = alsa_play;
 
-    if (!device) device = getenv("VMC_AUDIO_DEV");
-    if (!device) device = "default";
+    /* Prefer a physically-attached USB headset over the configured sink (the
+     * HDMI display): audio follows the device actually in front of the user.
+     * Falls back to VMC_AUDIO_DEV / "default" when no USB audio is present. */
+    char usb_dev[96] = {0};
+    const bool use_usb = vmc_alsa_find_usb_device(usb_dev, sizeof(usb_dev));
+    const char *dev = use_usb ? usb_dev : device;
+    if (use_usb) {
+        VMC_LOGI("alsa: USB audio device detected — routing to '%s'", usb_dev);
+    } else {
+        if (!device) device = getenv("VMC_AUDIO_DEV");
+        if (!device) device = "default";
+        dev = device;
+    }
 
-    if (snd_pcm_open(&a->pcm, device, SND_PCM_STREAM_PLAYBACK, 0) != 0) {
-        VMC_LOGW("alsa: cannot open '%s' — running silent", device);
+    if (snd_pcm_open(&a->pcm, dev, SND_PCM_STREAM_PLAYBACK, 0) != 0) {
+        VMC_LOGW("alsa: cannot open '%s' — running silent", dev);
         a->pcm = NULL;
         return VMC_OK;
     }
@@ -96,8 +140,10 @@ vmc_status vmc_alsa_sink_init(vmc_audio_sink *sink, const char *device) {
         a->pcm = NULL;
         return VMC_OK;
     }
-    VMC_LOGI("alsa: playing 48k stereo via '%s'", device);
-    alsa_unmute_hdmi();
+    VMC_LOGI("alsa: playing 48k stereo via '%s'", dev);
+    /* The NVIDIA HDMI is digitally muted by default; only unmute it when the
+     * audio is actually routed there (a USB headset needs no HDMI unmute). */
+    if (!use_usb) alsa_unmute_hdmi();
     return VMC_OK;
 }
 
