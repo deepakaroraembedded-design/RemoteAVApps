@@ -421,3 +421,18 @@ The iter-017 fix (DRM present gated on the LIVE audio-content crossing with a
 shipping DRM path fully green on a true 60Hz panel. The old panel (59.77Hz)
 drift is no longer a blocker on this hardware. Remaining confirmation cells:
 second 21-min clip, back-to-back replay.
+
+## confirmation-matrix cell: second clip (30fps/4Mbps/2s GOP) — DRM path  2026-09-08T16:53Z
+verdict: ERROR (measurement timing) — PRODUCT METRICS GREEN
+The iter-017 split correction (capped latency lead + constant sync-shift servo)
+is content-fps-agnostic: the 30fps clip plays with av_offset_mean 0.0ms (p95
+1.57, envelope 0), drift 0.0ms/min, cadence frame_interval_p95_err 0.05ms,
+0 drops / 0 vsync_miss / 0 underflows, audio 12000/12000, EOS at content
+1259.9s. The run was invalidated by (a) a measurement late-start: collect began
+~5 min after the client started playing, so the client reached EOS at window
+t=933s leaving only 15 of 20 buckets (environment) and (b) a Wi-Fi RTT spike
+(tcp_rtt p95 40-67ms) + slow segment fetches (1177ms) in buckets 9-10 draining
+the FIFO to 1.9% (network transient). Neither is a product defect. The cell
+needs a clean relaunch-with-immediate-collect run to certify.
+Also must re-verify the PRIMARY 60fps clip still PASSes with the servo code
+(no regression), and then run the back-to-back replay cell.
