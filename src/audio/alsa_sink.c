@@ -44,7 +44,10 @@ static int usb_playback_channels(int card) {
         if (strncmp(line, "Playback:", 9) == 0) { in_playback = 1; continue; }
         if (in_playback) {
             if (strncmp(line, "Capture:", 8) == 0) break;
-            if (sscanf(line, "Channels: %d", &ch) == 1) break;
+            const char *c = strstr(line, "Channels:");
+            if (c) {
+                if (sscanf(c + 9, " %d", &ch) == 1) break;
+            }
         }
     }
     fclose(f);
