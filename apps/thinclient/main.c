@@ -715,19 +715,21 @@ static void tlm_vrender_emit(int buf_idx, u64 vblank_us, u64 submit_us,
 static void *present_worker(void *arg) {
     (void)arg;
     static int g_last_presented_buf = -1;
-    /* Measured decision->scanout latency (us), EWMA-updated after every flip
-     * from (vblank - gate-release). The lead compensates it so the scanout
-     * lands ON the audio-content crossing. Capped at frame-period - margin so
-     * a large lead can never let the next frame's gate release before the
-     * previous flip completes (that bursted the 30fps cadence). */
-    static i64 s_present_latency_us = 16667;
-    /* Constant A/V bias (mpv vsync_offset): absorbs the audio-content-mapping
-     * offset that the LEAD cannot (the lead is capped by the frame period;
-     * the bias is content-fps dependent — ~0 at 60fps, ~35ms at 30fps).
-     * Servo-adjusted from the measured av_offset; a constant shift moves ALL
-     * frames uniformly, so it cannot break the cadence. */
+    /* Fixed decision->scanout lead: TWO vblanks. Measured the DRM decision->
+     * scanout path is ~2 vblanks (pre-flip drain waits out a pending flip,
+     * then the page flip completes one vblank later) and this lead keeps the
+     * cadence clean at BOTH 60fps (period 16.67ms, lead 33ms — the flip queue
+     * serializes on vblanks) and 30fps (period 33.33ms, lead 33ms < period +
+     * flip, no burst). The content-fps mapping bias (the residual that a fixed
+     * lead cannot absorb — ~0 at 60fps, ~35ms at 30fps) is handled by the
+     * s_sync_shift servo below, which moves ALL frames uniformly so it can
+     * never break the cadence. */
+    const i64 s_present_lead_us =
+        (i64)(g_drm.vblank_period_us > 0 ? g_drm.vblank_period_us : 16667u) *
+        2;
+    /* Constant A/V bias (mpv vsync_offset): servo-adjusted from the measured
+     * av_offset. A constant shift moves all frames uniformly. */
     static i64 s_sync_shift_us = 0;
-    i64 t_gate_done_wall = 0;
     while (g_run) {
         /* Wait a short while for audio playback to start so the first frame
          * is anchored to the audio clock, but never gate video permanently on
@@ -764,7 +766,7 @@ static void *present_worker(void *arg) {
              * fixed 2-vblank lead landed the 60fps scanout ON the crossing
              * (-1.84ms) but overshot at 30fps (-35ms). The EWMA is updated
              * after each flip from (vblank - gate-release). */
-            const i64 gate_pts = e.pts_us - s_present_latency_us -
+            const i64 gate_pts = e.pts_us - s_present_lead_us -
                                  s_sync_shift_us;
             for (int i = 0; i < 600; i++) {
                 const u64 wall = (u64)vmc_time_wall_us();
@@ -778,7 +780,6 @@ static void *present_worker(void *arg) {
                 av_usleep(3000);
                 if (!g_run) break;
             }
-            t_gate_done_wall = (i64)vmc_time_wall_us();
             const u64 now2 = dash_pres_clock();
             if (now2 > e.deadline_us + frame_period_us) {
 #ifdef VMC_DEBUG
@@ -836,26 +837,13 @@ static void *present_worker(void *arg) {
             const int repeat = (cb == g_last_presented_buf) ? 1 : 0;
             g_last_presented_buf = cb;
             const i64 apos = tlm_audio_content_us();
-            /* A/V alignment: split the correction so it cannot break cadence.
-             * (1) the LEAD is the measured decision->scanout latency (EWMA),
-             * capped at frame-period - margin: a lead larger than that would
-             * let the next frame's gate release before the previous flip
-             * completes, bursting the cadence (the 30fps failure). (2) the
-             * SHIFT is a constant servo on the measured av_offset (mpv
-             * vsync_offset / drift compensation) that absorbs the content-fps
-             * mapping bias (~0 at 60fps, ~35ms at 30fps) uniformly across all
-             * frames. */
-            if (t_gate_done_wall > 0 && (i64)vblank_us >= t_gate_done_wall) {
-                const i64 lat = (i64)vblank_us - t_gate_done_wall;
-                if (lat > 0 && lat < 500000) {
-                    s_present_latency_us =
-                        (s_present_latency_us * 15 + lat) / 16;
-                    const i64 max_lead =
-                        (i64)frame_period_us - 5000;
-                    if (s_present_latency_us > max_lead)
-                        s_present_latency_us = max_lead;
-                }
-            }
+            /* A/V alignment servo (mpv vsync_offset / drift compensation):
+             * the measured av_offset = pts - audio_content(vblank) at this
+             * flip is the ERROR; nudge the CONSTANT shift to drive it to zero.
+             * A fixed 2-vblank lead handles the decision->scanout latency but
+             * cannot absorb the content-fps mapping bias (~0 at 60fps, ~35ms
+             * at 30fps); the shift absorbs it uniformly across all frames so
+             * the cadence is unaffected. /8 = slow tau (~8 frames), clamped. */
             {
                 const i64 off = m->pts_us - apos;
                 if (off > -500000 && off < 500000) {
