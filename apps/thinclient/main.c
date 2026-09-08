@@ -747,7 +747,13 @@ static void *present_worker(void *arg) {
              * the deadline when the audio clock is unavailable/stalled. */
             const u64 vblank_us = g_drm.vblank_period_us > 0
                 ? g_drm.vblank_period_us : 16667u;
-            const i64 gate_pts = e.pts_us - (i64)(vblank_us / 2u);
+            /* Lead the audio-content crossing by TWO vblanks: measured, the
+             * decision->scanout path is ~2 vblanks (the pre-flip drain waits
+             * out a pending flip, then the page flip completes one vblank
+             * later). With a half-vblank lead the frame appeared ~28ms after
+             * the audio content it pairs with (av_offset -27.8ms); a 2-vblank
+             * lead lands the scanout ON the crossing. */
+            const i64 gate_pts = e.pts_us - (i64)(vblank_us * 2u);
             for (int i = 0; i < 600; i++) {
                 const u64 wall = (u64)vmc_time_wall_us();
                 const i64 ac = tlm_audio_content_at_wall(wall);
