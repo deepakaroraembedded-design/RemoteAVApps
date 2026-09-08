@@ -132,19 +132,64 @@ vmc_status vmc_alsa_sink_init(vmc_audio_sink *sink, const char *device) {
         if (!device) device = "default";
         dev = device;
     }
-
     if (snd_pcm_open(&a->pcm, dev, SND_PCM_STREAM_PLAYBACK, 0) != 0) {
         VMC_LOGW("alsa: cannot open '%s' — running silent", dev);
         a->pcm = NULL;
         return VMC_OK;
-    }    if (snd_pcm_set_params(a->pcm, SND_PCM_FORMAT_S16_LE,
-                           SND_PCM_ACCESS_RW_INTERLEAVED,
-                           VMC_AUDIO_CHANNELS, VMC_AUDIO_SAMPLE_RATE, 1,
-                           250000) != 0) {
-        VMC_LOGW("alsa: set_params failed — running silent");
-        snd_pcm_close(a->pcm);
-        a->pcm = NULL;
-        return VMC_OK;
+    }
+    /* Explicit hw params with a SMALL period: ADAPTIVE-sync USB devices (most
+     * headsets) deliver in 1 ms USB frames; ALSA's default negotiated a
+     * 62.5 ms period (3000 frames) that made the adaptive rate adjustment lumpy
+     * — a periodic low-level chip. A ~20 ms period keeps the stream smooth.
+     * plughw passes these through; hw devices accept them near-exactly. */
+    {
+        unsigned rate = VMC_AUDIO_SAMPLE_RATE;
+        snd_pcm_uframes_t period = 960;    /* 20 ms @48k */
+        snd_pcm_uframes_t buffer = 12000;  /* 250 ms */
+        snd_pcm_hw_params_t *hp = NULL;
+        snd_pcm_hw_params_malloc(&hp);
+        if (hp) {
+            snd_pcm_hw_params_any(a->pcm, hp);
+            int ok =
+                snd_pcm_hw_params_set_access(a->pcm, hp,
+                                             SND_PCM_ACCESS_RW_INTERLEAVED) == 0 &&
+                snd_pcm_hw_params_set_format(a->pcm, hp,
+                                             SND_PCM_FORMAT_S16_LE) == 0 &&
+                snd_pcm_hw_params_set_channels(a->pcm, hp,
+                                               VMC_AUDIO_CHANNELS) == 0 &&
+                snd_pcm_hw_params_set_rate_near(a->pcm, hp, &rate, 0) == 0 &&
+                snd_pcm_hw_params_set_period_size_near(a->pcm, hp, &period,
+                                                       0) == 0 &&
+                snd_pcm_hw_params_set_buffer_size_near(a->pcm, hp, &buffer) == 0;
+            if (!ok || snd_pcm_hw_params(a->pcm, hp) != 0) {
+                VMC_LOGW("alsa: hw_params failed — running silent");
+                snd_pcm_close(a->pcm);
+                a->pcm = NULL;
+                snd_pcm_hw_params_free(hp);
+                return VMC_OK;
+            }
+            snd_pcm_hw_params_free(hp);
+        }
+        /* Start playback after a short prefill (~10 ms), not after the whole
+         * buffer fills; and wake the writer every period so delivery to an
+         * ADAPTIVE USB device is steady. */
+        snd_pcm_sw_params_t *sw = NULL;
+        snd_pcm_sw_params_malloc(&sw);
+        if (sw) {
+            if (snd_pcm_sw_params_current(a->pcm, sw) == 0) {
+                snd_pcm_sw_params_set_start_threshold(a->pcm, sw, 480);
+                snd_pcm_sw_params_set_avail_min(a->pcm, sw, 240);
+                snd_pcm_sw_params_set_period_event(a->pcm, sw, 0);
+                (void)snd_pcm_sw_params(a->pcm, sw);
+            }
+            snd_pcm_sw_params_free(sw);
+        }
+        if (snd_pcm_prepare(a->pcm) != 0) {
+            VMC_LOGW("alsa: prepare failed — running silent");
+            snd_pcm_close(a->pcm);
+            a->pcm = NULL;
+            return VMC_OK;
+        }
     }
     VMC_LOGI("alsa: playing 48k stereo via '%s'", dev);
     /* The NVIDIA HDMI is digitally muted by default; only unmute it when the
