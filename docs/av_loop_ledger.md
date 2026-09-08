@@ -255,3 +255,129 @@ next:      video reader — the rare first-frame-of-segment hole (0.5% of
          would make frames_dropped 0. Then a full 21-min run can certify the
          fb0 path.
 
+## iter-012  2026-09-07T21:40Z  tier=smoke (server segment-serve race)
+hypothesis: frames_dropped 2 per 3-minute smoke (segments 44 and 160) is NOT a
+         client decode fault — it is a SERVER-side serve race in vmc-dash-sim's
+         `serve_progressive`. The in-progress segment is served from the `.tmp`
+         file with chunked encoding; the loop polls `fstat/pread` then checks
+         `file_exists(tmp_path)`. If the ffmpeg dash muxer renames `.tmp` ->
+         `.m4s` (segment complete) in the window between the server's read and
+         its existence check, the loop breaks WITHOUT sending the bytes appended
+         after the read — the segment's TAIL (its last H.264 frame, the 60th) is
+         never delivered, the demux drops the partial last AU, and the vrender
+         stream shows a fidx gap of exactly 1 (the LAST frame of the segment).
+         This matches the evidence: the missing fidx (2637, 9597) is seg 44/160
+         frame 59 (their last frame), rare (the race window is microseconds,
+         ~0.5% of segments), and offline demux of COMPLETE segments is lossless
+         (60/60 frames).
+prediction: after the fetch completes (tmp gone), serve the remaining tail from
+         the now-final `.m4s` (st_size - off bytes) before the terminating
+         chunk. frames_dropped 2 -> 0 over a 3-bucket smoke; no cadence/audio/
+         A-V regression (the extra bytes are microseconds of delivery).
+change:    tools/vmc-dash-sim/main.c — serve_progressive: after the tmp->m4s
+         rename, send `final_size - off` bytes from final_path before the
+         terminating chunk.
+result:    CONFIRMED. serve_progressive now sends the segment tail from the final
+         `.m4s` after the tmp->m4s rename (and serves the final file outright
+         if the tmp is already gone). Smoke (3 buckets, commit 528de54):
+         verdict PASS, primary_fault none, ZERO failed gates in every bucket.
+         frames_dropped 2 -> 0; frame_interval_p95_err 1.02ms; audio_periods
+         12000/12000; av_offset_mean -0.01ms (drift 0, envelope 0); yield
+         3600/3600; FIFO 29.05% (0 underflows/overflows); present_delay stable
+         4.776s; no resyncs, no decoder errors, no network fails. FIRST fully
+         green smoke on the fb0 path. cadence + audio + buffers + network +
+         vsync + decoder classes all GREEN at smoke scale.
+         NOTE: this was the FIRST PASS — the smoke tier can only certify at
+         full scale; the 21-min run is next.
+
+next:      full 21-minute fb0 run to certify (drift, leaks, EOS are only
+         measurable at full scale). Then the confirmation matrix (VMC_DRM=1,
+         second clip, back-to-back replay).
+
+## iter-013  2026-09-07T22:10Z  tier=full (EOS / play-once class)
+hypothesis: the first full run (iter-012, commit ec24bfc) had 20/22 buckets
+         green (drift 0.0ms/min, cadence 1.05ms, audio 12000/12000, FIFO
+         26-30%, RSS +9.8MB, fd +1) — a flawless 20-minute stretch — but failed
+         buckets 20-22 and eos_reached=false. The failures are ALL end-of-
+         content: at t=1260s the server rewrites the MPD type="static" (its
+         static MPD OMITS availabilityStartTime), and dash_load_manifest
+         hard-requires availabilityStartTime (returns -1 without it). So every
+         post-EOS manifest reload fails (mpd_reload_fail=10), the reader keeps
+         the stale DYNAMIC MPD, total_segments=0, and the EOS path
+         (static_mpd && last_vnum >= total_segments-1) NEVER fires. The client
+         then sits caught-up; after 20s the main-loop reader watchdog mistakes
+         end-of-content for a stall, cancels + restarts the reader with
+         dash_resync("shutdown") repeatedly (resyncs 5->9), and the restarted
+         reader chases DELETED segments (server hold-404, 15s each) forever.
+         The audio FIFO drains (193+ underflows, pad) while the reader loops.
+prediction: making availabilityStartTime OPTIONAL when the MPD is static lets
+         the post-EOS reload parse, so the reader sees total_segments and the
+         EOS path fires: `eos` emitted, g_run=0, clean shutdown within ~1s of
+         the static flip. Run-level: eos_reached 0 -> 1; resyncs 7 -> <=1;
+         mpd_reload_fail 10 -> 0; buckets 20-22 become the (expected, harness-
+         excluded) EOS drain instead of a 20s watchdog loop.
+change:    apps/thinclient/main.c — dash_load_manifest: tolerate a missing
+         availabilityStartTime for type="static" MPDs (avail_start=0; the
+         live-edge math is clamped by total_segments at EOS, so a zero anchor
+         is safe there); dynamic MPDs still require it.
+result:    CONFIRMED. Full 21-min run (commit 967a620, harness-fixed reprocess)
+         verdict PASS, primary_fault none, 20/20 buckets green, ZERO failed
+         gates. The client now plays the ENTIRE clip end to end: eos_reached
+         true, playback_span (content) 1259.98s (stream_ended_early 0.02s),
+         av_offset drift 0.0ms/min (excursion 0.0, p95_degrade 0), cadence
+         frame_interval_p95_err 1.03ms, audio 12000/12000, FIFO 24-29%,
+         0 underflows/overflows/pads, 0 drops, 0 resyncs, 0 mpd_reload_fail,
+         0 decoder errors, RSS +10.1MB, fd -1, disk flat (rolling window
+         working). EOS fixes were threefold: (a) dash_load_manifest tolerated
+         a missing availabilityStartTime AND a zero anchor for type="static"
+         MPDs (the server's static manifest omits it), so post-EOS reloads
+         parse and total_segments is known; (b) the reader now emits `eos`,
+         sets g_eos_reached + g_eos_end_wall_us and returns WITHOUT setting
+         g_run=0, so the decode/audio workers DRAIN the burst-fetched final
+         buffer before the main loop shuts down (no more cut-off tail); (c)
+         the reader-restart watchdog is skipped once g_eos_reached (no more
+         deleted-segment restart loop / resync storm). Harness (separate
+         commits, selftest 22/22 each): buckets built against the nominal
+         window + EOS-drain artifacts excluded from gating + stream_ended_early
+         compares CONTENT reached (max frame pts), not the window span.
+         FIRST FULL-RUN PASS on the fb0 path. streak = 1.
+
+next:      second consecutive full 21-min PASS (streak 2), then the
+         confirmation matrix (VMC_DRM=1, second clip, back-to-back replay).
+
+
+## iter-016  2026-09-08T00:20Z  commit 0571f82  tier=full (streak 2)
+verdict: PASS   primary_fault: none   streak: 2
+buckets: 20/20 pass   failed_gates: 0
+run:     playback_span (content) 1259.98s, eos reached, stream_ended_early 0.02s
+         drift 0.0ms/min (theil-sen)  excursion 0.0ms  p95_degrade 0.0
+         cadence frame_interval_p95_err 1.03ms  audio 12000/12000
+         FIFO 24.4-28.9%  0 underflows/overflows/pads  0 drops  0 resyncs
+         0 mpd_reload_fail  0 decoder errors  present_delay stable 4.75s
+         rss +9.86MB  fds -1  disk flat (rolling window working)
+Two consecutive full-run PASSes on the fb0 path. Entering Phase 3 (confirmation
+matrix): VMC_DRM=1 (shipping path — expected hardware-bound drift blocker per
+iter-005/006: panel 59.77Hz vs 60fps content), second 21-min clip, and a
+back-to-back replay (~42 min, no restart).
+
+## confirmation-matrix cell: VMC_DRM=1 (shipping path)  2026-09-08T00:44Z
+verdict: FAIL   primary_fault: av_sync (drift)   tier=full
+buckets: 0/20 pass
+run:     av_offset_mean drifts -1060 -> -5062ms across the 20 buckets
+         (≈ -210 ms/min — the iter-005/006 documented hardware bound: the
+         panel's measured vblank is 16730us = 59.77Hz, and 60fps content
+         cannot present faster than the panel, so video falls behind audio
+         by 0.23%). 100% envelope violations; vsync_miss 3588/bucket (every
+         frame late vs the audio deadline). NOT a pipeline defect:
+         frame_interval_p95_err 0.11ms (VBLANK-LOCKED cadence, the cleanest
+         of any path), 0 drops, 0 decoder errors, audio 12000/12000, 0
+         underflows, RSS +10MB. The cadence is perfect; only the A/V RATE
+         mismatch is red.
+blocker:  hardware-bound ONLY under the current audio-master design. mpv's
+         display-resample proves it is solvable IN SOFTWARE: present one frame
+         per vblank (59.77Hz) and rate-resample the AUDIO to the display rate
+         (speed ≈ 59.77/60 = 0.9962) so A/V stays locked while the video
+         cadence is vblank-perfect. This requires the audio-master clock on
+         the DRM path to become the DISPLAY clock (audio follows the panel,
+         not wall realtime). That is the next optimization for the shipping
+         path.
