@@ -1,0 +1,251 @@
+================================================================================
+VMC Thin Client — Complete Code Structure and File Details
+================================================================================
+Generated: 2026-09-08 (branch DEV0908)
+Repo:      REMOTEAPPS/thin-client
+Purpose:   MEC/edge low-latency DASH (LL-DASH) remote desktop / A/V playback.
+           Server (vmc-dash-sim) muxes a 21-min clip to CMAF LL-DASH via
+           NVENC; thin client (vmc-thinclient-app) demuxes + decodes (CUVID)
+           and renders via DRM/KMS (shipping) or /dev/fb0, with ALSA audio.
+
+Workload under test (agentic loop): ONE 21-minute clip played end-to-end in a
+single stretch. Native 1920x1080@60fps H.264 + AAC 44.1kHz, 1260 s.
+
+================================================================================
+TREE
+================================================================================
+thin-client/
+|-- AGENTICPLAN/                  Agentic A/V convergence plan (alternate copy)
+|   |-- AGENTIC_AV_PLAN.md        The plan: two-agent loop, gates, triage order
+|   |-- CLAUDE.md                 Main-agent standing instructions
+|   |-- README_AGENTIC.md
+|   |-- docs/
+|   |   `-- AV_TELEMETRY_SPEC.md  Telemetry event schema / instrumentation spec
+|   |-- .claude/
+|   |   |-- agents/av-test-runner.md   Measurement subagent definition
+|   |   `-- commands/av-loop.md        /av-loop entry point
+|   `-- tools/av_harness/         Harness copy (see tools/av_harness/ below)
+|
+|-- apps/
+|   `-- thinclient/
+|       `-- main.c                THE THIN CLIENT APPLICATION (4207 lines)
+|                                 Single file: DASH reader, CUVID decode, DRM/fb0
+|                                 present, ALSA audio, A/V sync servo, telemetry.
+|
+|-- include/vmc/                  Public headers (mirror src/)
+|   |-- vmc.h                     Top-level umbrella header
+|   |-- audio/
+|   |   |-- alsa_sink.h           ALSA sink interface (position/delay/stats)
+|   |   |-- mixer.h               Volume mixer
+|   |   `-- pipeline.h            Audio pipeline (sink + mixer)
+|   |-- core/
+|   |   |-- compiler.h            Compiler/attribute macros
+|   |   |-- error.h               vmc_status error codes
+|   |   |-- logger.h              Logging macros
+|   |   |-- platform.h            Time/sleep portability
+|   |   |-- ringbuf.h             Lock-free-ish ring buffer
+|   |   |-- telemetry.h           NDJSON telemetry ring + writer
+|   |   `-- types.h               Fixed-width typedefs (u8/u16/u32/u64, sz_t...)
+|   |-- input/
+|   |   |-- batch.h               Input event batching
+|   |   |-- evdev_input.h         Linux evdev capture
+|   |   `-- input.h               Input abstraction
+|   |-- session/
+|   |   |-- mapper.h              MEC session mapper protocol
+|   |   |-- session.h             Session state machine
+|   |   `-- state.h               Session states
+|   |-- transport/
+|   |   |-- jitter_buffer.h       Reorder/de-jitter buffer
+|   |   |-- protocol.h            MEC wire protocol
+|   |   |-- transport.h           Transport abstraction
+|   |   `-- udp_transport.h       UDP transport
+|   `-- video/
+|       |-- decoder.h             Video decoder interface (vmc_decoder_*)
+|       |-- display.h             Display interface (vmc_display, present)
+|       |-- drm_scanout.h         DRM/KMS dumb-buffer scanout API
+|       |-- fb_display.h          /dev/fb0 framebuffer display
+|       |-- ffmpeg_decoder.h      FFmpeg/CUVID decoder wrapper
+|       `-- fragment.h            Fragment (NAL/AU) parsing
+|
+|-- src/                          Implementation
+|   |-- audio/
+|   |   |-- alsa_sink.c (163)     ALSA PCM: open, position, delay, xrun stats
+|   |   |-- mixer.c     (53)      Simple volume control
+|   |   `-- pipeline.c  (37)      Wires sink+resample into a pipeline
+|   |-- core/
+|   |   |-- error.c     (28)      Error string map
+|   |   |-- logger.c    (44)      Stderr logger with levels
+|   |   |-- platform.c  (32)      Time helpers (monotonic, wall)
+|   |   |-- ringbuf.c   (98)      SPSC ring buffer (audio FIFO)
+|   |   `-- telemetry.c (345)     Lock-free SPSC ring -> NDJSON writer/UDP sink
+|   |-- input/
+|   |   |-- batch.c     (79)      Coalesce input events
+|   |   `-- evdev_input.c (138)   Read /dev/input/event* devices
+|   |-- platform/linux/
+|   |   `-- time.c                Linux clock helpers
+|   |-- session/
+|   |   |-- mapper.c   (104)      Mapper/session protocol handling
+|   |   |-- session.c  (92)       State machine transitions
+|   |   `-- state.c   (154)       State bookkeeping + transitions
+|   |-- transport/
+|   |   |-- jitter_buffer.c (149)  Reorder window + drop policy
+|   |   |-- protocol.c     (133)  Frame header parse/serialize
+|   |   |-- transport.c    (11)   Stub
+|   |   `-- udp_transport.c (136) UDP socket recv/send
+|   `-- video/
+|       |-- drm_scanout.c  (312)  DRM/KMS: modeset, dumb buffers, page flips,
+|       |                          vblank event loop, present with phase-lock fix
+|       |-- fb_display.c   (101)  /dev/fb0 mmap + row-by-row present
+|       |-- ffmpeg_decoder.c (374) CUVID hw decode, swscale/NV12->BGRA conv,
+|       |                          reorder/PTS mapping
+|       `-- fragment.c     (74)   NAL/AU fragment assembly
+|
+|-- tests/                        Unit tests (ctest, 9 suites)
+|   |-- CMakeLists.txt
+|   |-- vmc_test.h                Test helpers
+|   |-- test_decoder.c  test_fragment.c  test_input_batch.c
+|   |-- test_jitter_buffer.c  test_mixer.c  test_protocol.c
+|   |-- test_ringbuf.c  test_session.c  test_telemetry.c
+|
+|-- tools/
+|   |-- av_harness/               THE MEASUREMENT HARNESS (av-test-runner owns it)
+|   |   |-- env.sh                Topology, paths, tiers, all PASS gates (single source)
+|   |   |-- remote.sh             ssh wrapper with hard timeout to 192.168.0.145
+|   |   |-- relaunch.sh           CLEAN SLATE: kill -> verify dead -> purge -> start -> verify up
+|   |   |-- collect.sh            precheck, warm-up, measured window, heartbeat, EOS capture
+|   |   |-- av_report.py          NDJSON -> per-minute buckets -> gates -> av_report.json
+|   |   |-- selftest_synth.py     Fault-injection self-test (22 scenarios)
+|   |   `-- schema/av_report.schema.json
+|   |-- cuda/
+|   |   `-- nv12_conv.cu (249)    CUDA NV12->BGRA conversion kernel (libnv12conv.so)
+|   |-- mec_sim.py                Legacy MEC simulator
+|   |-- vmc-dash-sim/             THE DASH SERVER
+|   |   |-- CMakeLists.txt
+|   |   `-- main.c (942)          HTTP server + LL-DASH CMAF muxer + NVENC encoder
+|   |-- vmc_sim/
+|   |   |-- CMakeLists.txt
+|   |   `-- main.c (945)          Older MEC simulator (UDP stream)
+|   `-- wifi_connect.sh           Wi-Fi bring-up helper
+|
+|-- systemd/
+|   |-- vmc-dash-sim.service      Server systemd unit
+|   |-- vmc-thinclient.service    Client systemd unit
+|   `-- vmc-wifi.service          Wi-Fi service
+|
+|-- docs/
+|   |-- av_loop_ledger.md         ITERATION LEDGER (iter-000..iter-017, results)
+|   |-- AV_TELEMETRY_SPEC.md      Telemetry event contract
+|   `-- AV_CONVERGENCE_REPORT.md  Convergence report (fb0 streak-2)
+|
+|-- 4K/                           Media (large files, git-ignored)
+|   |-- Earth.mp4                 Source (55.6 min, 1080p@60, ~2.2 GB)
+|   |-- swiftrade_av_21min.mp4    PRIMARY FROZEN CLIP (0-21min, sha256 ...32fc3)
+|   `-- second_clip_30fps_21min.mp4  Confirmation-matrix second clip (30fps/4Mbps)
+|
+|-- runs/                         Harness run artifacts (per measurement)
+|   `-- <timestamp>-{smoke|full}/  ndjson telemetry, logs, meta.json, av_report.json
+|
+|-- build*/                       Build dirs (git-ignored)
+|   |-- build/                    Host build with tests (ctest green gate)
+|   |-- build-debug/              Host VMC_DEBUG=1 build
+|   |-- build-server-debug/       Server build used by relaunch
+|   `-- build-asan|nodebug/       ASan / no-debug builds
+|
+|-- CMakeLists.txt                Top-level build (VMC_DEBUG, VMC_DRM_FOUND,
+|                                 VMC_HAVE_FFMPEG, VMC_ENABLE_TESTS options)
+|-- Commands.sh                   Manual server/client launch helpers
+|-- CLAUDE.md                     Main-agent standing instructions (loop rules)
+|-- README.md                     Architecture docs (Design A/B, known landmines)
+|-- .claude/agents/av-test-runner.md   Measurement subagent (active copy)
+|-- .claude/commands/av-loop.md        /av-loop command
+|-- .gitignore
+`-- CodeStructure.txt             This file
+
+================================================================================
+KEY FILES — DETAILS
+================================================================================
+
+1. apps/thinclient/main.c  (4207 lines)  THE CLIENT
+   ------------------------------------------------------------------
+   Single-threaded-app wiring: reader thread + decode thread + present thread
+   (DRM) / fb0 decode-worker present + audio thread + main loop.
+   Important subsystems:
+   - DASH reader: dash_reader_direct() — fetches MPD + CMAF segments, demuxes
+     per-segment, publishes video AUs and decoded audio PCM. Anchors live edge
+     to availabilityStartTime; clamps fetches to the manifest startNumber;
+     play-once EOS detection + drain-before-exit (g_eos_reached /
+     g_eos_end_wall_us).
+   - Present pacing:
+       * fb0: two-phase wait (hrtimer sleep + busy-spin on the audio-content
+         crossing) — VMC_FB_PRESENT_SPIN_US; cadence floor
+         max(deadline, last+period); audio-content gate.
+       * DRM: present_worker() gates page flips on the LIVE audio-content
+         crossing (tlm_audio_content_at_wall) with a fixed 2-vblank lead plus a
+         constant sync-shift servo (s_sync_shift_us) that drives the measured
+         av_offset to zero (mpv display_sync_error style).
+   - Audio: audio_worker() renders clean 5ms periods; +2.33% AAC boundary-loss
+     compensation applied at DELIVERY (audio_fifo_write_compensated), not in
+     the render loop; ALSA position drives the audio-master clock.
+   - A/V alignment telemetry: tlm_audio_content_at_wall / tlm_vrender_emit /
+     tlm_arender_emit (NDJSON, env-gated VMC_TELEMETRY).
+   - vsync_miss flagged only when late exceeds playout_latency + 1.5*frame.
+
+2. tools/vmc-dash-sim/main.c  (942 lines)  THE DASH SERVER
+   ------------------------------------------------------------------
+   - Launches ffmpeg NVENC -> LL-DASH CMAF (streaming=1, SegmentTemplate,
+     availabilityTimeComplete=false, --play-once => movie loop=1, MPD flips
+     type="static" at EOS via patch_mpd_static()).
+   - HTTP server: conn_handler() serves /live.mpd and /chunk-stream*-*.m4s.
+   - serve_full() / serve_progressive() (chunked streaming of in-progress
+     .tmp segments, tail-race fix sends remaining bytes after tmp->m4s rename).
+   - Rollover deletion of old segments (rolling window).
+   - srv telemetry: mpd_update, eos, hold_404, encoder_restart.
+
+3. tools/av_harness/  THE MEASUREMENT HARNESS
+   ------------------------------------------------------------------
+   - env.sh: INPUT_CLIP, DASH_OUT, gates (GATE_AV_DRIFT_ABS_MS_PER_MIN=0.5,
+     GATE_FRAME_INTERVAL_FRAC=0.10, GATE_AUDIO_PERIOD_TOLERANCE=0.005, ...),
+     tiers (SMOKE 180s / FULL 1235s), CONTENT_FPS/AUDIO_RATE.
+   - av_report.py: NDJSON -> 60s buckets -> per-bucket + run-level gates;
+     builds buckets against the NOMINAL window, excludes EOS-drain artifacts
+     after the eos event, playback_span = content reached (max frame pts).
+   - relaunch.sh: clean slate, VMC_DRM, kill-verify-purge-start-verify.
+   - collect.sh: precheck, warm-up 15s, measured window, 30s heartbeat,
+     resource samples, EOS capture.
+   - selftest_synth.py: 22 injected-fault scenarios; gate/localisation checks.
+
+4. src/video/drm_scanout.c  (312 lines)  DRM/KMS
+   ------------------------------------------------------------------
+   - drmModeSetCrtc modeset, dumb-buffer alloc/import (DMA-BUF prime_fd),
+     page flips (drmModePageFlip), single-pass drain_events (returns at the
+     first flip event — the iter-005 phase-lock fix), vblank-period estimate.
+
+5. src/video/ffmpeg_decoder.c  (374 lines)  CUVID decode
+   ------------------------------------------------------------------
+   - av_hwdevice_ctx_create + get_format callback (h264_cuvid), frame reorder
+     by PTS, swscale/NV12->BGRA conversion, output stride/pitch.
+
+6. tools/cuda/nv12_conv.cu  (249 lines)  GPU conversion kernel
+   ------------------------------------------------------------------
+   - libnv12conv.so: async NV12->BGRA kernel (conv_async/conv_stage/conv_wait),
+     cudaSetDevice(0) before use.
+
+7. docs/av_loop_ledger.md  ITERATION LEDGER (read this first)
+   ------------------------------------------------------------------
+   iter-000..iter-017: cadence (4.06->1.02ms), audio periods (0.0227->0),
+   server serve-tail race, EOS/play-once, DRM present alignment
+   (av_offset -805->-1.84ms@60fps, 0.0ms@30fps; vsync_miss->0), fb0 streak-2,
+   confirmation cells.
+
+================================================================================
+BUILD & RUN
+================================================================================
+Server (host 192.168.0.126):  cmake -S . -B build-server-debug -DVMC_ENABLE_TESTS=OFF -DVMC_DEBUG=1
+                              cmake --build build-server-debug --target vmc-dash-sim -j$(nproc)
+Client (192.168.0.145):       cmake -S . -B build-debug -DVMC_ENABLE_TESTS=OFF -DVMC_DEBUG=1
+                              cmake --build build-debug --target vmc-thinclient-app -j$(nproc)
+                              (built ON the client; never scp the binary — FFmpeg ABI differs)
+Tests:                        ctest --test-dir build --output-on-failure   (9/9, green gate)
+Relaunch:                     tools/av_harness/relaunch.sh                 (VMC_DRM=1 default)
+Measure:                      av-test-runner subagent -> collect.sh --tier smoke|full -> av_report.py
+================================================================================
