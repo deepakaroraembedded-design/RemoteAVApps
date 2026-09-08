@@ -359,3 +359,25 @@ Two consecutive full-run PASSes on the fb0 path. Entering Phase 3 (confirmation
 matrix): VMC_DRM=1 (shipping path — expected hardware-bound drift blocker per
 iter-005/006: panel 59.77Hz vs 60fps content), second 21-min clip, and a
 back-to-back replay (~42 min, no restart).
+
+## confirmation-matrix cell: VMC_DRM=1 (shipping path)  2026-09-08T00:44Z
+verdict: FAIL   primary_fault: av_sync (drift)   tier=full
+buckets: 0/20 pass
+run:     av_offset_mean drifts -1060 -> -5062ms across the 20 buckets
+         (≈ -210 ms/min — the iter-005/006 documented hardware bound: the
+         panel's measured vblank is 16730us = 59.77Hz, and 60fps content
+         cannot present faster than the panel, so video falls behind audio
+         by 0.23%). 100% envelope violations; vsync_miss 3588/bucket (every
+         frame late vs the audio deadline). NOT a pipeline defect:
+         frame_interval_p95_err 0.11ms (VBLANK-LOCKED cadence, the cleanest
+         of any path), 0 drops, 0 decoder errors, audio 12000/12000, 0
+         underflows, RSS +10MB. The cadence is perfect; only the A/V RATE
+         mismatch is red.
+blocker:  hardware-bound ONLY under the current audio-master design. mpv's
+         display-resample proves it is solvable IN SOFTWARE: present one frame
+         per vblank (59.77Hz) and rate-resample the AUDIO to the display rate
+         (speed ≈ 59.77/60 = 0.9962) so A/V stays locked while the video
+         cadence is vblank-perfect. This requires the audio-master clock on
+         the DRM path to become the DISPLAY clock (audio follows the panel,
+         not wall realtime). That is the next optimization for the shipping
+         path.
