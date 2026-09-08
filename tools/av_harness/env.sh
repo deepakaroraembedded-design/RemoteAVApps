@@ -46,7 +46,26 @@ export RUNS_DIR="${RUNS_DIR:-$REPO/runs}"
 export VMC_DRM="${VMC_DRM:-1}"
 export VMC_AUDIO_DEV="${VMC_AUDIO_DEV:-hdmi}"
 export VMC_ALSA_CONF="${VMC_ALSA_CONF:-/etc/vmc-audio.conf}"
-export ALSA_PCM_STATUS="${ALSA_PCM_STATUS:-/proc/asound/card1/pcm3p/sub0/status}"
+# ALSA PCM status path checked by relaunch/collect for "audio actually
+# playing". The client routes audio to a physically-attached USB headset when
+# one is present (its PCM goes RUNNING, the HDMI PCM does not), so the check
+# must point at the USB playback PCM on THE CLIENT in that case, else the HDMI
+# status stays idle and the precheck falsely fails. Resolved remotely from the
+# client's /proc/asound/cards; falls back to the HDMI PCM.
+_alsa_pcm_status() {
+  local r=""
+  if [ -n "${CLIENT_IP:-}" ] && command -v ssh >/dev/null 2>&1; then
+    r="ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new ${CLIENT_USER}@${CLIENT_IP}"
+    [ -f "$CLIENT_SSH_KEY" ] && r="ssh -i $CLIENT_SSH_KEY -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new ${CLIENT_USER}@${CLIENT_IP}"
+  fi
+  if [ -n "$r" ]; then
+    local path
+    path="$($r 'while read -r num rest; do case "$rest" in *USB-Audio*) [ -f /proc/asound/card${num}/pcm0p/sub0/status ] && { echo /proc/asound/card${num}/pcm0p/sub0/status; exit 0; } ;; esac; done < /proc/asound/cards; echo /proc/asound/card1/pcm3p/sub0/status' 2>/dev/null)"
+    [ -n "$path" ] && { printf '%s' "$path"; return; }
+  fi
+  printf '/proc/asound/card1/pcm3p/sub0/status'
+}
+export ALSA_PCM_STATUS="${ALSA_PCM_STATUS:-$( _alsa_pcm_status )}"
 
 # ---------- measurement window ----------
 # Two tiers. SMOKE is a cheap pre-filter so a gross fault does not cost 21
