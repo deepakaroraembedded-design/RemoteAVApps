@@ -1271,7 +1271,7 @@ static void *decode_worker(void *arg) {
  * is how the rate compensation is applied — a proper resampler, not sample
  * duplication and not the one-shot swr_set_compensation correction. */
 #define VMC_AUDIO_SWR_OUT_RATE \
-    (VMC_AUDIO_SAMPLE_RATE + VMC_AUDIO_DELIVERY_DELTA)
+    (VMC_AUDIO_SAMPLE_RATE)
 #define VMC_AUDIO_FRAME_BYTES (960u)   /* 5 ms @ 48 kHz stereo s16 */
 /* 2 MiB (~10.9 s). The reader delivers ~1.5 s of audio just-in-time, so the
  * level is ~30 % of this cap (above the ≥15 % gate) while leaving room for
@@ -1383,6 +1383,14 @@ static void *audio_worker(void *arg) {
              * periods that produced audio_period_deviation 0.0227. */
             memcpy(outbuf, pcm, frames * 2u * 2u);
 #ifdef VMC_DEBUG
+            if (getenv("VMC_AUDIO_DUMP")) {
+                static int s_dump_fd = -1;
+                if (s_dump_fd < 0)
+                    s_dump_fd = open(getenv("VMC_AUDIO_DUMP"),
+                                     O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                if (s_dump_fd >= 0)
+                    (void)write(s_dump_fd, outbuf, (sz_t)frames * 4u);
+            }
             g_rate_out += out_n;
             g_rate_in += frames;
 #endif
@@ -1594,7 +1602,7 @@ static int dash_session_setup(AVFormatContext *fmt, dash_session *s) {
 #if LIBSWRESAMPLE_VERSION_MAJOR >= 4
                 AVChannelLayout ch_out = AV_CHANNEL_LAYOUT_STEREO;
                 if (swr_alloc_set_opts2(&s->swr, &ch_out, AV_SAMPLE_FMT_S16,
-                                        VMC_AUDIO_SWR_OUT_RATE,
+                                        VMC_AUDIO_SAMPLE_RATE,
                                         &s->actx->ch_layout,
                                         s->actx->sample_fmt,
                                         s->actx->sample_rate, 0, NULL) == 0 &&
@@ -1609,7 +1617,7 @@ static int dash_session_setup(AVFormatContext *fmt, dash_session *s) {
 #else
                 s->swr = swr_alloc_set_opts(
                     NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16,
-                    VMC_AUDIO_SWR_OUT_RATE, s->actx->channel_layout,
+                    VMC_AUDIO_SAMPLE_RATE, s->actx->channel_layout,
                     s->actx->sample_fmt, s->actx->sample_rate, 0, NULL);
                 if (s->swr && swr_init(s->swr) == 0) {
                     s->aframe = av_frame_alloc();
@@ -1749,7 +1757,7 @@ static int dash_init_setup_one(const u8 *init, size_t init_len, int want_audio,
                         AVChannelLayout ch_out = AV_CHANNEL_LAYOUT_STEREO;
                         if (swr_alloc_set_opts2(
                                 &s->swr, &ch_out, AV_SAMPLE_FMT_S16,
-                                VMC_AUDIO_SWR_OUT_RATE, &s->actx->ch_layout,
+                                VMC_AUDIO_SAMPLE_RATE, &s->actx->ch_layout,
                                 s->actx->sample_fmt, s->actx->sample_rate, 0,
                                 NULL) == 0 &&
                             swr_init(s->swr) == 0) {
@@ -1763,7 +1771,7 @@ static int dash_init_setup_one(const u8 *init, size_t init_len, int want_audio,
 #else
                         s->swr = swr_alloc_set_opts(
                             NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16,
-                            VMC_AUDIO_SWR_OUT_RATE, s->actx->channel_layout,
+                            VMC_AUDIO_SAMPLE_RATE, s->actx->channel_layout,
                             s->actx->sample_fmt, s->actx->sample_rate, 0,
                             NULL);
                         if (s->swr && swr_init(s->swr) == 0) {
@@ -1855,6 +1863,8 @@ static void dash_session_close(dash_session *s) {
     memset(s, 0, sizeof(*s));
 }
 
+static void dash_audio_write_frame(dash_session *s);
+
 static void *dash_reader(void *arg) {
     const char *url = (const char *)arg;
     AVPacket *pkt = av_packet_alloc();
@@ -1914,30 +1924,10 @@ static void *dash_reader(void *arg) {
                 }
             } else if (pkt->stream_index == s.as && s.actx && s.swr &&
                        s.aframe) {
+                av_packet_free_side_data(pkt);
                 if (avcodec_send_packet(s.actx, pkt) == 0) {
-                    while (avcodec_receive_frame(s.actx, s.aframe) == 0) {
-                        const int out_samples = swr_get_out_samples(
-                            s.swr, s.aframe->nb_samples);
-                        const int out_bytes = out_samples * 2 * 2;
-                        if (out_bytes > s.apcm_cap) {
-                            i16 *nb = (i16 *)realloc(s.apcm, (sz_t)out_bytes);
-                            if (!nb) break;
-                            s.apcm = nb;
-                            s.apcm_cap = out_bytes;
-                        }
-                        const int got = swr_convert(
-                            s.swr, (u8 **)&s.apcm, out_samples,
-                            (const u8 **)s.aframe->extended_data,
-                            s.aframe->nb_samples);
-                        if (got > 0) {
-                            pthread_mutex_lock(&g_audio_mu);
-                            (void)vmc_ringbuf_write(
-                                &g_audio_rb, s.apcm, (sz_t)got * 2 * 2);
-                            pthread_cond_signal(&g_audio_cv);
-                            pthread_mutex_unlock(&g_audio_mu);
-                        }
-                        av_frame_unref(s.aframe);
-                    }
+                    while (avcodec_receive_frame(s.actx, s.aframe) == 0)
+                        dash_audio_write_frame(&s);
                 }
                 av_packet_unref(pkt);
             } else {
@@ -2540,6 +2530,10 @@ static void dash_audio_write_frame(dash_session *s) {
         s->apcm = nb;
         s->apcm_cap = out_bytes;
     }
+    /* The decode is now lossless (per-segment side data cleared), so the swr
+     * converts 44.1k -> the device rate (48k) directly — no +2.33 % stretch.
+     * The FIFO holds clean 48k content that the worker's 240-frame / 5 ms
+     * reads align with exactly (no crude decimation chip). */
     const int got = swr_convert(s->swr, (u8 **)&s->apcm, out_samples,
                                 (const u8 **)s->aframe->extended_data,
                                 s->aframe->nb_samples);
@@ -2677,12 +2671,24 @@ static void dash_demux_segment(u8 *data, size_t len, dash_session *s,
             pkt->pts = s->audio_pts;
             pkt->dts = s->audio_pts;
             s->audio_pts += 1024;
+            /* The mov demuxer attaches side data to the FIRST packet of each
+             * per-segment demux (the track's disposition/initial-padding), and
+             * the AAC decoder drops that frame when it sees it. The concat
+             * demux only emits it on packet 0, which is why a continuous
+             * stream decodes losslessly but per-segment decode lost ~1 frame
+             * per boundary (the 2.33 % "boundary loss"). Clearing it makes
+             * per-segment decode lossless too. */
+            av_packet_free_side_data(pkt);
             /* Send can return EAGAIN if the decoder's input queue is full
              * (a frame is held for output). Drain first, then retry once so
              * no packet is dropped at a segment boundary. */
             if (avcodec_send_packet(s->actx, pkt) < 0) {
-                while (avcodec_receive_frame(s->actx, s->aframe) == 0)
+                while (avcodec_receive_frame(s->actx, s->aframe) == 0) {
+#ifdef VMC_DEBUG
+                    g_audio_frames += (u64)s->aframe->nb_samples;
+#endif
                     dash_audio_write_frame(s);
+                }
                 if (avcodec_send_packet(s->actx, pkt) < 0) {
 #ifdef VMC_DEBUG
                     g_audio_fetch_fail++; /* decode-side drop */
@@ -3036,6 +3042,21 @@ static void *dash_reader_direct(void *arg) {
                                  &fs) == 0 && seg_len > 0) {
                         if (vmc_tlm_enabled())
                             dash_tlm_net("audio", at, seg_url, 200, &fs);
+#ifdef VMC_DEBUG
+                        if (getenv("VMC_SEG_DUMP")) {
+                            static int s_aseg = 0;
+                            if (s_aseg < 300) {
+                                char dp[256];
+                                snprintf(dp, sizeof(dp), "%s/aseg_%03d.m4s",
+                                         getenv("VMC_SEG_DUMP"), s_aseg++);
+                                FILE *df = fopen(dp, "wb");
+                                if (df) {
+                                    (void)fwrite(seg, 1, seg_len, df);
+                                    fclose(df);
+                                }
+                            }
+                        }
+#endif
                         u8 *whole = (u8 *)malloc(init_a_len + seg_len);
                         if (whole) {
                             memcpy(whole, init_a, init_a_len);
