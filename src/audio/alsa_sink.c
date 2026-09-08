@@ -13,6 +13,9 @@
 typedef struct {
     snd_pcm_t *pcm;
     u64 frames_played;
+    int  channels;      /* PCM channels (1 = mono downmix, else stereo) */
+    i16 *mono;          /* mono downmix scratch (frames long) */
+    sz_t mono_cap;
 } alsa_ctx;
 
 #ifdef VMC_DEBUG
@@ -27,7 +30,34 @@ static u64 g_xrun_fatal;
  * the USB device does not natively accept (the pipeline always writes 48k
  * s16). The card INDEX is used (not the padded name in the [ ] column) so the
  * device string is always a valid ALSA PCM name. */
-bool vmc_alsa_find_usb_device(char *out, size_t out_len) {
+/* Read the device's playback channel count from /proc/asound/card<N>/stream0
+ * (the capability block after "Playback:"). Returns 2 on any uncertainty. */
+static int usb_playback_channels(int card) {
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/asound/card%d/stream0", card);
+    FILE *f = fopen(path, "r");
+    if (!f) return 2;
+    char line[128];
+    int in_playback = 0;
+    int ch = 2;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "Playback:", 9) == 0) { in_playback = 1; continue; }
+        if (in_playback) {
+            if (strncmp(line, "Capture:", 8) == 0) break;
+            if (sscanf(line, "Channels: %d", &ch) == 1) break;
+        }
+    }
+    fclose(f);
+    return ch > 0 ? ch : 2;
+}
+
+/* Detect an attached USB audio device (USB headset) by scanning
+ * /proc/asound/cards for a USB-Audio card that exposes a playback PCM. Writes
+ * the DIRECT ALSA device string "hw:<card-index>,0" into out (no plughw — the
+ * sink does the stereo->mono downmix itself with a proper (L+R)/2). Sets
+ * *channels to the device's playback channel count (1 = mono). */
+bool vmc_alsa_find_usb_device(char *out, size_t out_len, int *channels) {
+    if (channels) *channels = 2;
     FILE *f = fopen("/proc/asound/cards", "r");
     if (!f) return false;
     char line[256];
@@ -42,7 +72,8 @@ bool vmc_alsa_find_usb_device(char *out, size_t out_len) {
                      "/proc/asound/card%d/pcm0p/sub0/info", card);
             struct stat st;
             if (stat(pcm_path, &st) == 0) {
-                snprintf(out, out_len, "plughw:%d,0", card);
+                if (channels) *channels = usb_playback_channels(card);
+                snprintf(out, out_len, "hw:%d,0", card);
                 fclose(f);
                 return true;
             }
@@ -80,7 +111,22 @@ static void alsa_unmute_hdmi(void) {
 static vmc_status alsa_play(void *ctx, const i16 *pcm, sz_t frames) {
     alsa_ctx *a = (alsa_ctx *)ctx;
     if (!a->pcm) return VMC_OK;
-    snd_pcm_sframes_t r = snd_pcm_writei(a->pcm, pcm, (snd_pcm_sframes_t)frames);
+    const i16 *out = pcm;
+    if (a->channels == 1) {
+        /* Proper stereo->mono downmix (L+R)/2 done HERE, not by an ALSA plugin
+         * — clean and under our control (plugin downmixes were suspected of the
+         * periodic chip). */
+        if (frames > a->mono_cap) {
+            i16 *nb = (i16 *)realloc(a->mono, frames * sizeof(i16));
+            if (!nb) return VMC_OK;
+            a->mono = nb;
+            a->mono_cap = frames;
+        }
+        for (sz_t i = 0; i < frames; i++)
+            a->mono[i] = (i16)(((i32)pcm[i * 2u] + (i32)pcm[i * 2u + 1u]) >> 1);
+        out = a->mono;
+    }
+    snd_pcm_sframes_t r = snd_pcm_writei(a->pcm, out, (snd_pcm_sframes_t)frames);
     if (r < 0) {
         if (vmc_tlm_enabled())
             vmc_tlm_emit("buf", "\"which\":\"audio_fifo\","
@@ -117,10 +163,14 @@ vmc_status vmc_alsa_sink_init(vmc_audio_sink *sink, const char *device) {
      * HDMI display): audio follows the device actually in front of the user.
      * Falls back to VMC_AUDIO_DEV / "default" when no USB audio is present. */
     char usb_dev[96] = {0};
-    const bool use_usb = vmc_alsa_find_usb_device(usb_dev, sizeof(usb_dev));
+    int usb_ch = 2;
+    const bool use_usb = vmc_alsa_find_usb_device(usb_dev, sizeof(usb_dev),
+                                                  &usb_ch);
     const char *dev = use_usb ? usb_dev : device;
+    a->channels = use_usb ? usb_ch : VMC_AUDIO_CHANNELS;
     if (use_usb) {
-        VMC_LOGI("alsa: USB audio device detected — routing to '%s'", usb_dev);
+        VMC_LOGI("alsa: USB audio device detected — routing to '%s' (%d ch)",
+                 usb_dev, usb_ch);
         /* The harness sets ALSA_CONFIG_PATH to a minimal config that only
          * defines pcm.hdmi; under it the built-in hw/plughw plugins do not
          * resolve ("Unknown PCM plughw:..."). Open the USB device with the
@@ -140,10 +190,10 @@ vmc_status vmc_alsa_sink_init(vmc_audio_sink *sink, const char *device) {
     /* Explicit hw params with a SMALL period: ADAPTIVE-sync USB devices (most
      * headsets) deliver in 1 ms USB frames; ALSA's default negotiated a
      * 62.5 ms period (3000 frames) that made the adaptive rate adjustment lumpy
-     * — a periodic low-level chip. A ~20 ms period keeps the stream smooth.
-     * plughw passes these through; hw devices accept them near-exactly. */
+     * — a periodic low-level chip. A ~20 ms period keeps the stream smooth. */
     {
         unsigned rate = VMC_AUDIO_SAMPLE_RATE;
+        unsigned pch = (unsigned)a->channels;
         snd_pcm_uframes_t period = 960;    /* 20 ms @48k */
         snd_pcm_uframes_t buffer = 12000;  /* 250 ms */
         snd_pcm_hw_params_t *hp = NULL;
@@ -155,8 +205,7 @@ vmc_status vmc_alsa_sink_init(vmc_audio_sink *sink, const char *device) {
                                              SND_PCM_ACCESS_RW_INTERLEAVED) == 0 &&
                 snd_pcm_hw_params_set_format(a->pcm, hp,
                                              SND_PCM_FORMAT_S16_LE) == 0 &&
-                snd_pcm_hw_params_set_channels(a->pcm, hp,
-                                               VMC_AUDIO_CHANNELS) == 0 &&
+                snd_pcm_hw_params_set_channels(a->pcm, hp, pch) == 0 &&
                 snd_pcm_hw_params_set_rate_near(a->pcm, hp, &rate, 0) == 0 &&
                 snd_pcm_hw_params_set_period_size_near(a->pcm, hp, &period,
                                                        0) == 0 &&
@@ -191,7 +240,8 @@ vmc_status vmc_alsa_sink_init(vmc_audio_sink *sink, const char *device) {
             return VMC_OK;
         }
     }
-    VMC_LOGI("alsa: playing 48k stereo via '%s'", dev);
+    VMC_LOGI("alsa: playing 48k %s via '%s'",
+             a->channels == 1 ? "mono" : "stereo", dev);
     /* The NVIDIA HDMI is digitally muted by default; only unmute it when the
      * audio is actually routed there (a USB headset needs no HDMI unmute). */
     if (!use_usb) alsa_unmute_hdmi();
@@ -203,6 +253,7 @@ void vmc_alsa_sink_close(vmc_audio_sink *sink) {
     alsa_ctx *a = (alsa_ctx *)sink->ctx;
     if (!a) return;
     if (a->pcm) snd_pcm_close(a->pcm);
+    free(a->mono);
     free(a);
     sink->ctx = NULL;
     sink->play = NULL;

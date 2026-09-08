@@ -11,11 +11,12 @@
 VMC_BEGIN_DECLS
 
 /* Detect an attached USB audio device (e.g. a USB headset) and write an ALSA
- * playback device string ("plughw:<card-index>,0") into out/out_len. Returns
- * true if a USB-Audio card with a playback PCM is present. The sink prefers
- * this over the configured HDMI device, so audio follows a physically-attached
- * headset. */
-bool vmc_alsa_find_usb_device(char *out, size_t out_len);
+ * playback device string ("hw:<card-index>,0") into out/out_len — DIRECT, not
+ * plughw, so no plugin-level conversion (the pipeline handles the stereo->mono
+ * downmix itself with a proper (L+R)/2). Returns true if a USB-Audio card with
+ * a playback PCM is present, and sets *channels to the device's playback
+ * channel count (1 = mono, else stereo). */
+bool vmc_alsa_find_usb_device(char *out, size_t out_len, int *channels);
 
 /* Wire an ALSA sink into the pipeline. `device` may be NULL (uses
  * VMC_AUDIO_DEV env, else "default"). If ALSA/device is unavailable the
