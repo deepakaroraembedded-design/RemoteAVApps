@@ -2548,11 +2548,6 @@ static void dash_audio_write_frame(dash_session *s) {
     av_frame_unref(s->aframe);
 }
 
-/* Push already-resampled S16 PCM (frames*4 bytes) from s->apcm to the FIFO. */
-static void dash_audio_push_pcm(dash_session *s, int frames) {
-    if (frames <= 0) return;
-    audio_fifo_write_raw(s->apcm, frames);
-}
 #endif /* VMC_HAVE_ALSA */
 
 static u64 dash_au_deadline(int seg_num, int k) {
@@ -2592,9 +2587,6 @@ static void dash_demux_segment(u8 *data, size_t len, dash_session *s,
     s->video_first_pts = AV_NOPTS_VALUE;
     s->video_au_k = 0;
     s->last_frame_idx = -1;
-#ifdef VMC_HAVE_ALSA
-    bool saw_audio = false;
-#endif
     AVFormatContext *fmt = avformat_alloc_context();
     if (!fmt) {
         dash_close_mem_io(&avio);
@@ -2704,35 +2696,20 @@ static void dash_demux_segment(u8 *data, size_t len, dash_session *s,
                 dash_audio_write_frame(s);
             }
             av_packet_unref(pkt);
-#ifdef VMC_HAVE_ALSA
-            saw_audio = true;
-#endif
         } else {
             av_packet_unref(pkt);
         }
     }
     av_packet_free(&pkt);
-#ifdef VMC_HAVE_ALSA
-    /* Drain the AAC->48k resampler so the samples it buffered for the last
-     * frame(s) of this segment are flushed to the FIFO. Without this, ~2% of
-     * decoded audio is never delivered (buffered tail dropped on the next
-     * segment), which starves the sink and forces pitch-compensation drift. */
-    if (saw_audio && s->swr && s->apcm) {
-        int drain = swr_get_out_samples(s->swr, 0);
-        if (drain > 0) {
-            if ((sz_t)drain * 4u > s->apcm_cap) {
-                i16 *nb = (i16 *)realloc(s->apcm, (sz_t)drain * 4u);
-                if (nb) {
-                    s->apcm = nb;
-                    s->apcm_cap = (sz_t)drain * 4u;
-                }
-            }
-            const int got = swr_convert(s->swr, (u8 **)&s->apcm, drain,
-                                        NULL, 0);
-            dash_audio_push_pcm(s, got);
-        }
-    }
-#endif
+    /* NO per-segment swr drain: the resampler's buffered tail (the last few ms
+     * of this segment) carries over and is output when the next segment's
+     * frames are converted, so the AAC->48k filter state is CONTINUOUS across
+     * segment boundaries. Draining per segment flushed the filter tail into a
+     * separate FIFO chunk and produced a small phase/continuity step at every
+     * boundary — an audible periodic chip. The FIFO balance is unchanged (the
+     * same total samples are delivered; the tail just arrives with the next
+     * segment), and the buffer is deep enough (22-33 %) to absorb the few-ms
+     * shift. */
     fmt->pb = NULL;
     avformat_close_input(&fmt);
     dash_close_mem_io(&avio);
