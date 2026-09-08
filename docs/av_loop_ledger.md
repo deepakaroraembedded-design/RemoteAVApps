@@ -345,3 +345,17 @@ result:    CONFIRMED. Full 21-min run (commit 967a620, harness-fixed reprocess)
 next:      second consecutive full 21-min PASS (streak 2), then the
          confirmation matrix (VMC_DRM=1, second clip, back-to-back replay).
 
+
+## iter-016  2026-09-08T00:20Z  commit 0571f82  tier=full (streak 2)
+verdict: PASS   primary_fault: none   streak: 2
+buckets: 20/20 pass   failed_gates: 0
+run:     playback_span (content) 1259.98s, eos reached, stream_ended_early 0.02s
+         drift 0.0ms/min (theil-sen)  excursion 0.0ms  p95_degrade 0.0
+         cadence frame_interval_p95_err 1.03ms  audio 12000/12000
+         FIFO 24.4-28.9%  0 underflows/overflows/pads  0 drops  0 resyncs
+         0 mpd_reload_fail  0 decoder errors  present_delay stable 4.75s
+         rss +9.86MB  fds -1  disk flat (rolling window working)
+Two consecutive full-run PASSes on the fb0 path. Entering Phase 3 (confirmation
+matrix): VMC_DRM=1 (shipping path — expected hardware-bound drift blocker per
+iter-005/006: panel 59.77Hz vs 60fps content), second 21-min clip, and a
+back-to-back replay (~42 min, no restart).
