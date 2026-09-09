@@ -21,22 +21,36 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             cmake \
+            ffmpeg \
             libavcodec-dev \
             libavformat-dev \
             libavutil-dev \
             libdrm-dev \
             libasound2-dev \
             libswresample-dev \
-            libswscale-dev
+            libswscale-dev \
+            libx264-dev
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
-        run: cmake --build build -j$(nproc)
+        shell: bash -e -o pipefail {0}
+        run: cmake --build build -j$(nproc) 2>&1 | tee build/build.log
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-gcc
+          path: |
+            build/build.log
+            build/Testing/Temporary/LastTest.log
+            build/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
 
   sanitizer:
     name: Sanitizer build (ASan + UBSan)
@@ -51,22 +65,36 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             cmake \
+            ffmpeg \
             libavcodec-dev \
             libavformat-dev \
             libavutil-dev \
             libdrm-dev \
             libasound2-dev \
             libswresample-dev \
-            libswscale-dev
+            libswscale-dev \
+            libx264-dev
 
       - name: Configure with sanitizers
         run: cmake -S . -B build-asan -DVMC_ENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
-        run: cmake --build build-asan -j$(nproc)
+        shell: bash -e -o pipefail {0}
+        run: cmake --build build-asan -j$(nproc) 2>&1 | tee build-asan/build.log
 
       - name: Test
         run: ctest --test-dir build-asan --output-on-failure
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sanitizer
+          path: |
+            build-asan/build.log
+            build-asan/Testing/Temporary/LastTest.log
+            build-asan/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
 
   clang:
     name: Build and test (Clang)
@@ -85,22 +113,36 @@ jobs:
             clang \
             build-essential \
             cmake \
+            ffmpeg \
             libavcodec-dev \
             libavformat-dev \
             libavutil-dev \
             libdrm-dev \
             libasound2-dev \
             libswresample-dev \
-            libswscale-dev
+            libswscale-dev \
+            libx264-dev
 
       - name: Configure
-        run: cmake -S . -B build-clang -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -S . -B build-clang -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
-        run: cmake --build build-clang -j$(nproc)
+        shell: bash -e -o pipefail {0}
+        run: cmake --build build-clang -j$(nproc) 2>&1 | tee build-clang/build.log
 
       - name: Test
         run: ctest --test-dir build-clang --output-on-failure
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-clang
+          path: |
+            build-clang/build.log
+            build-clang/Testing/Temporary/LastTest.log
+            build-clang/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
 
   debug-instrumentation:
     name: Debug instrumentation build
@@ -115,22 +157,36 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             cmake \
+            ffmpeg \
             libavcodec-dev \
             libavformat-dev \
             libavutil-dev \
             libdrm-dev \
             libasound2-dev \
             libswresample-dev \
-            libswscale-dev
+            libswscale-dev \
+            libx264-dev
 
       - name: Configure with VMC_DEBUG
         run: cmake -S . -B build-debug -DVMC_DEBUG=1 -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
-        run: cmake --build build-debug -j$(nproc)
+        shell: bash -e -o pipefail {0}
+        run: cmake --build build-debug -j$(nproc) 2>&1 | tee build-debug/build.log
 
       - name: Test
         run: ctest --test-dir build-debug --output-on-failure
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-debug
+          path: |
+            build-debug/build.log
+            build-debug/Testing/Temporary/LastTest.log
+            build-debug/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
 
   harness-selftest:
     name: Offline harness self-test
