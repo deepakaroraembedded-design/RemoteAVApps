@@ -1,9 +1,25 @@
 # VMC Thin Client
 
-Embedded-oriented C11 implementation of the **Virtual Mobile Computing** thin
-client device. A lightweight client renders a GPU-encoded video stream coming
-from a MEC-hosted Android container, captures touch/sensor/audio input, and
-manages the network session — while all heavy compute stays at the edge.
+A C11 execution runtime for resource-constrained Linux endpoints. It is built as
+a layered hardware-abstraction stack with pluggable backends (display, audio,
+input, network, decode), lock-free non-blocking telemetry, and a gate-based
+regression harness. The A/V thin-client workload — H.264 decode, DRM/fb0 scanout,
+ALSA audio, UDP and LL-DASH transport — is the proving ground, not the product
+definition.
+
+Why a systems reader should care:
+
+- **C11, single-process, no GIL, no heavy frameworks.**
+- **Layered HAL with pluggable backends:** DRM scanout or fb0 display, ALSA
+  audio, CUVID decode, UDP/LL-DASH transport, Linux evdev input.
+- **Lock-free, non-blocking telemetry:** a SPSC ring that costs nothing in
+  production builds; test builds emit per-frame NDJSON for gate-driven
+  regression.
+- **Gate-based regression harness:** a two-agent convergence loop (`tools/av_harness/`)
+  — 3-minute smoke pre-filter, 21-minute single-stretch full run, per-minute
+  buckets, Theil-Sen drift estimators, leak gates, and EOS completion gates.
+- **Measured latency:** ~66 ms end-to-end, ~52 ms motion-to-photon over Wi-Fi 6
+  (4K stream to a 1080p display).
 
 This is a fresh, from-scratch implementation (it does not reuse the earlier
 scrcpy/Pi5 prototype scripts).
