@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build and test (GCC)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libdrm-dev \
+            libasound2-dev \
+            libswresample-dev \
+            libswscale-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizer:
+    name: Sanitizer build (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libdrm-dev \
+            libasound2-dev \
+            libswresample-dev \
+            libswscale-dev
+
+      - name: Configure with sanitizers
+        run: cmake -S . -B build-asan -DVMC_ENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build-asan -j$(nproc)
+
+      - name: Test
+        run: ctest --test-dir build-asan --output-on-failure
+
+  clang:
+    name: Build and test (Clang)
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            build-essential \
+            cmake \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libdrm-dev \
+            libasound2-dev \
+            libswresample-dev \
+            libswscale-dev
+
+      - name: Configure
+        run: cmake -S . -B build-clang -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build-clang -j$(nproc)
+
+      - name: Test
+        run: ctest --test-dir build-clang --output-on-failure
+
+  debug-instrumentation:
+    name: Debug instrumentation build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libdrm-dev \
+            libasound2-dev \
+            libswresample-dev \
+            libswscale-dev
+
+      - name: Configure with VMC_DEBUG
+        run: cmake -S . -B build-debug -DVMC_DEBUG=1 -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build-debug -j$(nproc)
+
+      - name: Test
+        run: ctest --test-dir build-debug --output-on-failure
+
+  harness-selftest:
+    name: Offline harness self-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3
+
+      - name: Run selftest_synth.py
+        run: python3 tools/av_harness/selftest_synth.py
