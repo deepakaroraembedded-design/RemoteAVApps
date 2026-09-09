@@ -27,42 +27,44 @@ scrcpy/Pi5 prototype scripts).
 ## Architecture
 
 ```
-┌──────────────────────┐      UDP (VMC protocol)      ┌───────────────────────┐
-│  MEC SIM (host)      │  ──────────────────────────▶ │  THIN CLIENT          │
-│  192.168.0.126       │      mapper :9999            │  192.168.0.145 (WiFi) │
-│                      │      media  :6000            │                       │
-│  ffmpeg h264_nvenc   │                              │  UDP transport        │
-│  (RTX 5080)          │                              │  jitter buffer        │
-│  → H.264 access units│                              │  fragment reassembly  │
-│  → fragment → send   │                              │  CUVID decode         │
-│  (C11 poll loop)     │                              │  → NV12 → BGRA conv   │
-└──────────────────────┘                              │  → /dev/fb0 → HDMI    │
-                                                      └───────────────────────┘
+┌──────────────────────┐      MPEG-DASH over SSL/TCP     ┌───────────────────────┐
+│  MEC host            │  ───────────────────────────────▶ │  THIN CLIENT          │
+│  192.168.0.126       │        HTTPS/TCP :443 / :8080     │  192.168.0.145 (WiFi) │
+│                      │                                   │                       │
+│  ffmpeg h264_nvenc   │                                   │  DASH manifest/segment│
+│  + AAC encoder       │                                   │  fetch over SSL/TCP   │
+│  → LL-DASH CMAF      │                                   │  → demux              │
+│    segment packager  │                                   │  → CUVID decode       │
+│  → HTTPS server      │                                   │  → NV12 → BGRA conv   │
+│    (vmc-dash-sim)    │                                   │  → DRM / fb0 → HDMI   │
+└──────────────────────┘                                   │  → ALSA audio         │
+                                                           └───────────────────────┘
 ```
 
 Roles:
 
-- **MEC sim** (`tools/vmc_sim/vmc-mec-sim`) — stands in for the ReDroid/MEC
-  container. Encodes real H.264 with **NVENC** (ffmpeg `h264_nvenc` subprocess),
-  wraps access units in the VMC protocol (fragmenting large frames), echoes
-  keepalives, and ingests input batches. A single-threaded `poll()` loop with
-  **no Python GIL** — the previous `tools/mec_sim.py` Python simulator is kept
-  for comparison but no longer used.
-- **Thin client** (`apps/thinclient/main.c`) — receives, reorders, reassembles,
-  decodes with **CUVID**, converts NV12→BGRA on the GPU via `libnv12conv.so`,
-  and presents to the framebuffer/HDMI. A decode worker keeps reception
-  independent of decode cost; in DRM mode a separate **present worker**
-  thread waits on the audio-master clock and submits the page-flip, so the
-  content-frame presentation cadence is independent of the conversion-to-scanout copy.
-- **LL-DASH server** (`tools/vmc-dash-sim/vmc-dash-sim`) — optional
-  standards-based transport: ffmpeg NVENC+AAC → Low-Latency DASH (CMAF
-  segments, dynamic MPD) served over HTTP. The client's `--dash <mpd-url>` mode
-  replaces the UDP transport end-to-end (same CUVID decode + DRM scanout).
+- **LL-DASH server** (`tools/vmc-dash-sim/vmc-dash-sim`) — stands in for the
+  MEC-hosted content source. Encodes real H.264 with **NVENC** and AAC, packages
+  the stream into Low-Latency **MPEG-DASH** CMAF segments, and serves the dynamic
+  MPD and segments over **SSL/TCP** (HTTPS). Supports live loop pacing as well as
+  single-stretch (`--play-once`) playback for regression runs.
+- **Thin client** (`apps/thinclient/main.c`) — runs on the endpoint. Fetches
+  the MPD and CMAF segments over **SSL/TCP**, demuxes them in memory, decodes
+  H.264 with **CUVID**, converts NV12→BGRA on the GPU via `libnv12conv.so`, and
+  presents to the framebuffer/HDMI. A decode worker keeps network reception
+  independent of decode cost; in DRM mode a separate **present worker** thread
+  waits on the audio-master clock and submits the page-flip.
+- **MEC sim** (`tools/vmc_sim/vmc-mec-sim`) — optional custom **UDP (VMC
+  protocol)** low-latency path. Encodes H.264 with NVENC and sends access units
+  over a lightweight framed UDP transport. Kept for low-latency experiments; the
+  primary architecture is MPEG-DASH over SSL/TCP.
 
 Two transport modes coexist in one client binary:
-- **UDP (VMC protocol)** — the low-latency path (~54 ms motion-to-photon).
-- **LL-DASH over HTTP** — the standards path (~1–3 s live-edge latency), chosen
-  with `--dash <mpd-url>`.
+- **MPEG-DASH over SSL/TCP** — the standards-based path (`--dash <mpd-url>`),
+  served over HTTPS. This is the architecture shown above (~1–3 s live-edge
+  latency).
+- **UDP (VMC protocol)** — the custom low-latency path (~54 ms motion-to-photon).
+  Described in the UDP-mode section below.
 
 ## Repo layout
 
