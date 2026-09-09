@@ -40,15 +40,15 @@ enum { TLM_SLOT_EMPTY = 0, TLM_SLOT_CLAIMED = 1, TLM_SLOT_FILLED = 2 };
 typedef struct {
     u8   buf[TLM_SLOT_CAP];
     u16  len;
-    _Atomic u32 state;
+    volatile u32 state;
 } tlm_slot;
 
 static tlm_slot g_slots[TLM_RING_SLOTS];
-static _Atomic u32 g_head;   /* producer reservation cursor */
+static volatile u32 g_head;   /* producer reservation cursor */
 static u32       g_tail;     /* writer drain cursor (writer thread only) */
 
-static _Atomic u64 g_seq;        /* per-process monotonic event counter */
-static _Atomic u64 g_dropped;    /* ring-overflow drop counter */
+static volatile u64 g_seq;        /* per-process monotonic event counter */
+static volatile u64 g_dropped;    /* ring-overflow drop counter */
 
 static volatile int g_enabled = 0;
 static volatile int g_stop = 0;
